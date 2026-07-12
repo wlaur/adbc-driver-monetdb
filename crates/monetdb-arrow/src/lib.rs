@@ -14,4 +14,7 @@
 //! Only little-endian servers and MonetDB Dec2025 (11.55) or newer are
 //! supported.
 
+mod decode;
 pub mod exportbin;
+
+pub use decode::{DecodeError, decode_column, decode_frame, field_for_column};

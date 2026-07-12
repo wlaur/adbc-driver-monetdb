@@ -47,7 +47,7 @@ as upstream-shaped MPL-2.0 changes so they can be offered back to
 
 ### M0 — spike: validate the read path end to end
 
-- [ ] `Xexportbin` issued over a raw MAPI connection against a live Dec2025 server
+- [x] `Xexportbin` issued over a raw MAPI connection against a live Dec2025 server
 - [ ] decode int/double/varchar columns to Arrow, hand to polars via the C stream interface
 - [ ] benchmark a large (multi-million row, mixed numeric/string) fetch against pymonetdb
       (text and binary modes) to quantify the win before building everything else
@@ -59,29 +59,29 @@ as upstream-shaped MPL-2.0 changes so they can be offered back to
 
 ### M1 — protocol layer (the monetdb-rust fork)
 
-- [ ] `Xexportbin <resid> <start> <count>` command + binary response framing
-- [ ] `Xreply_size` control (small text prefix, bulk via binary windows)
+- [x] `Xexportbin <resid> <start> <count>` command + binary response framing
+- [x] `Xreply_size` control (small text prefix, bulk via binary windows)
 - [ ] transactions: autocommit handshake option, `Xauto_commit`, commit/rollback
 - [ ] `PREPARE` / `EXECUTE` (text descriptions; `Q_PREPARE` result sets are text-only
       in the MAPI protocol)
 - [ ] file-transfer uploads (the `rb` subprotocol) for `COPY BINARY ... ON CLIENT`,
       serving named "files" from in-memory column buffers
-- [ ] expose the server fingerprint: endianness (challenge field 5), `BINARY` level,
+- [x] expose the server fingerprint: endianness (challenge field 5), `BINARY` level,
       `monet_version`
-- [ ] result-set header parsing that carries decimal digits/scale and column types
+- [x] result-set header parsing that carries decimal digits/scale and column types
       through to the consumer
 
 ### M2 — Arrow conversion (crates/monetdb-arrow)
 
 - [x] `Xexportbin` frame parsing (header, 32-byte-aligned columns, TOC, in-frame errors)
-- [ ] fixed-width decoders: ints (sentinel `INT_MIN` per width), floats (NaN = NULL),
+- [x] fixed-width decoders: ints (sentinel `INT_MIN` per width), floats (NaN = NULL),
       bool (`0x80` = NULL), decimal as scaled int8/16/32/64/128 → `decimal128(p, s)`
-- [ ] temporal decoders: date (4 B struct), time (8 B), timestamp (12 B) → `date32` /
+- [x] temporal decoders: date (4 B struct), time (8 B), timestamp (12 B) → `date32` /
       `time64[us]` / `timestamp[us]`; **the wire field named `ms` holds microseconds**
-- [ ] string decoder: NUL-terminated UTF-8 → offsets + data buffer; `80 00` = NULL;
+- [x] string decoder: NUL-terminated UTF-8 → offsets + data buffer; `80 00` = NULL;
       back-reference decoding (defensive on read — servers currently emit backrefs only
       on ingest, but the format allows them)
-- [ ] blob (i64 length prefix, `~0` = NULL), uuid (16 B, all-zero = NULL), inet4/inet6
+- [x] blob (i64 length prefix, `~0` = NULL), uuid (16 B, all-zero = NULL), inet4/inet6
 - [ ] encoders for every type above (COPY BINARY little-endian), including
       dictionary/categorical strings → back-reference encoding
 - [ ] golden-fixture tests for every type (bytes captured from a real server), plus

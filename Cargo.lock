@@ -681,6 +681,7 @@ dependencies = [
  "arrow-array",
  "arrow-buffer",
  "arrow-schema",
+ "monetdb",
 ]
 
 [[package]]
