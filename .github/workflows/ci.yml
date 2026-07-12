@@ -31,8 +31,12 @@ jobs:
       - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
           python-version: "3.13"
-      # uv sync builds the extension via maturin (rust is preinstalled on the runner),
-      # so pyright checks against the real _native module and installed deps
+      - name: Install current stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      # uv sync builds the extension via maturin, so pyright checks against the real
+      # _native module and installed dependencies.
       - run: uv sync --locked
       - run: uv run --no-sync ruff check .
       - run: uv run --no-sync ruff format --check .
@@ -68,6 +72,10 @@ jobs:
       - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
           python-version: "3.13"
+      - name: Install current stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
       - run: uv build --sdist --out-dir dist
       - name: Rebuild and smoke-test from the sdist
         shell: bash
@@ -100,6 +108,10 @@ jobs:
         with:
           submodules: true
       - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+      - name: Install current stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
       - name: Build wheels
         uses: pypa/cibuildwheel@a0a973acdc9e7b7f8b04ac5c80e6883a5a102615 # v4.1.0
         with:

@@ -65,8 +65,8 @@ skip = ["*-musllinux*", "*_i686", "*-win32"]
 test-command = 'python -c "import adbc_driver_monetdb as m; print(m.driver_path())"'
 
 [tool.cibuildwheel.linux]
-# the manylinux image lacks Rust (needed by maturin); install it, then build
-before-all = "curl -sSf https://sh.rustup.rs | sh -s -- -y"
+# The manylinux image lacks Rust; install the current stable toolchain for maturin.
+before-all = "curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable"
 environment = { PATH = "$HOME/.cargo/bin:$PATH" }
 repair-wheel-command = "auditwheel repair -w {dest_dir} {wheel}"
 

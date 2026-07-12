@@ -205,9 +205,7 @@ def test_metadata_and_schema_apis(monetdb_uri: str) -> None:
                 "table_types", db_schema_filter="sys"
             ),
         )
-        assert str(table_schema) == (
-            "table_type_id: int16 not null\ntable_type_name: string not null"
-        )
+        assert str(table_schema) == ("table_type_id: int16 not null\ntable_type_name: string not null")
         with conn.cursor() as cursor:
             query_schema = cast(
                 object,
