@@ -16,8 +16,11 @@ use arrow_array::{
     UnionArray, new_empty_array,
 };
 use arrow_schema::{ArrowError, DataType, Schema, SchemaRef};
-use monetdb::{CursorError, Endian, Parameters, ResultColumn};
+use monetdb::{CursorError, Endian, Parameters, ResultColumn, parms::Parm};
 use percent_encoding::percent_decode_str;
+
+mod metadata;
+use metadata::{like_pattern_matches, load_objects, objects_batch};
 
 const DEFAULT_BATCH_ROWS: usize = 131_072;
 const BATCH_ROWS_OPTION: &str = "adbc.monetdb.batch_rows";
@@ -233,6 +236,10 @@ impl Database for MonetdbDatabase {
         parameters
             .set_autocommit(true)
             .map_err(|value| map_display(value, Status::InvalidArguments))?;
+        let catalog = parameters
+            .get_str(Parm::Database)
+            .map_err(|value| map_display(value, Status::InvalidArguments))?
+            .into_owned();
 
         let mut connection = monetdb::Connection::new(parameters).map_err(|value| {
             let status = match value {
@@ -270,6 +277,7 @@ impl Database for MonetdbDatabase {
             inner: Arc::new(Mutex::new(connection)),
             options: Options::default(),
             version,
+            catalog,
         };
         for (key, value) in opts {
             result.set_option(key, value)?;
@@ -292,6 +300,7 @@ pub struct MonetdbConnection {
     inner: Arc<Mutex<monetdb::Connection>>,
     options: Options,
     version: (u16, u16, u16),
+    catalog: String,
 }
 
 impl Optionable for MonetdbConnection {
@@ -380,14 +389,29 @@ impl Connection for MonetdbConnection {
 
     fn get_objects(
         &self,
-        _depth: ObjectDepth,
-        _catalog: Option<&str>,
-        _db_schema: Option<&str>,
-        _table_name: Option<&str>,
-        _table_type: Option<Vec<&str>>,
-        _column_name: Option<&str>,
+        depth: ObjectDepth,
+        catalog: Option<&str>,
+        db_schema: Option<&str>,
+        table_name: Option<&str>,
+        table_type: Option<Vec<&str>>,
+        column_name: Option<&str>,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-        Err(not_implemented("get_objects"))
+        let include_catalog = catalog
+            .map(|pattern| like_pattern_matches(pattern, &self.catalog))
+            .unwrap_or(true);
+        let schemas = if include_catalog && depth != ObjectDepth::Catalogs {
+            load_objects(
+                &self.inner,
+                db_schema,
+                table_name,
+                table_type.as_deref(),
+                column_name,
+            )?
+        } else {
+            Vec::new()
+        };
+        let batch = objects_batch(&self.catalog, include_catalog, depth, &schemas)?;
+        Ok(Box::new(SingleBatchReader::new(batch)))
     }
 
     fn get_table_schema(
@@ -396,10 +420,10 @@ impl Connection for MonetdbConnection {
         db_schema: Option<&str>,
         table_name: &str,
     ) -> Result<Schema> {
-        if catalog.is_some() {
+        if catalog.is_some_and(|catalog| catalog != self.catalog) {
             return Err(error(
-                "MonetDB does not support cross-catalog table lookup",
-                Status::NotImplemented,
+                format!("catalog '{}' does not exist", catalog.unwrap_or_default()),
+                Status::NotFound,
             ));
         }
         schema_for_query(

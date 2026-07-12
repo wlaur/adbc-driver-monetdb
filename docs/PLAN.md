@@ -99,7 +99,8 @@ as upstream-shaped MPL-2.0 changes so they can be offered back to
       chunked into successive `COPY BINARY` statements inside one transaction
 - [x] `GetInfo` (vendor_name = "MonetDB" — polars introspects it), `GetTableTypes`
 - [x] `GetTableSchema` and `ExecuteSchema` from a zero-row query result header
-- [ ] `GetObjects` via `sys.tables` / `sys.columns` / `sys.keys`
+- [x] `GetObjects` via `sys.tables` / `sys.columns` / `sys.keys`, including filters,
+      XDBC column attributes, and primary/unique/foreign-key constraint usage
 - [ ] prepared statements with positional (qmark) parameters rendered as SQL literals
       (MonetDB has no wire-level binary bind; bulk data goes through ingest)
 - [x] error mapping: MAPI error strings → ADBC status + SQLSTATE (MonetDB prefixes

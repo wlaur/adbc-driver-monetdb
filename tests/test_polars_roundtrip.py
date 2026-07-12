@@ -59,6 +59,50 @@ def test_metadata_and_schema_apis(monetdb_uri: str) -> None:
 
 
 @pytest.mark.integration
+def test_get_objects_with_columns_constraints_and_filters(monetdb_uri: str) -> None:
+    with dbapi.connect(monetdb_uri) as conn, conn.cursor() as cursor:
+        try:
+            cursor.execute(  # pyright: ignore[reportUnknownMemberType]
+                "CREATE TABLE objects_parent(id INT PRIMARY KEY, label VARCHAR(10))"
+            )
+            cursor.execute(  # pyright: ignore[reportUnknownMemberType]
+                "CREATE TABLE objects_child("
+                "id INT, parent_id INT, "
+                "CONSTRAINT objects_fk FOREIGN KEY(parent_id) REFERENCES objects_parent(id), "
+                "CONSTRAINT objects_unique UNIQUE(id))"
+            )
+            rows = cast(
+                list[object],
+                conn.adbc_get_objects(  # pyright: ignore[reportUnknownMemberType]
+                    depth="all",
+                    db_schema_filter="sys",
+                    table_name_filter="objects_%",
+                )
+                .read_all()
+                .to_pylist(),
+            )
+            rendered = repr(rows)
+            assert "objects_parent_id_pkey" in rendered
+            assert "objects_fk" in rendered
+            assert "FOREIGN KEY" in rendered
+            assert "objects_parent" in rendered
+            assert "parent_id" in rendered
+            assert "xdbc_data_type': 4" in rendered
+            empty = cast(
+                list[object],
+                conn.adbc_get_objects(  # pyright: ignore[reportUnknownMemberType]
+                    catalog_filter="missing_catalog"
+                )
+                .read_all()
+                .to_pylist(),
+            )
+            assert empty == []
+        finally:
+            cursor.execute("DROP TABLE IF EXISTS objects_child")  # pyright: ignore[reportUnknownMemberType]
+            cursor.execute("DROP TABLE IF EXISTS objects_parent")  # pyright: ignore[reportUnknownMemberType]
+
+
+@pytest.mark.integration
 def test_write_database_roundtrip(monetdb_uri: str) -> None:
     df = pl.DataFrame(
         {
