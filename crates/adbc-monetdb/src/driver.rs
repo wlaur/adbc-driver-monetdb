@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fmt,
     os::raw::c_char,
     sync::{Arc, Mutex},
@@ -62,6 +62,7 @@ fn map_cursor_error(value: CursorError) -> Error {
         {
             Status::NotFound
         }
+        CursorError::Server(ref message) if message.starts_with("2DM30!") => Status::InvalidState,
         CursorError::Server(_) => Status::Unknown,
     };
     let mut result = error(value.to_string(), status);
@@ -593,16 +594,13 @@ impl Statement for MonetdbStatement {
     fn execute(&mut self) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
         if self.bound.is_some() {
             let queries = self.take_bound_queries()?;
-            if queries.len() != 1 {
+            if queries.is_empty() {
                 return Err(error(
-                    format!(
-                        "query execution requires exactly one parameter row, found {}",
-                        queries.len()
-                    ),
+                    "query execution requires at least one parameter row",
                     Status::InvalidArguments,
                 ));
             }
-            return query_reader(&self.connection, &queries[0], self.batch_rows);
+            return parameter_query_reader(&self.connection, queries, self.batch_rows);
         }
         let query = self
             .query
@@ -1058,6 +1056,26 @@ fn query_reader(
     }))
 }
 
+fn parameter_query_reader(
+    connection: &Arc<Mutex<monetdb::Connection>>,
+    queries: Vec<String>,
+    batch_rows: usize,
+) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
+    let mut queries = VecDeque::from(queries);
+    let first = queries
+        .pop_front()
+        .ok_or_else(|| error("no parameter rows to execute", Status::InvalidArguments))?;
+    let current = query_reader(connection, &first, batch_rows)?;
+    let schema = current.schema();
+    Ok(Box::new(ParameterQueryReader {
+        connection: Arc::clone(connection),
+        queries,
+        current: Some(current),
+        schema,
+        batch_rows,
+    }))
+}
+
 fn scalar_string(connection: &Arc<Mutex<monetdb::Connection>>, query: &str) -> Result<String> {
     let mut reader = query_reader(connection, query, 1)?;
     let batch = reader
@@ -1154,6 +1172,45 @@ impl Iterator for BinaryReader {
 }
 
 impl RecordBatchReader for BinaryReader {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+}
+
+struct ParameterQueryReader {
+    connection: Arc<Mutex<monetdb::Connection>>,
+    queries: VecDeque<String>,
+    current: Option<Box<dyn RecordBatchReader + Send + 'static>>,
+    schema: SchemaRef,
+    batch_rows: usize,
+}
+
+impl Iterator for ParameterQueryReader {
+    type Item = std::result::Result<RecordBatch, ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(reader) = &mut self.current
+                && let Some(batch) = reader.next()
+            {
+                return Some(batch);
+            }
+            self.current = None;
+            let query = self.queries.pop_front()?;
+            match query_reader(&self.connection, &query, self.batch_rows) {
+                Ok(reader) if reader.schema() == self.schema => self.current = Some(reader),
+                Ok(_) => {
+                    return Some(Err(ArrowError::SchemaError(
+                        "parameterized query schema changed between rows".into(),
+                    )));
+                }
+                Err(value) => return Some(Err(ArrowError::ExternalError(Box::new(value)))),
+            }
+        }
+    }
+}
+
+impl RecordBatchReader for ParameterQueryReader {
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }

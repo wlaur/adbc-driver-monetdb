@@ -1,0 +1,5 @@
+skip = "MonetDB DECIMAL does not support negative scales"
+
+[tags]
+partial-support = true
+caveats = ["MonetDB DECIMAL scales range from zero through the declared precision."]

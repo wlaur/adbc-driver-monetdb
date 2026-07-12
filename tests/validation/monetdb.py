@@ -22,7 +22,7 @@ class MonetdbQuirks(model.DriverQuirks):
         get_objects_constraints_foreign=True,
         get_objects_constraints_primary=True,
         get_objects_constraints_unique=True,
-        metadata_type_name=True,
+        metadata_type_name=False,
         statement_bind=True,
         statement_bulk_ingest=True,
         statement_bulk_ingest_schema=True,
@@ -31,6 +31,7 @@ class MonetdbQuirks(model.DriverQuirks):
         statement_get_parameter_schema=True,
         statement_prepare=True,
         statement_rows_affected=True,
+        quirk_bulk_ingest_temporary_shares_namespace=True,
         supported_xdbc_fields=[
             "xdbc_data_type",
             "xdbc_type_name",
@@ -63,7 +64,12 @@ class MonetdbQuirks(model.DriverQuirks):
     def is_table_not_found(self, table_name: str | None, error: Exception) -> bool:
         del table_name
         message = str(error).lower()
-        return "does not exist" in message or "unknown table" in message or "not found" in message
+        return (
+            "does not exist" in message
+            or "no such table" in message
+            or "unknown table" in message
+            or "not found" in message
+        )
 
     def qualify_temp_table(self, cursor: object, name: str) -> str:
         del cursor

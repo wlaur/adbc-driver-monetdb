@@ -118,9 +118,11 @@ as upstream-shaped MPL-2.0 changes so they can be offered back to
 - [ ] register `monetdb` in
       [adbc-drivers/name-mappings](https://github.com/adbc-drivers/name-mappings)
 - [ ] run the [adbc-drivers/validation](https://github.com/adbc-drivers/validation)
-      pytest suite via a `DriverQuirks` class; the harness is pinned and its connection
-      module is green (28 passed, 3 feature skips); finish ingest/query/statement coverage
-      and publish the feature matrix in the README
+      pytest suite via a `DriverQuirks` class; the harness is pinned, with connection
+      (28 passed, 3 feature skips), ingest (43 passed, 3 feature skips), and statement
+      (7 passed) green. The initial query matrix has 131 passing cases; finish its
+      MonetDB-specific integer-sentinel, temporal-precision, BLOB, and literal cases,
+      then publish the feature matrix in the README
 - [ ] announce on MonetDB/MonetDB#7464 and offer the protocol work upstream
 
 ## ADBC feature mapping

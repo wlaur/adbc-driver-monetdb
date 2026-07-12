@@ -64,7 +64,7 @@ pub(super) fn load_objects(
                t.name AS table_name,
                tt.table_type_name AS table_type,
                c.name AS column_name,
-               c.number + 1 AS ordinal_position,
+               c.number AS ordinal_position,
                c.type AS type_name,
                c.type_digits,
                c.type_scale,
@@ -140,7 +140,10 @@ pub(super) fn load_objects(
                 .columns
                 .push(ObjectColumn {
                     name: column_name.to_owned(),
-                    ordinal: ordinals.value(row),
+                    ordinal: ordinals
+                        .value(row)
+                        .checked_add(1)
+                        .ok_or_else(|| error("column ordinal overflows i32", Status::Internal))?,
                     remarks: (!remarks.is_null(row)).then(|| remarks.value(row).to_owned()),
                     type_name: type_names.value(row).to_owned(),
                     digits: digits.value(row),
