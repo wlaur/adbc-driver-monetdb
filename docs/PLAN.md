@@ -101,7 +101,7 @@ as upstream-shaped MPL-2.0 changes so they can be offered back to
 - [x] `GetTableSchema` and `ExecuteSchema` from a zero-row query result header
 - [x] `GetObjects` via `sys.tables` / `sys.columns` / `sys.keys`, including filters,
       XDBC column attributes, and primary/unique/foreign-key constraint usage
-- [ ] prepared statements with positional (qmark) parameters rendered as SQL literals
+- [x] prepared statements with positional (qmark) parameters rendered as typed SQL literals
       (MonetDB has no wire-level binary bind; bulk data goes through ingest)
 - [x] error mapping: MAPI error strings → ADBC status + SQLSTATE (MonetDB prefixes
       errors with a 5-character SQLSTATE)

@@ -15,12 +15,14 @@ use arrow_array::{
     ArrayRef, BooleanArray, Int64Array, RecordBatch, RecordBatchReader, StringArray, UInt32Array,
     UnionArray, new_empty_array,
 };
-use arrow_schema::{ArrowError, DataType, Schema, SchemaRef};
+use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 use monetdb::{CursorError, Endian, Parameters, ResultColumn, parms::Parm};
 use percent_encoding::percent_decode_str;
 
 mod metadata;
+mod parameters;
 use metadata::{like_pattern_matches, load_objects, objects_batch};
+use parameters::{parameter_count, render_row};
 
 const DEFAULT_BATCH_ROWS: usize = 131_072;
 const BATCH_ROWS_OPTION: &str = "adbc.monetdb.batch_rows";
@@ -564,7 +566,17 @@ impl Statement for MonetdbStatement {
 
     fn execute(&mut self) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
         if self.bound.is_some() {
-            return Err(not_implemented("query parameters"));
+            let queries = self.take_bound_queries()?;
+            if queries.len() != 1 {
+                return Err(error(
+                    format!(
+                        "query execution requires exactly one parameter row, found {}",
+                        queries.len()
+                    ),
+                    Status::InvalidArguments,
+                ));
+            }
+            return query_reader(&self.connection, &queries[0], self.batch_rows);
         }
         let query = self
             .query
@@ -574,8 +586,27 @@ impl Statement for MonetdbStatement {
     }
 
     fn execute_update(&mut self) -> Result<Option<i64>> {
-        if self.bound.is_some() {
+        if self.bound.is_some()
+            && self
+                .options
+                .optional_string(OptionStatement::TargetTable)
+                .is_some()
+        {
             return self.ingest();
+        }
+        if self.bound.is_some() {
+            let queries = self.take_bound_queries()?;
+            let mut total = 0i64;
+            let mut has_count = false;
+            for query in queries {
+                if let Some(rows) = execute_update(&self.connection, &query)? {
+                    total = total.checked_add(rows).ok_or_else(|| {
+                        error("affected row count overflows i64", Status::Internal)
+                    })?;
+                    has_count = true;
+                }
+            }
+            return Ok(has_count.then_some(total));
         }
         let query = self
             .query
@@ -586,7 +617,17 @@ impl Statement for MonetdbStatement {
 
     fn execute_schema(&mut self) -> Result<Schema> {
         if self.bound.is_some() {
-            return Err(not_implemented("parameterized execute_schema"));
+            let queries = self.take_bound_queries()?;
+            if queries.len() != 1 {
+                return Err(error(
+                    format!(
+                        "execute_schema requires exactly one parameter row, found {}",
+                        queries.len()
+                    ),
+                    Status::InvalidArguments,
+                ));
+            }
+            return schema_for_query(&self.connection, &queries[0]);
         }
         let query = self
             .query
@@ -600,11 +641,25 @@ impl Statement for MonetdbStatement {
     }
 
     fn get_parameter_schema(&self) -> Result<Schema> {
-        Err(not_implemented("get_parameter_schema"))
+        if let Some(bound) = &self.bound {
+            return Ok(bound.schema().as_ref().clone());
+        }
+        let query = self
+            .query
+            .as_deref()
+            .ok_or_else(|| error("SQL query is not set", Status::InvalidState))?;
+        let fields = (0..parameter_count(query)?)
+            .map(|index| Field::new(index.to_string(), DataType::Null, true))
+            .collect::<Vec<_>>();
+        Ok(Schema::new(fields))
     }
 
     fn prepare(&mut self) -> Result<()> {
-        Err(not_implemented("prepare"))
+        let query = self
+            .query
+            .as_deref()
+            .ok_or_else(|| error("SQL query is not set", Status::InvalidState))?;
+        parameter_count(query).map(|_| ())
     }
 
     fn set_sql_query(&mut self, query: impl AsRef<str>) -> Result<()> {
@@ -622,6 +677,43 @@ impl Statement for MonetdbStatement {
 }
 
 impl MonetdbStatement {
+    fn take_bound_queries(&mut self) -> Result<Vec<String>> {
+        let query = self
+            .query
+            .as_deref()
+            .ok_or_else(|| error("SQL query is not set", Status::InvalidState))?
+            .to_owned();
+        let mut reader = self
+            .bound
+            .take()
+            .ok_or_else(|| error("no Arrow parameters are bound", Status::InvalidState))?;
+        let schema = reader.schema();
+        let expected = parameter_count(&query)?;
+        if schema.fields().len() != expected {
+            return Err(error(
+                format!(
+                    "query has {expected} positional parameters but the bound stream has {} columns",
+                    schema.fields().len()
+                ),
+                Status::InvalidArguments,
+            ));
+        }
+        let mut queries = Vec::new();
+        for batch in &mut reader {
+            let batch = batch.map_err(Error::from)?;
+            if batch.schema() != schema {
+                return Err(error(
+                    "parameter schema changed within the bound stream",
+                    Status::InvalidData,
+                ));
+            }
+            for row in 0..batch.num_rows() {
+                queries.push(render_row(&query, &batch, row)?);
+            }
+        }
+        Ok(queries)
+    }
+
     fn ingest(&mut self) -> Result<Option<i64>> {
         let mut reader = self
             .bound
@@ -915,7 +1007,7 @@ fn query_reader(
         let query = query.trim().trim_end_matches(';');
         cursor
             .execute(&format!(
-                "WITH \"__adbc_source\" AS ({query}) \
+                "WITH \"__adbc_source\" AS (\n{query}\n) \
                  SELECT \"__adbc_source\".* FROM \"__adbc_source\" \
                  CROSS JOIN (VALUES (1), (2)) AS \"__adbc_duplicate\"(\"n\")"
             ))

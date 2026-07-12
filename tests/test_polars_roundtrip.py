@@ -103,6 +103,58 @@ def test_get_objects_with_columns_constraints_and_filters(monetdb_uri: str) -> N
 
 
 @pytest.mark.integration
+def test_prepared_parameters_and_executemany(monetdb_uri: str) -> None:
+    malicious = "x'); DROP TABLE parameter_rows; --"
+    with dbapi.connect(monetdb_uri) as conn, conn.cursor() as cursor:
+        try:
+            parameter_schema = cast(
+                object,
+                cursor.adbc_prepare("SELECT ? + ?"),  # pyright: ignore[reportUnknownMemberType]
+            )
+            assert str(parameter_schema) == "0: null\n1: null"
+            cursor.execute(  # pyright: ignore[reportUnknownMemberType]
+                "SELECT ? AS i, '?' AS literal_qmark, ? AS s, ? AS b, "
+                "CAST(? AS DECIMAL(9, 2)) AS d, ? AS dt, ? AS tm, ? AS ts, ? AS tstz, ? AS iv",
+                [
+                    42,
+                    malicious,
+                    b"\x00\xff",
+                    Decimal("1.23"),
+                    date(2025, 12, 31),
+                    time(1, 2, 3, 123456),
+                    datetime(2025, 12, 31, 1, 2, 3, 123456),
+                    datetime(2025, 12, 31, 1, 2, 3, 123456, tzinfo=UTC),
+                    timedelta(milliseconds=1234),
+                ],
+            )
+            assert cursor.fetchone() == (  # pyright: ignore[reportUnknownMemberType]
+                42,
+                "?",
+                malicious,
+                b"\x00\xff",
+                Decimal("1.23"),
+                date(2025, 12, 31),
+                time(1, 2, 3, 123456),
+                datetime(2025, 12, 31, 1, 2, 3, 123456),
+                datetime(2025, 12, 31, 1, 2, 3, 123456, tzinfo=UTC),
+                timedelta(milliseconds=1234),
+            )
+            cursor.execute("CREATE TABLE parameter_rows(i INT, s STRING)")  # pyright: ignore[reportUnknownMemberType]
+            cursor.executemany(  # pyright: ignore[reportUnknownMemberType]
+                "INSERT INTO parameter_rows VALUES (?, ?)",
+                [(1, malicious), (2, None), (3, "?")],
+            )
+            cursor.execute("SELECT i, s FROM parameter_rows ORDER BY i")  # pyright: ignore[reportUnknownMemberType]
+            assert cursor.fetchall() == [  # pyright: ignore[reportUnknownMemberType]
+                (1, malicious),
+                (2, None),
+                (3, "?"),
+            ]
+        finally:
+            cursor.execute("DROP TABLE IF EXISTS parameter_rows")  # pyright: ignore[reportUnknownMemberType]
+
+
+@pytest.mark.integration
 def test_write_database_roundtrip(monetdb_uri: str) -> None:
     df = pl.DataFrame(
         {
