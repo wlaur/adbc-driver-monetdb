@@ -728,7 +728,37 @@ fn civil_from_days(days: i32) -> (i32, u8, u8) {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
+    use crate::decode::decode_strings;
+
     use super::*;
+
+    fn string_values() -> impl Strategy<Value = Vec<Option<String>>> {
+        let arbitrary = proptest::string::string_regex("[^\\x00]{0,80}")
+            .expect("the property-test regex is valid")
+            .prop_map(Some);
+        prop::collection::vec(
+            prop_oneof![
+                2 => Just(None),
+                3 => Just(Some(String::new())),
+                3 => Just(Some("repeated".to_owned())),
+                3 => Just(Some("数据库".to_owned())),
+                9 => arbitrary,
+            ],
+            0..300,
+        )
+    }
+
+    proptest! {
+        #[test]
+        fn string_codec_round_trips(values in string_values()) {
+            let mut encoded = Vec::new();
+            encode_strings(values.iter().map(Option::as_deref), &mut encoded).unwrap();
+            let decoded = decode_strings(&encoded, values.len()).unwrap();
+            prop_assert_eq!(decoded.iter().collect::<Vec<_>>(), values.iter().map(Option::as_deref).collect::<Vec<_>>());
+        }
+    }
 
     #[test]
     fn encodes_signed_values_and_nulls() {

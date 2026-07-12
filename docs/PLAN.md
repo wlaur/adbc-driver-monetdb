@@ -84,8 +84,8 @@ as upstream-shaped MPL-2.0 changes so they can be offered back to
 - [x] blob (i64 length prefix, `~0` = NULL), uuid (16 B, all-zero = NULL), inet4/inet6
 - [x] encoders for every type above (COPY BINARY little-endian), including
       dictionary/categorical strings → back-reference encoding
-- [ ] golden-fixture tests for every type (bytes captured from a real server), plus
-      property tests for the string/backref codec
+- [x] golden-fixture tests for every supported type (column bytes captured from
+      Dec2025-SP3), plus property tests for the string/backref codec
 
 ### M3 — ADBC surface (crates/adbc-monetdb)
 

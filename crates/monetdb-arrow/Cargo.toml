@@ -13,5 +13,8 @@ arrow-buffer.workspace = true
 arrow-schema.workspace = true
 monetdb.workspace = true
 
+[dev-dependencies]
+proptest = "1"
+
 [lints]
 workspace = true

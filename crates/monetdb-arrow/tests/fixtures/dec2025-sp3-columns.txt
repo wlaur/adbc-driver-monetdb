@@ -1,0 +1,31 @@
+# Captured from monetdb/monetdb:Dec2025-SP3 on a little-endian server.
+# Each buffer contains one non-NULL value followed by the type's NULL sentinel.
+# name|MAPI type|precision|scale|COPY BINARY column bytes (hex)
+bool_v|boolean|0|0|0180
+i8_v|tinyint|0|0|0780
+i16_v|smallint|0|0|2c010080
+i32_v|int|0|0|7011010000000080
+i64_v|bigint|0|0|00f2052a010000000000000000000080
+i128_v|hugeint|0|0|d20a3f4eeee073c3f60fe98e0100000000000000000000000000000000000080
+dec2_v|decimal|2|0|0c80
+dec4_v|decimal|4|2|d2040080
+dec9_v|decimal|9|0|15cd5b0700000080
+dec18_v|decimal|18|0|4ef330a64b9bb6010000000000000080
+dec38_v|decimal|38|0|4ef338de509049c4133302f0f6b0490900000000000000000000000000000080
+f32_v|real|0|0|0000c03f0000c07f
+f64_v|double|0|0|0000000000000440000000000000f87f
+str_v|varchar|0|0|68656c6c6f008000
+blob_v|blob|0|0|020000000000000000ffffffffffffffffff
+date_v|date|0|0|1f0ce907ffffffff
+time_v|time|0|0|40e2010003020100ffffffffffffffff
+timetz_v|timetz|0|0|40e2010003020100ffffffffffffffff
+ts_v|timestamp|0|0|40e20100030201001f0ce907ffffffffffffffffffffffff
+tstz_v|timestamptz|0|0|40e20100030201001f0ce907ffffffffffffffffffffffff
+month_v|month_interval|0|0|0e00000000000080
+day_v|day_interval|0|0|00b84c0a000000000000000000000080
+sec_v|sec_interval|0|0|d2040000000000000000000000000080
+uuid_v|uuid|0|0|1234567812345678123456781234567800000000000000000000000000000000
+inet4_v|inet4|0|0|7f00000100000000
+inet6_v|inet6|0|0|20010db800000000000000000000000100000000000000000000000000000000
+json_v|json|0|0|7b2278223a317d008000
+url_v|url|0|0|68747470733a2f2f6578616d706c652e636f6d2f78008000

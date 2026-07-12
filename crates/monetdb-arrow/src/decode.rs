@@ -351,7 +351,7 @@ fn decimal_array(
     Ok(Decimal128Array::from(values).with_precision_and_scale(precision, scale)?)
 }
 
-fn decode_strings(bytes: &[u8], rows: usize) -> Result<StringArray, DecodeError> {
+pub(crate) fn decode_strings(bytes: &[u8], rows: usize) -> Result<StringArray, DecodeError> {
     let mut builder = StringBuilder::with_capacity(rows, bytes.len());
     let mut history: Vec<Option<&str>> = Vec::with_capacity(rows);
     let mut pos = 0;
@@ -622,6 +622,241 @@ mod tests {
     use arrow_array::Array;
 
     use super::*;
+
+    fn golden_columns() -> Vec<Vec<u8>> {
+        include_str!("../tests/fixtures/dec2025-sp3-columns.txt")
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .map(|line| {
+                let hex = line.rsplit('|').next().expect("fixture line has hex bytes");
+                assert_eq!(hex.len() % 2, 0);
+                hex.as_bytes()
+                    .chunks_exact(2)
+                    .map(|digits| {
+                        u8::from_str_radix(
+                            std::str::from_utf8(digits).expect("hex digits are ASCII"),
+                            16,
+                        )
+                        .expect("fixture contains valid hex")
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn decodes_real_server_golden_columns() {
+        let types = [
+            MonetType::Bool,
+            MonetType::TinyInt,
+            MonetType::SmallInt,
+            MonetType::Int,
+            MonetType::BigInt,
+            MonetType::HugeInt,
+            MonetType::Decimal(2, 0),
+            MonetType::Decimal(4, 2),
+            MonetType::Decimal(9, 0),
+            MonetType::Decimal(18, 0),
+            MonetType::Decimal(38, 0),
+            MonetType::Real,
+            MonetType::Double,
+            MonetType::Varchar(0),
+            MonetType::Blob,
+            MonetType::Date,
+            MonetType::Time,
+            MonetType::TimeTz,
+            MonetType::Timestamp,
+            MonetType::TimestampTz,
+            MonetType::MonthInterval,
+            MonetType::DayInterval,
+            MonetType::SecInterval,
+            MonetType::Uuid,
+            MonetType::Inet,
+            MonetType::Inet,
+            MonetType::Json,
+            MonetType::Url,
+        ];
+        let columns = golden_columns();
+        assert_eq!(columns.len(), types.len());
+        let arrays = types
+            .iter()
+            .zip(&columns)
+            .map(|(data_type, bytes)| decode_column(data_type, bytes, 2).unwrap())
+            .collect::<Vec<_>>();
+        for array in &arrays {
+            assert_eq!(array.len(), 2);
+            assert!(!array.is_null(0));
+            assert!(array.is_null(1));
+        }
+
+        assert!(
+            arrays[0]
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .unwrap()
+                .value(0)
+        );
+        assert_eq!(
+            arrays[1]
+                .as_any()
+                .downcast_ref::<Int8Array>()
+                .unwrap()
+                .value(0),
+            7
+        );
+        assert_eq!(
+            arrays[2]
+                .as_any()
+                .downcast_ref::<Int16Array>()
+                .unwrap()
+                .value(0),
+            300
+        );
+        assert_eq!(
+            arrays[3]
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            70_000
+        );
+        assert_eq!(
+            arrays[4]
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            5_000_000_000
+        );
+        assert_eq!(
+            arrays[5]
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .unwrap()
+                .value(0),
+            123_456_789_012_345_678_901_234_567_890
+        );
+        for (index, expected) in [
+            (6, 12),
+            (7, 1_234),
+            (8, 123_456_789),
+            (9, 123_456_789_012_345_678),
+            (10, 12_345_678_901_234_567_890_123_456_789_012_345_678),
+        ] {
+            assert_eq!(
+                arrays[index]
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .unwrap()
+                    .value(0),
+                expected
+            );
+        }
+        assert_eq!(
+            arrays[11]
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap()
+                .value(0),
+            1.5
+        );
+        assert_eq!(
+            arrays[12]
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(0),
+            2.5
+        );
+        assert_eq!(
+            arrays[13]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "hello"
+        );
+        assert_eq!(
+            arrays[14]
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .unwrap()
+                .value(0),
+            [0, 255]
+        );
+        assert_eq!(
+            arrays[15]
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .unwrap()
+                .value(0),
+            20_453
+        );
+        for index in [16, 17] {
+            assert_eq!(
+                arrays[index]
+                    .as_any()
+                    .downcast_ref::<Time64MicrosecondArray>()
+                    .unwrap()
+                    .value(0),
+                3_723_123_456
+            );
+        }
+        for index in [18, 19] {
+            assert_eq!(
+                arrays[index]
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                    .unwrap()
+                    .value(0),
+                1_767_142_923_123_456
+            );
+        }
+        assert_eq!(
+            arrays[20]
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            14
+        );
+        for (index, expected) in [(21, 172_800_000), (22, 1_234)] {
+            assert_eq!(
+                arrays[index]
+                    .as_any()
+                    .downcast_ref::<DurationMillisecondArray>()
+                    .unwrap()
+                    .value(0),
+                expected
+            );
+        }
+        assert_eq!(
+            arrays[23]
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .unwrap()
+                .value(0),
+            [
+                0x12, 0x34, 0x56, 0x78, 0x12, 0x34, 0x56, 0x78, 0x12, 0x34, 0x56, 0x78, 0x12, 0x34,
+                0x56, 0x78,
+            ]
+        );
+        for (index, expected) in [
+            (24, "127.0.0.1"),
+            (25, "2001:db8::1"),
+            (26, "{\"x\":1}"),
+            (27, "https://example.com/x"),
+        ] {
+            assert_eq!(
+                arrays[index]
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .value(0),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn decodes_fixed_width_sentinels() {
