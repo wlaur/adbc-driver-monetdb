@@ -32,6 +32,7 @@ dev = [
     "polars>=1.42",
     "pymonetdb>=1.9",
     "pyarrow>=25.0.0",
+    "adbc-drivers-validation",
 ]
 
 [project.urls]
@@ -111,4 +112,12 @@ reportUnusedImport = false
 testpaths = ["tests"]
 markers = [
     "integration: requires a running MonetDB server (set MONETDB_TEST_URI)",
+    "feature: validation test for an ADBC feature",
+    "requires_features: validation test gated by advertised driver features",
 ]
+
+[tool.uv]
+override-dependencies = ["pyarrow>=25"]
+
+[tool.uv.sources]
+adbc-drivers-validation = { git = "https://github.com/adbc-drivers/validation", rev = "20bcdbe0d498065565e727861ca7e1f94d9b66bb" }

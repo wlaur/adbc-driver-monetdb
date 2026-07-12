@@ -118,7 +118,9 @@ as upstream-shaped MPL-2.0 changes so they can be offered back to
 - [ ] register `monetdb` in
       [adbc-drivers/name-mappings](https://github.com/adbc-drivers/name-mappings)
 - [ ] run the [adbc-drivers/validation](https://github.com/adbc-drivers/validation)
-      pytest suite via a `DriverQuirks` class; publish the feature matrix in the README
+      pytest suite via a `DriverQuirks` class; the harness is pinned and its connection
+      module is green (28 passed, 3 feature skips); finish ingest/query/statement coverage
+      and publish the feature matrix in the README
 - [ ] announce on MonetDB/MonetDB#7464 and offer the protocol work upstream
 
 ## ADBC feature mapping
@@ -184,7 +186,8 @@ convert to UTC → TIMESTAMPTZ; float NaN and null both map to NULL (MonetDB sem
   backing width, temporal edge values, 0-row and multi-window results, wide tables.
   Tests are written first and marked `xfail(strict=False)` until their milestone lands.
 - **Conformance:** the ADBC validation suite (M4) drives the driver through the Python
-  driver manager, so it exercises the same artifact users install.
+  driver manager, so it exercises the same artifact users install. Its driver quirks live
+  under `tests/validation`; validation dependencies are pinned in `uv.lock`.
 
 ## References
 

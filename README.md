@@ -45,9 +45,14 @@ uv run pytest -m "not integration"     # python tests (no server needed)
 cargo test --workspace                 # rust tests
 
 # integration tests against a real server:
-docker run -d -p 50000:50000 -e MDB_DB_ADMIN_PASS=monetdb -e MDB_CREATE_DBS=test \
+docker run -d --platform linux/amd64 -p 50000:50000 \
+    -e MDB_DB_ADMIN_PASS=monetdb -e MDB_CREATE_DBS=test \
     monetdb/monetdb:Dec2025-SP3
 MONETDB_TEST_URI=monetdb://monetdb:monetdb@localhost:50000/test uv run pytest -m integration
+
+# run the reusable ADBC conformance suite:
+MONETDB_TEST_URI=monetdb://monetdb:monetdb@localhost:50000/test \
+    uv run pytest tests/validation
 ```
 
 Lint/typecheck: `uv run ruff check .`, `uv run ruff format --check .`, `uv run pyright`,

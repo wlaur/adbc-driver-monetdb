@@ -12,8 +12,8 @@ use adbc_core::options::{
 use adbc_core::schemas::{GET_INFO_SCHEMA, GET_TABLE_TYPES_SCHEMA};
 use adbc_core::{Connection, Database, Driver, Optionable, PartitionedResult, Statement};
 use arrow_array::{
-    ArrayRef, BooleanArray, Int64Array, RecordBatch, RecordBatchReader, StringArray, UInt32Array,
-    UnionArray, new_empty_array,
+    Array, ArrayRef, BooleanArray, Int64Array, RecordBatch, RecordBatchReader, StringArray,
+    UInt32Array, UnionArray, new_empty_array,
 };
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 use monetdb::{CursorError, Endian, Parameters, ResultColumn, parms::Parm};
@@ -55,6 +55,13 @@ fn map_cursor_error(value: CursorError) -> Error {
         CursorError::Conversion { .. } | CursorError::InvalidRange { .. } => Status::InvalidData,
         CursorError::FileTransfer(_) => Status::InvalidData,
         CursorError::Metadata(_) => Status::Internal,
+        CursorError::Server(ref message)
+            if message.starts_with("42S02!")
+                || message.starts_with("42S22!")
+                || message.starts_with("3F000!") =>
+        {
+            Status::NotFound
+        }
         CursorError::Server(_) => Status::Unknown,
     };
     let mut result = error(value.to_string(), status);
@@ -152,6 +159,9 @@ impl Optionable for MonetdbDatabase {
     type Option = OptionDatabase;
 
     fn set_option(&mut self, key: Self::Option, value: OptionValue) -> Result<()> {
+        if matches!(key, OptionDatabase::Other(_)) {
+            return Err(not_implemented(key.as_ref()));
+        }
         self.options.set(key, value);
         Ok(())
     }
@@ -275,9 +285,17 @@ impl Database for MonetdbDatabase {
             ));
         }
 
+        let inner = Arc::new(Mutex::new(connection));
+        let current_schema =
+            scalar_string(&inner, "SELECT current_schema AS \"__adbc_current_schema\"")?;
+        let mut options = Options::default();
+        options.set(OptionConnection::CurrentCatalog, catalog.clone().into());
+        options.set(OptionConnection::CurrentSchema, current_schema.into());
+        options.set(OptionConnection::AutoCommit, "true".into());
+        options.set(OptionConnection::ReadOnly, "false".into());
         let mut result = MonetdbConnection {
-            inner: Arc::new(Mutex::new(connection)),
-            options: Options::default(),
+            inner,
+            options,
             version,
             catalog,
         };
@@ -338,7 +356,7 @@ impl Optionable for MonetdbConnection {
             OptionConnection::IsolationLevel | OptionConnection::CurrentCatalog => {
                 return Err(not_implemented(key.as_ref()));
             }
-            OptionConnection::Other(_) => {}
+            OptionConnection::Other(_) => return Err(not_implemented(key.as_ref())),
             _ => return Err(not_implemented(key.as_ref())),
         }
         self.options.set(key, value);
@@ -527,6 +545,14 @@ impl Optionable for MonetdbStatement {
                 .ok_or_else(|| error("batch_rows must be positive", Status::InvalidArguments))?;
             self.options.set(key, OptionValue::Int(rows));
             return Ok(());
+        }
+        match &key {
+            OptionStatement::IngestMode
+            | OptionStatement::TargetTable
+            | OptionStatement::TargetCatalog
+            | OptionStatement::TargetDbSchema
+            | OptionStatement::Temporary => {}
+            _ => return Err(not_implemented(key.as_ref())),
         }
         self.options.set(key, value);
         Ok(())
@@ -907,7 +933,7 @@ fn info_value(code: InfoCode, version: (u16, u16, u16)) -> InfoValue {
         }
         InfoCode::DriverName => InfoValue::String(Some("adbc-driver-monetdb".into())),
         InfoCode::DriverVersion => InfoValue::String(Some(env!("CARGO_PKG_VERSION").into())),
-        InfoCode::DriverArrowVersion => InfoValue::String(Some("58.3.0".into())),
+        InfoCode::DriverArrowVersion => InfoValue::String(Some("v58.3.0".into())),
         InfoCode::DriverAdbcVersion => InfoValue::Int(1_001_000),
         _ => InfoValue::String(None),
     }
@@ -1030,6 +1056,24 @@ fn query_reader(
         batch_rows,
         finished: false,
     }))
+}
+
+fn scalar_string(connection: &Arc<Mutex<monetdb::Connection>>, query: &str) -> Result<String> {
+    let mut reader = query_reader(connection, query, 1)?;
+    let batch = reader
+        .next()
+        .transpose()
+        .map_err(Error::from)?
+        .ok_or_else(|| error("scalar query returned no rows", Status::Internal))?;
+    let values = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| error("scalar query did not return a string", Status::Internal))?;
+    if values.is_null(0) {
+        return Err(error("scalar query returned NULL", Status::Internal));
+    }
+    Ok(values.value(0).to_owned())
 }
 
 fn schema_for_query(connection: &Arc<Mutex<monetdb::Connection>>, query: &str) -> Result<Schema> {
