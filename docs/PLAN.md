@@ -103,7 +103,8 @@ as upstream-shaped MPL-2.0 changes so they can be offered back to
       `adbc.ingest.temporary`; DDL generated from the Arrow schema; multi-batch streams
       chunked into successive `COPY BINARY` statements inside one transaction
 - [x] `GetInfo` (vendor_name = "MonetDB" — polars introspects it), `GetTableTypes`
-- [x] `GetTableSchema` and `ExecuteSchema` from a zero-row query result header
+- [x] `GetTableSchema` from `sys.columns` declarations; `ExecuteSchema` from PREPARE metadata
+      reconciled with unambiguous source-column declarations, without executing the query
 - [x] `GetObjects` via `sys.tables` / `sys.columns` / `sys.keys`, including filters,
       XDBC column attributes, and primary/unique/foreign-key constraint usage
 - [x] prepared statements with positional (qmark) parameters: native server-side
@@ -144,8 +145,8 @@ as upstream-shaped MPL-2.0 changes so they can be offered back to
 - [x] validate append destination schemas before binary COPY and make multi-row DML atomic
 - [x] make `ExecuteSchema` metadata-only and keep bound streams intact
 - [x] push `GetObjects` filters into SQL and make wildcard matching time-bounded
-- [ ] expand failure, memory, concurrency, one-row dtype, timezone, and boundary coverage
-- [ ] harden wheel/sdist licensing and CI coverage, then run every local, wheel, and live gate
+- [x] expand failure, memory, concurrency, one-row dtype, timezone, and boundary coverage
+- [x] harden wheel/sdist licensing and CI coverage, then run every local, wheel, and live gate
 
 ## ADBC feature mapping
 
@@ -155,7 +156,7 @@ as upstream-shaped MPL-2.0 changes so they can be offered back to
 | bulk ingest (all four modes) | DDL from Arrow schema + `COPY BINARY INTO ... ON CLIENT` |
 | `adbc.ingest.temporary` | `CREATE LOCAL TEMPORARY TABLE` |
 | prepared statements / bind | `PREPARE`/`EXECUTE`, literal parameter rendering |
-| `GetTableSchema` | zero-row `SELECT * FROM t WHERE FALSE` result header |
+| `GetTableSchema` | declared types and nullability from `sys.columns` |
 | `GetObjects` | SQL over `sys.*` catalogs |
 | transactions / autocommit | handshake option + `Xauto_commit` + SQL |
 | partitioned results | unsupported (MAPI is a single sequential channel) |

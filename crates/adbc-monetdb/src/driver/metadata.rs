@@ -8,8 +8,9 @@ use arrow_array::builder::{
     StructBuilder, make_builder,
 };
 use arrow_array::{Array, BooleanArray, Int32Array, RecordBatch, StringArray};
+use arrow_schema::Schema;
 
-use super::{error, query_reader};
+use super::{error, prepared_arrow_field, prepared_monet_type, query_reader};
 
 #[derive(Debug)]
 pub(super) struct ObjectSchema {
@@ -188,6 +189,50 @@ pub(super) fn load_objects(
     Ok(schemas)
 }
 
+pub(super) fn table_schema(
+    connection: &Arc<Mutex<monetdb::Connection>>,
+    schema_name: &str,
+    table_name: &str,
+) -> Result<Schema> {
+    let query = format!(
+        r#"
+        SELECT c.name, c.type, c.type_digits, c.type_scale, c."null"
+          FROM sys.columns AS c
+          JOIN sys.tables AS t ON t.id = c.table_id
+          JOIN sys.schemas AS s ON s.id = t.schema_id
+         WHERE s.name = {} AND t.name = {}
+         ORDER BY c.number
+        "#,
+        raw_string_literal(schema_name)?,
+        raw_string_literal(table_name)?,
+    );
+    let mut reader = query_reader(connection, &query, super::DEFAULT_BATCH_ROWS)?;
+    let mut fields = Vec::new();
+    for batch in &mut reader {
+        let batch = batch.map_err(Error::from)?;
+        let names = array_as::<StringArray>(&batch, 0)?;
+        let type_names = array_as::<StringArray>(&batch, 1)?;
+        let digits = array_as::<Int32Array>(&batch, 2)?;
+        let scales = array_as::<Int32Array>(&batch, 3)?;
+        let nullable = array_as::<BooleanArray>(&batch, 4)?;
+        for row in 0..batch.num_rows() {
+            let data_type =
+                prepared_monet_type(type_names.value(row), digits.value(row), scales.value(row))?;
+            fields.push(
+                prepared_arrow_field(names.value(row).to_owned(), &data_type)?
+                    .with_nullable(nullable.value(row)),
+            );
+        }
+    }
+    if fields.is_empty() {
+        return Err(error(
+            format!("table '{schema_name}.{table_name}' does not exist"),
+            Status::NotFound,
+        ));
+    }
+    Ok(Schema::new(fields))
+}
+
 fn load_constraints(
     connection: &Arc<Mutex<monetdb::Connection>>,
     schemas: &mut [ObjectSchema],
@@ -347,7 +392,7 @@ fn in_predicate(column: &str, values: Option<&[&str]>) -> Result<Option<String>>
         .transpose()
 }
 
-fn raw_string_literal(value: &str) -> Result<String> {
+pub(super) fn raw_string_literal(value: &str) -> Result<String> {
     if value.contains('\0') {
         return Err(error(
             "metadata filter contains a NUL byte",

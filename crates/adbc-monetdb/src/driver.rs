@@ -24,7 +24,7 @@ use percent_encoding::percent_decode_str;
 
 mod metadata;
 mod parameters;
-use metadata::{like_pattern_matches, load_objects, objects_batch};
+use metadata::{like_pattern_matches, load_objects, objects_batch, table_schema};
 use parameters::{parameter_count, render_arguments, render_row};
 
 const DEFAULT_BATCH_ROWS: usize = 131_072;
@@ -482,13 +482,13 @@ impl Connection for MonetdbConnection {
                 Status::NotFound,
             ));
         }
-        schema_for_query(
-            &self.inner,
-            &format!(
-                "SELECT * FROM {} WHERE FALSE",
-                qualified_name(db_schema, table_name)
-            ),
-        )
+        let schema_name = db_schema
+            .or_else(|| {
+                self.options
+                    .optional_string(OptionConnection::CurrentSchema)
+            })
+            .ok_or_else(|| error("current schema is not set", Status::InvalidState))?;
+        table_schema(&self.inner, schema_name, table_name)
     }
 
     fn get_table_types(&self) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
@@ -735,7 +735,9 @@ impl Statement for MonetdbStatement {
             .ok_or_else(|| error("SQL query is not set", Status::InvalidState))?;
         let parameter_count = parameter_count(query)?;
         if parameter_count == 0 {
-            return Err(not_implemented("preparing parameterless statements"));
+            self.prepared_parameter_schema = Some(Schema::empty());
+            self.prepared = true;
+            return Ok(());
         }
         match prepare_query(&self.connection, query, parameter_count) {
             Ok(metadata) => {
@@ -1187,6 +1189,8 @@ struct PreparedMetadata {
 struct PreparedField {
     data_type: MonetType,
     name: Option<String>,
+    origin_schema: Option<String>,
+    origin_table: Option<String>,
 }
 
 fn prepare_query(
@@ -1254,9 +1258,21 @@ fn prepare_query(
                 .get_str(5)
                 .map_err(map_cursor_error)?
                 .map(str::to_owned);
+            let origin_schema = cursor
+                .get_str(3)
+                .map_err(map_cursor_error)?
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned);
+            let origin_table = cursor
+                .get_str(4)
+                .map_err(map_cursor_error)?
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned);
             fields.push(PreparedField {
                 data_type: prepared_monet_type(&code, digits, scale)?,
                 name,
+                origin_schema,
+                origin_table,
             });
         }
         let result_count = fields.len().checked_sub(parameter_count).ok_or_else(|| {
@@ -1268,6 +1284,7 @@ fn prepare_query(
                 Status::InvalidData,
             )
         })?;
+        restore_declared_result_types(&mut cursor, &mut fields[..result_count])?;
         let parameter_fields = fields
             .drain(result_count..)
             .enumerate()
@@ -1301,6 +1318,97 @@ fn prepare_query(
             .map_err(map_cursor_error)?;
     }
     parsed
+}
+
+fn restore_declared_result_types(
+    cursor: &mut monetdb::Cursor,
+    fields: &mut [PreparedField],
+) -> Result<()> {
+    let table_names = fields
+        .iter()
+        .filter_map(|field| field.origin_table.as_deref())
+        .collect::<HashSet<_>>();
+    if table_names.is_empty() {
+        return Ok(());
+    }
+    let table_names = table_names
+        .into_iter()
+        .map(metadata::raw_string_literal)
+        .collect::<Result<Vec<_>>>()?;
+    cursor
+        .execute(&format!(
+            "SELECT s.name, t.name, c.name, c.type, c.type_digits, c.type_scale \
+             FROM sys.columns AS c \
+             JOIN sys.tables AS t ON t.id = c.table_id \
+             JOIN sys.schemas AS s ON s.id = t.schema_id \
+             WHERE t.name IN ({})",
+            table_names.join(", ")
+        ))
+        .map_err(map_cursor_error)?;
+
+    let mut declared = HashMap::<(String, String, String), MonetType>::new();
+    while cursor.next_row().map_err(map_cursor_error)? {
+        let schema = cursor
+            .get_str(0)
+            .map_err(map_cursor_error)?
+            .ok_or_else(|| error("catalog schema name is NULL", Status::InvalidData))?;
+        let table = cursor
+            .get_str(1)
+            .map_err(map_cursor_error)?
+            .ok_or_else(|| error("catalog table name is NULL", Status::InvalidData))?;
+        let column = cursor
+            .get_str(2)
+            .map_err(map_cursor_error)?
+            .ok_or_else(|| error("catalog column name is NULL", Status::InvalidData))?;
+        let code = cursor
+            .get_str(3)
+            .map_err(map_cursor_error)?
+            .ok_or_else(|| error("catalog column type is NULL", Status::InvalidData))?;
+        let digits = cursor
+            .get::<i32>(4)
+            .map_err(map_cursor_error)?
+            .ok_or_else(|| error("catalog type digits are NULL", Status::InvalidData))?;
+        let scale = cursor
+            .get::<i32>(5)
+            .map_err(map_cursor_error)?
+            .ok_or_else(|| error("catalog type scale is NULL", Status::InvalidData))?;
+        declared.insert(
+            (schema.to_owned(), table.to_owned(), column.to_owned()),
+            prepared_monet_type(code, digits, scale)?,
+        );
+    }
+
+    for field in fields {
+        let (Some(table), Some(column)) = (field.origin_table.as_deref(), field.name.as_deref())
+        else {
+            continue;
+        };
+        let mut candidate = None;
+        let mut ambiguous = false;
+        for ((schema, declared_table, declared_column), data_type) in &declared {
+            if declared_table != table
+                || declared_column != column
+                || field
+                    .origin_schema
+                    .as_deref()
+                    .is_some_and(|origin| origin != schema)
+            {
+                continue;
+            }
+            match candidate {
+                None => candidate = Some(*data_type),
+                Some(previous) if previous == *data_type => {}
+                Some(_) => {
+                    ambiguous = true;
+                    break;
+                }
+            }
+        }
+        if !ambiguous && let Some(data_type) = candidate {
+            field.data_type = data_type;
+        }
+    }
+    Ok(())
 }
 
 fn prepared_monet_type(code: &str, digits: i32, scale: i32) -> Result<MonetType> {
@@ -1396,13 +1504,6 @@ fn scalar_string(connection: &Arc<Mutex<monetdb::Connection>>, query: &str) -> R
         return Err(error("scalar query returned NULL", Status::Internal));
     }
     Ok(values.value(0).to_owned())
-}
-
-fn schema_for_query(connection: &Arc<Mutex<monetdb::Connection>>, query: &str) -> Result<Schema> {
-    let mut cursor = lock_connection(connection)?.cursor();
-    cursor.execute(query).map_err(map_cursor_error)?;
-    let result = cursor.binary_result().map_err(map_cursor_error)?;
-    Ok(schema_for_columns(&result.columns)?.as_ref().clone())
 }
 
 fn execute_update(

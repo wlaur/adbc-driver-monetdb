@@ -143,6 +143,8 @@ def test_long_variable_width_inline_and_binary(monetdb_uri: str) -> None:
 @pytest.mark.integration
 def test_parameterless_reads_do_not_create_prepared_statements(monetdb_uri: str) -> None:
     with dbapi.connect(monetdb_uri) as conn, conn.cursor() as cursor:
+        cursor.adbc_statement.set_sql_query("SELECT 42")  # pyright: ignore[reportUnknownMemberType]
+        cursor.adbc_statement.prepare()  # pyright: ignore[reportUnknownMemberType]
         cursor.execute("SELECT 42")  # pyright: ignore[reportUnknownMemberType]
         assert cursor.fetchone() == (42,)  # pyright: ignore[reportUnknownMemberType]
         cursor.execute("SELECT COUNT(*) FROM sys.prepared_statements")  # pyright: ignore[reportUnknownMemberType]
@@ -203,7 +205,9 @@ def test_metadata_and_schema_apis(monetdb_uri: str) -> None:
                 "table_types", db_schema_filter="sys"
             ),
         )
-        assert str(table_schema) == "table_type_id: int16\ntable_type_name: string"
+        assert str(table_schema) == (
+            "table_type_id: int16 not null\ntable_type_name: string not null"
+        )
         with conn.cursor() as cursor:
             query_schema = cast(
                 object,
@@ -212,6 +216,34 @@ def test_metadata_and_schema_apis(monetdb_uri: str) -> None:
                 ),
             )
             assert str(query_schema) == "value: int32"
+
+
+@pytest.mark.integration
+def test_declared_decimal_schema_is_not_narrowed_by_prepare_statistics(
+    monetdb_uri: str,
+) -> None:
+    with dbapi.connect(monetdb_uri) as conn, conn.cursor() as cursor:
+        try:
+            cursor.execute(  # pyright: ignore[reportUnknownMemberType]
+                "CREATE TABLE decimal_schema_probe (idx INT NOT NULL, value DECIMAL(10, 2))"
+            )
+            cursor.execute(  # pyright: ignore[reportUnknownMemberType]
+                "INSERT INTO decimal_schema_probe VALUES (1, 9999999.99)"
+            )
+            table_schema = cast(
+                object,
+                conn.adbc_get_table_schema("decimal_schema_probe"),  # pyright: ignore[reportUnknownMemberType]
+            )
+            assert str(table_schema) == "idx: int32 not null\nvalue: decimal128(10, 2)"
+            query_schema = cast(
+                object,
+                cursor.adbc_execute_schema(  # pyright: ignore[reportUnknownMemberType]
+                    "SELECT value FROM decimal_schema_probe ORDER BY idx"
+                ),
+            )
+            assert str(query_schema) == "value: decimal128(10, 2)"
+        finally:
+            cursor.execute("DROP TABLE IF EXISTS decimal_schema_probe")  # pyright: ignore[reportUnknownMemberType]
 
 
 @pytest.mark.integration
@@ -632,12 +664,12 @@ def test_repeated_query_rss_is_bounded(monetdb_uri: str) -> None:
 
     with dbapi.connect(monetdb_uri) as conn:
         for _ in range(10):
-            pl.read_database("SELECT value FROM sys.generate_series(1, 10000)", conn)  # pyright: ignore[reportUnknownMemberType]
+            pl.read_database("SELECT value FROM sys.generate_series(1, 10001)", conn)  # pyright: ignore[reportUnknownMemberType]
         gc.collect()
         baseline = rss_bytes()
         for _ in range(200):
             frame = pl.read_database(  # pyright: ignore[reportUnknownMemberType]
-                "SELECT value, CAST(value AS STRING) AS text FROM sys.generate_series(1, 10000)",
+                "SELECT value, CAST(value AS STRING) AS text FROM sys.generate_series(1, 10001)",
                 conn,
             )
             assert frame.height == 10_000

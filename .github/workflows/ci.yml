@@ -55,7 +55,8 @@ jobs:
       - run: cargo test --workspace
       - run: cargo clippy --manifest-path monetdb-rust/Cargo.toml --lib --all-features -- -D warnings
       - run: cargo test --manifest-path monetdb-rust/Cargo.toml --lib --all-features
-      - run: monetdb-rust/checklicense.py --check
+      - run: ./checklicense.py --check
+        working-directory: monetdb-rust
 
   build-sdist:
     name: build sdist
