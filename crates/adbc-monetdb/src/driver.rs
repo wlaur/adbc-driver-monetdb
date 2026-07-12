@@ -16,13 +16,13 @@ use arrow_array::{
     UInt32Array, UnionArray, new_empty_array,
 };
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
-use monetdb::{CursorError, Endian, Parameters, ResultColumn, parms::Parm};
+use monetdb::{CursorError, Endian, MonetType, Parameters, ResultColumn, parms::Parm};
 use percent_encoding::percent_decode_str;
 
 mod metadata;
 mod parameters;
 use metadata::{like_pattern_matches, load_objects, objects_batch};
-use parameters::{parameter_count, render_row};
+use parameters::{parameter_count, render_arguments, render_row};
 
 const DEFAULT_BATCH_ROWS: usize = 131_072;
 const BATCH_ROWS_OPTION: &str = "adbc.monetdb.batch_rows";
@@ -54,6 +54,7 @@ fn map_cursor_error(value: CursorError) -> Error {
         CursorError::Framing(_) | CursorError::BadReply(_) => Status::InvalidData,
         CursorError::Conversion { .. } | CursorError::InvalidRange { .. } => Status::InvalidData,
         CursorError::FileTransfer(_) => Status::InvalidData,
+        CursorError::PreparedResult => Status::InvalidState,
         CursorError::Metadata(_) => Status::Internal,
         CursorError::Server(ref message)
             if message.starts_with("42S02!")
@@ -391,6 +392,10 @@ impl Connection for MonetdbConnection {
             query: None,
             batch_rows: DEFAULT_BATCH_ROWS,
             bound: None,
+            prepared: false,
+            prepared_id: None,
+            prepared_parameter_schema: None,
+            prepared_result_schema: None,
         })
     }
 
@@ -527,6 +532,10 @@ pub struct MonetdbStatement {
     query: Option<String>,
     batch_rows: usize,
     bound: Option<Box<dyn RecordBatchReader + Send>>,
+    prepared: bool,
+    prepared_id: Option<u64>,
+    prepared_parameter_schema: Option<Schema>,
+    prepared_result_schema: Option<Schema>,
 }
 
 impl Optionable for MonetdbStatement {
@@ -606,6 +615,14 @@ impl Statement for MonetdbStatement {
             .query
             .as_deref()
             .ok_or_else(|| error("SQL query is not set", Status::InvalidState))?;
+        if let Some(id) = self.prepared_id {
+            return query_reader_with_source(
+                &self.connection,
+                &format!("EXECUTE {id}()"),
+                query,
+                self.batch_rows,
+            );
+        }
         query_reader(&self.connection, query, self.batch_rows)
     }
 
@@ -623,7 +640,7 @@ impl Statement for MonetdbStatement {
             let mut total = 0i64;
             let mut has_count = false;
             for query in queries {
-                if let Some(rows) = execute_update(&self.connection, &query)? {
+                if let Some(rows) = execute_update(&self.connection, &query.sql)? {
                     total = total.checked_add(rows).ok_or_else(|| {
                         error("affected row count overflows i64", Status::Internal)
                     })?;
@@ -636,10 +653,21 @@ impl Statement for MonetdbStatement {
             .query
             .as_deref()
             .ok_or_else(|| error("SQL query is not set", Status::InvalidState))?;
+        if let Some(id) = self.prepared_id {
+            return execute_update(&self.connection, &format!("EXECUTE {id}()"));
+        }
         execute_update(&self.connection, query)
     }
 
     fn execute_schema(&mut self) -> Result<Schema> {
+        if self
+            .prepared_parameter_schema
+            .as_ref()
+            .is_some_and(|schema| !schema.fields().is_empty())
+            && let Some(schema) = &self.prepared_result_schema
+        {
+            return Ok(schema.clone());
+        }
         if self.bound.is_some() {
             let queries = self.take_bound_queries()?;
             if queries.len() != 1 {
@@ -651,7 +679,7 @@ impl Statement for MonetdbStatement {
                     Status::InvalidArguments,
                 ));
             }
-            return schema_for_query(&self.connection, &queries[0]);
+            return schema_for_query(&self.connection, &queries[0].sql);
         }
         let query = self
             .query
@@ -665,6 +693,9 @@ impl Statement for MonetdbStatement {
     }
 
     fn get_parameter_schema(&self) -> Result<Schema> {
+        if let Some(schema) = &self.prepared_parameter_schema {
+            return Ok(schema.clone());
+        }
         if let Some(bound) = &self.bound {
             return Ok(bound.schema().as_ref().clone());
         }
@@ -679,14 +710,39 @@ impl Statement for MonetdbStatement {
     }
 
     fn prepare(&mut self) -> Result<()> {
+        if self.prepared {
+            return Ok(());
+        }
         let query = self
             .query
             .as_deref()
             .ok_or_else(|| error("SQL query is not set", Status::InvalidState))?;
-        parameter_count(query).map(|_| ())
+        let parameter_count = parameter_count(query)?;
+        match prepare_query(&self.connection, query, parameter_count) {
+            Ok(metadata) => {
+                self.prepared_id = Some(metadata.id);
+                self.prepared_parameter_schema = Some(metadata.parameters);
+                self.prepared_result_schema = Some(metadata.result);
+            }
+            Err(value)
+                if value
+                    .message
+                    .contains("Could not determine type for argument number") =>
+            {
+                self.prepared_parameter_schema = Some(Schema::new(
+                    (0..parameter_count)
+                        .map(|index| Field::new(index.to_string(), DataType::Null, true))
+                        .collect::<Vec<_>>(),
+                ));
+            }
+            Err(value) => return Err(value),
+        }
+        self.prepared = true;
+        Ok(())
     }
 
     fn set_sql_query(&mut self, query: impl AsRef<str>) -> Result<()> {
+        self.clear_prepared();
         self.query = Some(query.as_ref().to_owned());
         Ok(())
     }
@@ -701,7 +757,16 @@ impl Statement for MonetdbStatement {
 }
 
 impl MonetdbStatement {
-    fn take_bound_queries(&mut self) -> Result<Vec<String>> {
+    fn clear_prepared(&mut self) {
+        if let Some(id) = self.prepared_id.take() {
+            let _ = execute_update(&self.connection, &format!("DEALLOCATE {id}"));
+        }
+        self.prepared_parameter_schema = None;
+        self.prepared_result_schema = None;
+        self.prepared = false;
+    }
+
+    fn take_bound_queries(&mut self) -> Result<Vec<ExecutableQuery>> {
         let query = self
             .query
             .as_deref()
@@ -732,7 +797,15 @@ impl MonetdbStatement {
                 ));
             }
             for row in 0..batch.num_rows() {
-                queries.push(render_row(&query, &batch, row)?);
+                let source = render_row(&query, &batch, row)?;
+                let sql = match self.prepared_id {
+                    Some(id) => format!(
+                        "EXECUTE {id}({})",
+                        render_arguments(&batch, row)?.join(", ")
+                    ),
+                    None => source.clone(),
+                };
+                queries.push(ExecutableQuery { sql, source });
             }
         }
         Ok(queries)
@@ -911,6 +984,19 @@ impl MonetdbStatement {
     }
 }
 
+impl Drop for MonetdbStatement {
+    fn drop(&mut self) {
+        if let Some(id) = self.prepared_id.take() {
+            let _ = execute_update(&self.connection, &format!("DEALLOCATE {id}"));
+        }
+    }
+}
+
+struct ExecutableQuery {
+    sql: String,
+    source: String,
+}
+
 enum InfoValue {
     String(Option<String>),
     Bool(bool),
@@ -1012,9 +1098,140 @@ fn info_batch(version: (u16, u16, u16), codes: Option<HashSet<InfoCode>>) -> Res
     )?)
 }
 
+struct PreparedMetadata {
+    id: u64,
+    parameters: Schema,
+    result: Schema,
+}
+
+struct PreparedField {
+    data_type: MonetType,
+    name: Option<String>,
+}
+
+fn prepare_query(
+    connection: &Arc<Mutex<monetdb::Connection>>,
+    query: &str,
+    parameter_count: usize,
+) -> Result<PreparedMetadata> {
+    let query = query.trim().trim_end_matches(';');
+    let mut cursor = connection
+        .lock()
+        .expect("connection mutex is not poisoned")
+        .cursor();
+    cursor
+        .execute(&format!("PREPARE {query}"))
+        .map_err(map_cursor_error)?;
+    let id = cursor.prepared_statement_id().ok_or_else(|| {
+        error(
+            "MonetDB did not return prepared statement metadata",
+            Status::InvalidData,
+        )
+    })?;
+    let parsed = (|| {
+        let mut fields = Vec::new();
+        while cursor.next_row().map_err(map_cursor_error)? {
+            let code = cursor
+                .get_str(0)
+                .map_err(map_cursor_error)?
+                .ok_or_else(|| error("prepared type is NULL", Status::InvalidData))?
+                .to_owned();
+            let digits = cursor
+                .get::<i32>(1)
+                .map_err(map_cursor_error)?
+                .ok_or_else(|| error("prepared type digits are NULL", Status::InvalidData))?;
+            let scale = cursor
+                .get::<i32>(2)
+                .map_err(map_cursor_error)?
+                .ok_or_else(|| error("prepared type scale is NULL", Status::InvalidData))?;
+            let name = cursor
+                .get_str(5)
+                .map_err(map_cursor_error)?
+                .map(str::to_owned);
+            fields.push(PreparedField {
+                data_type: prepared_monet_type(&code, digits, scale)?,
+                name,
+            });
+        }
+        let result_count = fields.len().checked_sub(parameter_count).ok_or_else(|| {
+            error(
+                format!(
+                    "PREPARE returned {} metadata rows for {parameter_count} parameters",
+                    fields.len()
+                ),
+                Status::InvalidData,
+            )
+        })?;
+        let parameter_fields = fields
+            .drain(result_count..)
+            .enumerate()
+            .map(|(index, field)| prepared_arrow_field(index.to_string(), &field.data_type))
+            .collect::<Result<Vec<_>>>()?;
+        let result_fields = fields
+            .into_iter()
+            .enumerate()
+            .map(|(index, field)| {
+                prepared_arrow_field(
+                    field
+                        .name
+                        .filter(|name| !name.is_empty())
+                        .unwrap_or_else(|| format!("column_{index}")),
+                    &field.data_type,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(PreparedMetadata {
+            id,
+            parameters: Schema::new(parameter_fields),
+            result: Schema::new(result_fields),
+        })
+    })();
+    if parsed.is_err() {
+        let _ = cursor.execute(&format!("DEALLOCATE {id}"));
+    }
+    parsed
+}
+
+fn prepared_monet_type(code: &str, digits: i32, scale: i32) -> Result<MonetType> {
+    let mut data_type = MonetType::from_mapi_code(code).ok_or_else(|| {
+        error(
+            format!("unknown MonetDB prepared type '{code}'"),
+            Status::InvalidData,
+        )
+    })?;
+    match &mut data_type {
+        MonetType::Decimal(precision, decimal_scale) => {
+            *precision = u8::try_from(digits)
+                .map_err(|_| error("prepared decimal precision is invalid", Status::InvalidData))?;
+            *decimal_scale = u8::try_from(scale)
+                .map_err(|_| error("prepared decimal scale is invalid", Status::InvalidData))?;
+        }
+        MonetType::Varchar(width) => {
+            *width = u32::try_from(digits)
+                .map_err(|_| error("prepared string width is invalid", Status::InvalidData))?;
+        }
+        _ => {}
+    }
+    Ok(data_type)
+}
+
+fn prepared_arrow_field(name: String, data_type: &MonetType) -> Result<Field> {
+    monetdb_arrow::field_for_monet_type(name, data_type)
+        .map_err(|value| map_display(value, Status::InvalidData))
+}
+
 fn query_reader(
     connection: &Arc<Mutex<monetdb::Connection>>,
     query: &str,
+    batch_rows: usize,
+) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
+    query_reader_with_source(connection, query, query, batch_rows)
+}
+
+fn query_reader_with_source(
+    connection: &Arc<Mutex<monetdb::Connection>>,
+    query: &str,
+    source_query: &str,
     batch_rows: usize,
 ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
     let mut cursor = connection
@@ -1028,7 +1245,7 @@ fn query_reader(
     let mut result = cursor.binary_result().map_err(map_cursor_error)?;
     let total_rows = result.total_rows;
     if total_rows == 1 {
-        let query = query.trim().trim_end_matches(';');
+        let query = source_query.trim().trim_end_matches(';');
         cursor
             .execute(&format!(
                 "WITH \"__adbc_source\" AS (\n{query}\n) \
@@ -1058,14 +1275,14 @@ fn query_reader(
 
 fn parameter_query_reader(
     connection: &Arc<Mutex<monetdb::Connection>>,
-    queries: Vec<String>,
+    queries: Vec<ExecutableQuery>,
     batch_rows: usize,
 ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
     let mut queries = VecDeque::from(queries);
     let first = queries
         .pop_front()
         .ok_or_else(|| error("no parameter rows to execute", Status::InvalidArguments))?;
-    let current = query_reader(connection, &first, batch_rows)?;
+    let current = query_reader_with_source(connection, &first.sql, &first.source, batch_rows)?;
     let schema = current.schema();
     Ok(Box::new(ParameterQueryReader {
         connection: Arc::clone(connection),
@@ -1179,7 +1396,7 @@ impl RecordBatchReader for BinaryReader {
 
 struct ParameterQueryReader {
     connection: Arc<Mutex<monetdb::Connection>>,
-    queries: VecDeque<String>,
+    queries: VecDeque<ExecutableQuery>,
     current: Option<Box<dyn RecordBatchReader + Send + 'static>>,
     schema: SchemaRef,
     batch_rows: usize,
@@ -1197,7 +1414,12 @@ impl Iterator for ParameterQueryReader {
             }
             self.current = None;
             let query = self.queries.pop_front()?;
-            match query_reader(&self.connection, &query, self.batch_rows) {
+            match query_reader_with_source(
+                &self.connection,
+                &query.sql,
+                &query.source,
+                self.batch_rows,
+            ) {
                 Ok(reader) if reader.schema() == self.schema => self.current = Some(reader),
                 Ok(_) => {
                     return Some(Err(ArrowError::SchemaError(

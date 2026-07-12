@@ -62,8 +62,8 @@ as upstream-shaped MPL-2.0 changes so they can be offered back to
 - [x] `Xexportbin <resid> <start> <count>` command + binary response framing
 - [x] `Xreply_size` control (small text prefix, bulk via binary windows)
 - [x] transactions: autocommit handshake option, `Xauto_commit`, commit/rollback
-- [ ] `PREPARE` / `EXECUTE` (text descriptions; `Q_PREPARE` result sets are text-only
-      in the MAPI protocol)
+- [x] `PREPARE` / `EXECUTE`, including typed text metadata from `Q_PREPARE`; the driver
+      falls back to literal execution only when MonetDB cannot infer an untyped parameter
 - [x] file-transfer uploads (the `rb` subprotocol) for `COPY BINARY ... ON CLIENT`,
       serving named "files" from in-memory column buffers
 - [x] expose the server fingerprint: endianness (challenge field 5), `BINARY` level,
@@ -101,8 +101,9 @@ as upstream-shaped MPL-2.0 changes so they can be offered back to
 - [x] `GetTableSchema` and `ExecuteSchema` from a zero-row query result header
 - [x] `GetObjects` via `sys.tables` / `sys.columns` / `sys.keys`, including filters,
       XDBC column attributes, and primary/unique/foreign-key constraint usage
-- [x] prepared statements with positional (qmark) parameters rendered as typed SQL literals
-      (MonetDB has no wire-level binary bind; bulk data goes through ingest)
+- [x] prepared statements with positional (qmark) parameters: native server-side
+      `PREPARE` / `EXECUTE` with typed SQL literals, falling back to direct literal
+      execution for parameters MonetDB cannot infer (bulk data goes through ingest)
 - [x] error mapping: MAPI error strings → ADBC status + SQLSTATE (MonetDB prefixes
       errors with a 5-character SQLSTATE)
 - [x] geometry/xml columns: fail with guidance to cast to text in SQL

@@ -22,17 +22,7 @@ pub(super) fn parameter_count(query: &str) -> Result<usize> {
 }
 
 pub(super) fn render_row(query: &str, batch: &RecordBatch, row: usize) -> Result<String> {
-    if row >= batch.num_rows() {
-        return Err(error(
-            "parameter row is out of bounds",
-            Status::InvalidArguments,
-        ));
-    }
-    let values = batch
-        .columns()
-        .iter()
-        .map(|array| literal(array.as_ref(), row))
-        .collect::<Result<Vec<_>>>()?;
+    let values = render_arguments(batch, row)?;
     let (rendered, count) = render_query(query, &values)?;
     if count != values.len() {
         return Err(error(
@@ -44,6 +34,20 @@ pub(super) fn render_row(query: &str, batch: &RecordBatch, row: usize) -> Result
         ));
     }
     Ok(rendered)
+}
+
+pub(super) fn render_arguments(batch: &RecordBatch, row: usize) -> Result<Vec<String>> {
+    if row >= batch.num_rows() {
+        return Err(error(
+            "parameter row is out of bounds",
+            Status::InvalidArguments,
+        ));
+    }
+    batch
+        .columns()
+        .iter()
+        .map(|array| literal(array.as_ref(), row))
+        .collect()
 }
 
 fn render_query(query: &str, values: &[String]) -> Result<(String, usize)> {

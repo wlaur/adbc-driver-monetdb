@@ -127,7 +127,7 @@ def test_prepared_parameters_and_executemany(monetdb_uri: str) -> None:
                 object,
                 cursor.adbc_prepare("SELECT ? + ?"),  # pyright: ignore[reportUnknownMemberType]
             )
-            assert str(parameter_schema) == "0: null\n1: null"
+            assert str(parameter_schema) == "0: decimal128(38, 0)\n1: decimal128(38, 0)"
             cursor.execute(  # pyright: ignore[reportUnknownMemberType]
                 "SELECT ? AS i, '?' AS literal_qmark, ? AS s, ? AS b, "
                 "CAST(? AS DECIMAL(9, 2)) AS d, ? AS dt, ? AS tm, ? AS ts, ? AS tstz, ? AS iv",
@@ -168,6 +168,40 @@ def test_prepared_parameters_and_executemany(monetdb_uri: str) -> None:
             ]
         finally:
             cursor.execute("DROP TABLE IF EXISTS parameter_rows")  # pyright: ignore[reportUnknownMemberType]
+
+
+@pytest.mark.integration
+def test_native_prepared_statement_lifecycle(monetdb_uri: str) -> None:
+    with dbapi.connect(monetdb_uri) as conn:
+        with conn.cursor() as prepared:
+            schema = cast(
+                object,
+                prepared.adbc_prepare("SELECT 1 + ? AS value"),  # pyright: ignore[reportUnknownMemberType]
+            )
+            assert str(schema) == "0: decimal128(38, 0)"
+            with conn.cursor() as audit:
+                audit.execute("SELECT COUNT(*) FROM sys.prepared_statements")  # pyright: ignore[reportUnknownMemberType]
+                row = cast(
+                    tuple[object, ...] | None,
+                    audit.fetchone(),  # pyright: ignore[reportUnknownMemberType]
+                )
+                assert row is not None
+                assert row[0] == 2
+            prepared.execute("SELECT 1 + ? AS value", [41])  # pyright: ignore[reportUnknownMemberType]
+            row = cast(
+                tuple[object, ...] | None,
+                prepared.fetchone(),  # pyright: ignore[reportUnknownMemberType]
+            )
+            assert row is not None
+            assert row[0] == 42
+        with conn.cursor() as audit:
+            audit.execute("SELECT COUNT(*) FROM sys.prepared_statements")  # pyright: ignore[reportUnknownMemberType]
+            row = cast(
+                tuple[object, ...] | None,
+                audit.fetchone(),  # pyright: ignore[reportUnknownMemberType]
+            )
+            assert row is not None
+            assert row[0] == 1
 
 
 @pytest.mark.integration

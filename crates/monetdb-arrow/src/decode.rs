@@ -108,8 +108,15 @@ pub fn decode_frame(frame: &[u8], columns: &[ResultColumn]) -> Result<RecordBatc
 }
 
 pub fn field_for_column(column: &ResultColumn) -> Result<Field, DecodeError> {
-    let mut field = Field::new(column.name(), data_type(column.sql_type())?, true);
-    let extension = match column.sql_type() {
+    field_for_monet_type(column.name(), column.sql_type())
+}
+
+pub fn field_for_monet_type(
+    name: impl Into<String>,
+    data_type: &MonetType,
+) -> Result<Field, DecodeError> {
+    let mut field = Field::new(name, data_type_for_monet_type(data_type)?, true);
+    let extension = match data_type {
         MonetType::Json => Some("arrow.json"),
         MonetType::Uuid => Some("arrow.uuid"),
         MonetType::MonthInterval => Some("monetdb.interval_month"),
@@ -121,7 +128,7 @@ pub fn field_for_column(column: &ResultColumn) -> Result<Field, DecodeError> {
     Ok(field)
 }
 
-fn data_type(data_type: &MonetType) -> Result<DataType, DecodeError> {
+pub fn data_type_for_monet_type(data_type: &MonetType) -> Result<DataType, DecodeError> {
     Ok(match *data_type {
         MonetType::Bool => DataType::Boolean,
         MonetType::TinyInt => DataType::Int8,
@@ -973,7 +980,9 @@ mod tests {
             Err(DecodeError::InvalidValue { .. })
         ));
         assert_eq!(
-            data_type(&MonetType::Geometry).unwrap_err().to_string(),
+            data_type_for_monet_type(&MonetType::Geometry)
+                .unwrap_err()
+                .to_string(),
             "MonetDB type GEOMETRY is not available through Xexportbin; cast the column to VARCHAR in SQL"
         );
     }
