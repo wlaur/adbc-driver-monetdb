@@ -61,7 +61,11 @@ def test_one_row_all_supported_types(monetdb_uri: str) -> None:
         SELECT TRUE AS b,
                CAST(-7 AS TINYINT) AS i8,
                CAST(123456789012345678901234567890 AS HUGEINT) AS hi,
-               CAST(1.23 AS DECIMAL(9, 2)) AS d,
+               CAST(-9 AS DECIMAL(2, 0)) AS d2,
+               CAST(-1.25 AS DECIMAL(4, 2)) AS d4,
+               CAST(1.23 AS DECIMAL(9, 2)) AS d9,
+               CAST(123456789012.345678 AS DECIMAL(18, 6)) AS d18,
+               CAST(1234567890123456789012345678.1234567890 AS DECIMAL(38, 10)) AS d38,
                R'tail\' AS s,
                BLOB '00ff' AS blob_v,
                DATE '2038-01-19' AS date_v,
@@ -75,13 +79,18 @@ def test_one_row_all_supported_types(monetdb_uri: str) -> None:
                CAST('::1' AS INET6) AS inet6_v,
                JSON '{"x":"ä"}' AS json_v,
                URL 'https://example.com/ä' AS url_v,
+               '' AS empty_v,
                CAST(NULL AS STRING) AS null_v
     """
     expected = (
         True,
         -7,
         Decimal("123456789012345678901234567890"),
+        Decimal("-9"),
+        Decimal("-1.25"),
         Decimal("1.23"),
+        Decimal("123456789012.345678"),
+        Decimal("1234567890123456789012345678.1234567890"),
         "tail\\",
         b"\x00\xff",
         date(2038, 1, 19),
@@ -95,6 +104,7 @@ def test_one_row_all_supported_types(monetdb_uri: str) -> None:
         "::1",
         '{"x":"ä"}',
         "https://example.com/ä",
+        "",
         None,
     )
     with dbapi.connect(monetdb_uri) as conn, conn.cursor() as cursor:
@@ -114,6 +124,20 @@ def test_one_row_all_supported_types(monetdb_uri: str) -> None:
         assert cursor.fetchall() == [expected, expected]  # pyright: ignore[reportUnknownMemberType]
         two_description = cast(object, cursor.description)  # pyright: ignore[reportUnknownMemberType]
         assert two_description == one_description == zero_description
+
+
+@pytest.mark.integration
+def test_long_variable_width_inline_and_binary(monetdb_uri: str) -> None:
+    projection = "SELECT REPEAT('ä', 65537) AS text_v, CAST(REPEAT('ab', 65537) AS BLOB) AS blob_v"
+    expected = ("ä" * 65_537, b"\xab" * 65_537)
+    with dbapi.connect(monetdb_uri) as connection, connection.cursor() as cursor:
+        cursor.execute(f"{projection} LIMIT 1")  # pyright: ignore[reportUnknownMemberType]
+        assert cursor.fetchone() == expected  # pyright: ignore[reportUnknownMemberType]
+
+        cursor.execute(  # pyright: ignore[reportUnknownMemberType]
+            f"{projection} FROM sys.generate_series(1, 3) LIMIT 2"
+        )
+        assert cursor.fetchall() == [expected, expected]  # pyright: ignore[reportUnknownMemberType]
 
 
 @pytest.mark.integration

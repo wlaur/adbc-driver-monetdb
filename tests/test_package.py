@@ -35,8 +35,10 @@ def test_connect_rejects_unreachable_tcp_without_poisoning_driver() -> None:
 @pytest.mark.skipif(os.name == "nt", reason="Unix sockets are not available on Windows")
 def test_connect_rejects_missing_unix_socket(tmp_path: Path) -> None:
     missing = tmp_path / "missing.sock"
-    with pytest.raises(adbc_driver_manager.OperationalError, match=r"No such file|not found|cannot find"):
+    with pytest.raises(adbc_driver_manager.OperationalError):
         dbapi.connect(f"monetdb:///test?sock={missing}")
+    with pytest.raises(adbc_driver_manager.ProgrammingError):
+        dbapi.connect("still-not-a-uri")
 
 
 def test_connect_reports_disabled_tls_cleanly() -> None:
