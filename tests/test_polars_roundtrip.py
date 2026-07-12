@@ -21,6 +21,22 @@ def test_read_database(monetdb_uri: str) -> None:
 
 
 @pytest.mark.integration
+def test_polars_uri_resolution_and_streaming_batches(monetdb_uri: str) -> None:
+    frame = pl.read_database_uri("SELECT 42 AS answer", monetdb_uri, engine="adbc")
+    assert frame.get_column("answer").item() == 42
+
+    with dbapi.connect(monetdb_uri) as conn:
+        batches = list(
+            pl.read_database(  # pyright: ignore[reportUnknownMemberType]
+                "SELECT value FROM sys.generate_series(1, 300001)",
+                conn,
+                iter_batches=True,
+            )
+        )
+    assert [batch.height for batch in batches] == [131_072, 131_072, 37_856]
+
+
+@pytest.mark.integration
 def test_one_row_query_executes_once(monetdb_uri: str) -> None:
     with dbapi.connect(monetdb_uri) as conn, conn.cursor() as cursor:
         try:
