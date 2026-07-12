@@ -3,7 +3,7 @@
 An ADBC driver for MonetDB in Rust: reads decode MonetDB's binary result-set protocol
 (`Xexportbin`) directly into Arrow record batches; writes stream Arrow columns through
 `COPY BINARY ... ON CLIENT`. Consumers get MonetDB through the standard ADBC surface —
-polars, pandas ≥ 2.2, R (`adbi`), and anything else that speaks ADBC — instead of
+polars, pandas ≥ 3.0, R (`adbi`), and anything else that speaks ADBC — instead of
 per-value Python object materialization.
 
 Context: [MonetDB/MonetDB#7464](https://github.com/MonetDB/MonetDB/issues/7464) asked for
@@ -116,7 +116,8 @@ as upstream-shaped MPL-2.0 changes so they can be offered back to
 - [x] CI: lint (ruff + pyright strict), rust (fmt/clippy/test), abi3 wheels for all four
       platforms (cibuildwheel + maturin), wheel smoke tests on 3.13/3.14, integration job
       against a dockerized MonetDB
-- [ ] sdist build + PyPI publish via trusted publishing (tag-driven, already scaffolded)
+- [x] sdist build, rebuild-from-sdist smoke test, and release artifact upload in CI
+- [ ] PyPI publish via trusted publishing (tag-driven, already scaffolded)
 - [ ] TOML driver manifest so non-Python driver managers (and `dbc install`) can resolve
       the driver by name
 - [ ] register `monetdb` in
@@ -125,7 +126,7 @@ as upstream-shaped MPL-2.0 changes so they can be offered back to
       pytest suite via a pinned `DriverQuirks` harness: 242 passed, 6 intentional feature
       skips, and 3 subtests passed against Dec2025-SP3. MonetDB-specific fixtures document
       the signed-integer NULL sentinels, microsecond temporal precision, and BLOB syntax
-- [ ] publish the ADBC validation feature matrix in the README
+- [x] publish the ADBC validation feature matrix in the README
 - [ ] announce on MonetDB/MonetDB#7464 and offer the protocol work upstream
 
 ## ADBC feature mapping

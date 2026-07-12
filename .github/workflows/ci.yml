@@ -2,6 +2,7 @@ name: CI/release
 
 # lint          -> ruff check + format, pyright (strict)
 # rust          -> cargo fmt, clippy (-D warnings), workspace tests
+# build-sdist   -> sdist, then rebuild and smoke-test a wheel from that sdist
 # build-wheels  -> one abi3 (cp313) wheel per platform via cibuildwheel + maturin
 # test          -> install each prebuilt wheel + run the python suite, every OS x py
 # integration   -> wheel against a dockerized MonetDB (Dec2025-SP3)
@@ -53,6 +54,30 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
+  build-sdist:
+    name: build sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: true
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          python-version: "3.13"
+      - run: uv build --sdist --out-dir dist
+      - name: Rebuild and smoke-test from the sdist
+        shell: bash
+        run: |
+          uv build dist/*.tar.gz --wheel --out-dir sdist-wheel
+          wheel=$(find sdist-wheel -maxdepth 1 -name 'adbc_driver_monetdb-*.whl' -print -quit)
+          uv run --isolated --no-project --python 3.13 --with "$wheel" \
+            python -c "import adbc_driver_monetdb as m; assert m.__version__; print(m.driver_path())"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
   build-wheels:
     name: build ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
@@ -90,27 +115,23 @@ jobs:
         python: ["3.13", "3.14"]
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
           python-version: ${{ matrix.python }}
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: wheelhouse
           name: wheels-${{ matrix.os }}
-      - name: Install the prebuilt wheel
-        shell: bash
-        run: |
-          python -m pip install --upgrade pip
-          # install the PREBUILT wheel by name (abi3 cp313 installs on 3.14 too) so it
-          # is not rebuilt from source; deps + test deps come from PyPI
-          version=$(python -c 'from pathlib import Path; wheels = sorted(Path("wheelhouse").glob("adbc_driver_monetdb-*.whl")); assert len(wheels) == 1, f"expected exactly one wheel, found {len(wheels)}"; print(wheels[0].name.split("-")[1])')
-          pip install --find-links wheelhouse "adbc-driver-monetdb==$version" pytest polars
       - name: Run the suite against the installed wheel
         # NOT from the workspace: the adbc_driver_monetdb source dir at the repo root
         # would shadow the installed wheel on sys.path (no compiled _native there)
         working-directory: ${{ runner.temp }}
         shell: bash
-        run: python -m pytest "$GITHUB_WORKSPACE/tests" -q -m "not integration"
+        run: |
+          wheel=$(find "$GITHUB_WORKSPACE/wheelhouse" -maxdepth 1 -name 'adbc_driver_monetdb-*.whl' -print -quit)
+          uv run --isolated --no-project --python '${{ matrix.python }}' \
+            --with "$wheel" --with pytest \
+            python -m pytest "$GITHUB_WORKSPACE/tests/test_package.py" -q
 
   integration:
     name: integration (MonetDB Dec2025)
@@ -128,21 +149,17 @@ jobs:
       MONETDB_TEST_URI: monetdb://monetdb:monetdb@localhost:50000/test
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
           python-version: "3.13"
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: wheelhouse
           name: wheels-ubuntu-latest
-      - name: Install the prebuilt wheel
-        run: |
-          python -m pip install --upgrade pip
-          version=$(python -c 'from pathlib import Path; wheels = sorted(Path("wheelhouse").glob("adbc_driver_monetdb-*.whl")); assert len(wheels) == 1; print(wheels[0].name.split("-")[1])')
-          pip install --find-links wheelhouse "adbc-driver-monetdb==$version" pytest polars pymonetdb
       - name: Wait for MonetDB to accept connections
+        shell: bash
         run: |
-          python - <<'PY'
+          uv run --isolated --no-project --python 3.13 --with pymonetdb python - <<'PY'
           import time
           import pymonetdb
           for attempt in range(60):
@@ -160,11 +177,21 @@ jobs:
         # NOT from the workspace: the adbc_driver_monetdb source dir at the repo root
         # would shadow the installed wheel on sys.path (no compiled _native there)
         working-directory: ${{ runner.temp }}
-        run: python -m pytest "$GITHUB_WORKSPACE/tests" -q -m integration
+        shell: bash
+        run: |
+          wheel=$(find "$GITHUB_WORKSPACE/wheelhouse" -maxdepth 1 -name 'adbc_driver_monetdb-*.whl' -print -quit)
+          uv run --isolated --no-project --python 3.13 \
+            --with "$wheel" --with pytest --with polars --with 'pandas>=3.0' \
+            --with pymonetdb --with 'pyarrow>=25' \
+            python -m pytest "$GITHUB_WORKSPACE/tests/test_polars_roundtrip.py" -q
+          uv run --isolated --no-project --python 3.13 \
+            --with "$wheel" --with pytest --with pymonetdb \
+            --with 'adbc-drivers-validation @ git+https://github.com/adbc-drivers/validation@20bcdbe0d498065565e727861ca7e1f94d9b66bb' \
+            python -m pytest "$GITHUB_WORKSPACE/tests/validation" -q
 
   publish:
     name: publish to PyPI
-    needs: [lint, rust, build-wheels, test, integration]
+    needs: [lint, rust, build-sdist, build-wheels, test, integration]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     environment: pypi               # configure the Trusted Publisher against this env
@@ -186,6 +213,10 @@ jobs:
           path: dist
           pattern: wheels-*
           merge-multiple: true
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          name: sdist
       - uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
 
   github-release:

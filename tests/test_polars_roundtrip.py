@@ -3,6 +3,7 @@ from decimal import Decimal
 from typing import cast
 
 import adbc_driver_manager
+import pandas as pd
 import polars as pl
 import pytest
 
@@ -225,6 +226,30 @@ def test_write_database_roundtrip(monetdb_uri: str) -> None:
 
 
 @pytest.mark.integration
+def test_pandas_roundtrip(monetdb_uri: str) -> None:
+    frame = pd.DataFrame({"id": [1, 2, 3], "name": ["a", None, "c"]})
+    with dbapi.connect(monetdb_uri) as conn:
+        try:
+            assert (
+                frame.to_sql(  # pyright: ignore[reportUnknownMemberType]
+                    "pandas_smoke", conn, if_exists="replace", index=False
+                )
+                == 3
+            )
+            result = pd.read_sql(  # pyright: ignore[reportUnknownMemberType]
+                "SELECT id, name FROM pandas_smoke ORDER BY id",
+                conn,
+                dtype_backend="pyarrow",
+            )
+            assert result.to_dict(orient="list") == {
+                "id": [1, 2, 3],
+                "name": ["a", None, "c"],
+            }
+        finally:
+            conn.execute("DROP TABLE IF EXISTS pandas_smoke")  # pyright: ignore[reportUnknownMemberType]
+
+
+@pytest.mark.integration
 def test_ingest_modes_and_temporary_table(monetdb_uri: str) -> None:
     first = pl.concat(
         [pl.DataFrame({"value": [1]}), pl.DataFrame({"value": [2]})],
@@ -286,7 +311,7 @@ def test_dtype_matrix_roundtrip(monetdb_uri: str) -> None:
             pl.Series("dec", [Decimal("1.23"), None, Decimal("-4.56")], dtype=pl.Decimal(9, 2)),
         ]
     )
-    expected = frame.with_columns(  # pyright: ignore[reportUnknownMemberType]
+    expected = frame.with_columns(
         pl.col("u8").cast(pl.Int16),
         pl.col("u16").cast(pl.Int32),
         pl.col("u32").cast(pl.Int64),
