@@ -31,8 +31,12 @@ jobs:
       - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
           python-version: "3.13"
-      # uv sync builds the extension via maturin (rust is preinstalled on the runner),
-      # so pyright checks against the real _native module and installed deps
+      - name: Install current stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      # uv sync builds the extension via maturin, so pyright checks against the real
+      # _native module and installed dependencies.
       - run: uv sync --locked
       - run: uv run --no-sync ruff check .
       - run: uv run --no-sync ruff format --check .
@@ -53,6 +57,10 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - run: cargo clippy --manifest-path monetdb-rust/Cargo.toml --lib --all-features -- -D warnings
+      - run: cargo test --manifest-path monetdb-rust/Cargo.toml --lib --all-features
+      - run: ./checklicense.py --check
+        working-directory: monetdb-rust
 
   build-sdist:
     name: build sdist
@@ -64,6 +72,10 @@ jobs:
       - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
           python-version: "3.13"
+      - name: Install current stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
       - run: uv build --sdist --out-dir dist
       - name: Rebuild and smoke-test from the sdist
         shell: bash
@@ -95,11 +107,44 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           submodules: true
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+      - name: Install current stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
       - name: Build wheels
         uses: pypa/cibuildwheel@a0a973acdc9e7b7f8b04ac5c80e6883a5a102615 # v4.1.0
         with:
           package-dir: .
           output-dir: wheelhouse
+      - name: Audit Linux wheel dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: uvx --from auditwheel auditwheel show wheelhouse/*.whl
+      - name: Audit macOS wheel dependencies
+        if: runner.os == 'macOS'
+        shell: bash
+        run: uvx --from delocate delocate-listdeps wheelhouse/*.whl
+      - name: Audit Windows architecture and runtime dependencies
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $unpack = Join-Path $env:RUNNER_TEMP "adbc-wheel-audit"
+          New-Item -ItemType Directory -Path $unpack | Out-Null
+          $wheel = Get-ChildItem wheelhouse\*.whl | Select-Object -First 1
+          tar -xf $wheel.FullName -C $unpack
+          $native = Get-ChildItem $unpack -Recurse -Filter "_native*.pyd" | Select-Object -First 1
+          if (-not $native) { throw "wheel contains no _native .pyd" }
+          $dumpbin = Get-ChildItem "${env:ProgramFiles}\Microsoft Visual Studio\*\*\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $dumpbin) { throw "dumpbin.exe was not found" }
+          $headers = & $dumpbin.FullName /headers $native.FullName
+          $imports = & $dumpbin.FullName /dependents $native.FullName
+          $headers | Write-Output
+          $imports | Write-Output
+          if (-not ($headers -match "machine \(x64\)")) { throw "extension is not x86-64 PE" }
+          $forbidden = $imports | Select-String -Pattern '(?i)\b(?:MSVCP|CONCRT)[^\s]*\.dll\b'
+          if ($forbidden) { throw "extension unexpectedly depends on the C++ runtime: $forbidden" }
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: wheels-${{ matrix.os }}
@@ -132,8 +177,9 @@ jobs:
         run: |
           wheel=$(find "$GITHUB_WORKSPACE/wheelhouse" -maxdepth 1 -name 'adbc_driver_monetdb-*.whl' -print -quit)
           uv run --isolated --no-project --python '${{ matrix.python }}' \
-            --with "$wheel" --with pytest \
-            python -m pytest "$GITHUB_WORKSPACE/tests/test_package.py" -q
+            --with "$wheel" --with pytest --with polars --with 'pandas>=3.0' --with 'pyarrow>=25' \
+            python -m pytest "$GITHUB_WORKSPACE/tests" -m 'not integration' \
+              --ignore "$GITHUB_WORKSPACE/tests/validation" -q
 
   integration:
     name: integration (MonetDB Dec2025)
@@ -141,7 +187,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       monetdb:
-        image: monetdb/monetdb:Dec2025-SP3
+        image: monetdb/monetdb:Dec2025-SP3@sha256:a71e6e8c8402beadc51aebf944b465ee5b185c7ae4a9e6808b5d9133ee921786
         ports:
           - 50000:50000
         env:
@@ -151,6 +197,8 @@ jobs:
       MONETDB_TEST_URI: monetdb://monetdb:monetdb@localhost:50000/test
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: true
       - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
           python-version: "3.13"
@@ -185,11 +233,16 @@ jobs:
           uv run --isolated --no-project --python 3.13 \
             --with "$wheel" --with pytest --with polars --with 'pandas>=3.0' \
             --with pymonetdb --with 'pyarrow>=25' \
-            python -m pytest "$GITHUB_WORKSPACE/tests/test_polars_roundtrip.py" -q
+            python -m pytest "$GITHUB_WORKSPACE/tests" -m integration \
+              --ignore "$GITHUB_WORKSPACE/tests/validation" -q
           uv run --isolated --no-project --python 3.13 \
             --with "$wheel" --with pytest --with pymonetdb \
             --with 'adbc-drivers-validation @ git+https://github.com/adbc-drivers/validation@20bcdbe0d498065565e727861ca7e1f94d9b66bb' \
             python -m pytest "$GITHUB_WORKSPACE/tests/validation" -q
+      - name: Run monetdb-rust live protocol tests
+        env:
+          CI_SERVER_URL: monetdb://monetdb:monetdb@localhost:50000/test
+        run: cargo test --manifest-path monetdb-rust/Cargo.toml --test ci --all-features
 
   publish:
     name: publish to PyPI

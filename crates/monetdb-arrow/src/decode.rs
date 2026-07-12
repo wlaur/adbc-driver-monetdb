@@ -14,7 +14,14 @@ use arrow_array::{
     builder::{BinaryBuilder, BooleanBuilder, FixedSizeBinaryBuilder, StringBuilder},
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
-use monetdb::{MonetType, ResultColumn};
+use chrono::{Datelike, FixedOffset, NaiveDate, NaiveTime, TimeZone, Timelike};
+use monetdb::{
+    Cursor, MonetType, ResultColumn,
+    convert::{
+        raw_decimal::RawDecimal,
+        raw_temporal::{RawDate, RawTime, RawTimeTz, RawTimestamp, RawTimestampTz},
+    },
+};
 
 use crate::exportbin::{FrameError, parse_frame};
 
@@ -26,6 +33,7 @@ pub enum DecodeError {
     InvalidValue { row: usize, message: &'static str },
     InvalidUtf8 { row: usize },
     InvalidBackref { row: usize },
+    Cursor(monetdb::CursorError),
     Unsupported(MonetType),
     Arrow(arrow_schema::ArrowError),
 }
@@ -48,6 +56,7 @@ impl fmt::Display for DecodeError {
             }
             Self::InvalidUtf8 { row } => write!(f, "invalid UTF-8 at row {row}"),
             Self::InvalidBackref { row } => write!(f, "invalid string back-reference at row {row}"),
+            Self::Cursor(error) => error.fmt(f),
             Self::Unsupported(data_type) => {
                 if matches!(
                     data_type,
@@ -83,6 +92,19 @@ impl From<arrow_schema::ArrowError> for DecodeError {
     }
 }
 
+impl From<monetdb::CursorError> for DecodeError {
+    fn from(value: monetdb::CursorError) -> Self {
+        Self::Cursor(value)
+    }
+}
+
+fn decimal_scale(scale: u8) -> Result<i8, DecodeError> {
+    i8::try_from(scale).map_err(|_| DecodeError::InvalidValue {
+        row: 0,
+        message: "decimal scale exceeds Arrow's maximum of 127",
+    })
+}
+
 pub fn decode_frame(frame: &[u8], columns: &[ResultColumn]) -> Result<RecordBatch, DecodeError> {
     let frame = parse_frame(frame)?;
     if columns.len() != frame.columns.len() {
@@ -107,6 +129,311 @@ pub fn decode_frame(frame: &[u8], columns: &[ResultColumn]) -> Result<RecordBatc
     Ok(RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)?)
 }
 
+/// Decode the current inline text row of a MAPI result through the same
+/// validated wire-to-Arrow path used by `Xexportbin`.
+pub fn decode_inline_row(
+    cursor: &mut Cursor,
+    columns: &[ResultColumn],
+) -> Result<RecordBatch, DecodeError> {
+    if !cursor.next_row()? {
+        return Err(DecodeError::InvalidValue {
+            row: 0,
+            message: "inline result did not contain a row",
+        });
+    }
+    let fields = columns
+        .iter()
+        .map(field_for_column)
+        .collect::<Result<Vec<_>, _>>()?;
+    let arrays = columns
+        .iter()
+        .enumerate()
+        .map(|(index, column)| {
+            let bytes = inline_wire_value(cursor, index, column.sql_type())?;
+            decode_column(column.sql_type(), &bytes, 1)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if cursor.next_row()? {
+        return Err(DecodeError::InvalidValue {
+            row: 1,
+            message: "inline scalar result contained more than one row",
+        });
+    }
+    Ok(RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)?)
+}
+
+fn inline_wire_value(
+    cursor: &Cursor,
+    index: usize,
+    data_type: &MonetType,
+) -> Result<Vec<u8>, DecodeError> {
+    if cursor.get_str(index)?.is_none() {
+        return null_wire_value(data_type);
+    }
+    Ok(match *data_type {
+        MonetType::Bool => vec![u8::from(required(cursor.get_bool(index)?)?)],
+        MonetType::TinyInt => required(cursor.get_i8(index)?)?.to_le_bytes().to_vec(),
+        MonetType::SmallInt => required(cursor.get_i16(index)?)?.to_le_bytes().to_vec(),
+        MonetType::Int => required(cursor.get_i32(index)?)?.to_le_bytes().to_vec(),
+        MonetType::BigInt => required(cursor.get_i64(index)?)?.to_le_bytes().to_vec(),
+        MonetType::HugeInt => required(cursor.get_i128(index)?)?.to_le_bytes().to_vec(),
+        MonetType::Oid => required(cursor.get_u64(index)?)?.to_le_bytes().to_vec(),
+        MonetType::Decimal(precision, scale) => {
+            let decimal = required(cursor.get::<RawDecimal<i128>>(index)?)?;
+            let value = decimal.at_scale(scale).ok_or(DecodeError::InvalidValue {
+                row: 0,
+                message: "decimal text has more fractional digits than its declared scale",
+            })?;
+            decimal_wire_value(value, precision)?
+        }
+        MonetType::Varchar(_) | MonetType::Url | MonetType::Json => {
+            let value = required(cursor.get_str(index)?)?;
+            let mut bytes = value.as_bytes().to_vec();
+            bytes.push(0);
+            bytes
+        }
+        MonetType::Real => required(cursor.get_f32(index)?)?.to_le_bytes().to_vec(),
+        MonetType::Double => required(cursor.get_f64(index)?)?.to_le_bytes().to_vec(),
+        MonetType::MonthInterval => required(cursor.get_i32(index)?)?.to_le_bytes().to_vec(),
+        MonetType::DayInterval | MonetType::SecInterval => {
+            let decimal = required(cursor.get::<RawDecimal<i64>>(index)?)?;
+            decimal
+                .at_scale(3)
+                .ok_or(DecodeError::InvalidValue {
+                    row: 0,
+                    message: "interval text is not representable in milliseconds",
+                })?
+                .to_le_bytes()
+                .to_vec()
+        }
+        MonetType::Time => time_wire(required(cursor.get::<RawTime>(index)?)?),
+        MonetType::TimeTz => {
+            let value = required(cursor.get::<RawTimeTz>(index)?)?;
+            time_wire(normalize_time(value.time, value.tz.seconds_east)?)
+        }
+        MonetType::Date => date_wire(required(cursor.get::<RawDate>(index)?)?),
+        MonetType::Timestamp => {
+            let value = required(cursor.get::<RawTimestamp>(index)?)?;
+            timestamp_wire(value.date, value.time)
+        }
+        MonetType::TimestampTz => {
+            let value = required(cursor.get::<RawTimestampTz>(index)?)?;
+            let (date, time) = normalize_timestamp(value.date, value.time, value.tz.seconds_east)?;
+            timestamp_wire(date, time)
+        }
+        MonetType::Blob => {
+            let value = required(cursor.get::<Vec<u8>>(index)?)?;
+            let length = i64::try_from(value.len()).map_err(|_| DecodeError::InvalidValue {
+                row: 0,
+                message: "BLOB length does not fit on the wire",
+            })?;
+            let mut bytes = length.to_le_bytes().to_vec();
+            bytes.extend_from_slice(&value);
+            bytes
+        }
+        MonetType::Uuid => uuid::Uuid::parse_str(required(cursor.get_str(index)?)?)
+            .map_err(|_| DecodeError::InvalidValue {
+                row: 0,
+                message: "invalid UUID text",
+            })?
+            .into_bytes()
+            .to_vec(),
+        MonetType::Inet => match required(cursor.get_str(index)?)?
+            .parse::<IpAddr>()
+            .map_err(|_| DecodeError::InvalidValue {
+                row: 0,
+                message: "invalid INET address",
+            })? {
+            IpAddr::V4(value) => value.octets().to_vec(),
+            IpAddr::V6(value) => value.octets().to_vec(),
+        },
+        MonetType::Geometry | MonetType::GeometryA | MonetType::Xml => {
+            return Err(DecodeError::Unsupported(*data_type));
+        }
+    })
+}
+
+fn required<T>(value: Option<T>) -> Result<T, DecodeError> {
+    value.ok_or(DecodeError::InvalidValue {
+        row: 0,
+        message: "non-NULL inline value decoded as NULL",
+    })
+}
+
+fn null_wire_value(data_type: &MonetType) -> Result<Vec<u8>, DecodeError> {
+    Ok(match *data_type {
+        MonetType::Bool => vec![0x80],
+        MonetType::TinyInt => i8::MIN.to_le_bytes().to_vec(),
+        MonetType::SmallInt => i16::MIN.to_le_bytes().to_vec(),
+        MonetType::Int | MonetType::MonthInterval => i32::MIN.to_le_bytes().to_vec(),
+        MonetType::BigInt | MonetType::DayInterval | MonetType::SecInterval => {
+            i64::MIN.to_le_bytes().to_vec()
+        }
+        MonetType::HugeInt => i128::MIN.to_le_bytes().to_vec(),
+        MonetType::Oid => (1u64 << 63).to_le_bytes().to_vec(),
+        MonetType::Decimal(precision, _) => match precision {
+            0..=2 => i8::MIN.to_le_bytes().to_vec(),
+            3..=4 => i16::MIN.to_le_bytes().to_vec(),
+            5..=9 => i32::MIN.to_le_bytes().to_vec(),
+            10..=18 => i64::MIN.to_le_bytes().to_vec(),
+            19..=38 => i128::MIN.to_le_bytes().to_vec(),
+            _ => {
+                return Err(DecodeError::InvalidValue {
+                    row: 0,
+                    message: "decimal precision must be between 1 and 38",
+                });
+            }
+        },
+        MonetType::Varchar(_) | MonetType::Url | MonetType::Json => vec![0x80, 0],
+        MonetType::Real => f32::NAN.to_le_bytes().to_vec(),
+        MonetType::Double => f64::NAN.to_le_bytes().to_vec(),
+        MonetType::Time | MonetType::TimeTz => vec![0xff; 8],
+        MonetType::Date => vec![0xff; 4],
+        MonetType::Timestamp | MonetType::TimestampTz => vec![0xff; 12],
+        MonetType::Blob => (-1i64).to_le_bytes().to_vec(),
+        MonetType::Uuid => vec![0; 16],
+        MonetType::Inet => vec![0; 4],
+        MonetType::Geometry | MonetType::GeometryA | MonetType::Xml => {
+            return Err(DecodeError::Unsupported(*data_type));
+        }
+    })
+}
+
+fn decimal_wire_value(value: i128, precision: u8) -> Result<Vec<u8>, DecodeError> {
+    macro_rules! narrow {
+        ($type:ty) => {
+            <$type>::try_from(value)
+                .map_err(|_| DecodeError::InvalidValue {
+                    row: 0,
+                    message: "decimal value does not fit its backing integer",
+                })?
+                .to_le_bytes()
+                .to_vec()
+        };
+    }
+    Ok(match precision {
+        0..=2 => narrow!(i8),
+        3..=4 => narrow!(i16),
+        5..=9 => narrow!(i32),
+        10..=18 => narrow!(i64),
+        19..=38 => value.to_le_bytes().to_vec(),
+        _ => {
+            return Err(DecodeError::InvalidValue {
+                row: 0,
+                message: "decimal precision must be between 1 and 38",
+            });
+        }
+    })
+}
+
+fn time_wire(value: RawTime) -> Vec<u8> {
+    let mut bytes = value.microseconds.to_le_bytes().to_vec();
+    bytes.extend_from_slice(&[value.seconds, value.minutes, value.hours, 0]);
+    bytes
+}
+
+fn date_wire(value: RawDate) -> Vec<u8> {
+    let mut bytes = vec![value.day, value.month];
+    bytes.extend_from_slice(&value.year.to_le_bytes());
+    bytes
+}
+
+fn timestamp_wire(date: RawDate, time: RawTime) -> Vec<u8> {
+    let mut bytes = time_wire(time);
+    bytes.extend_from_slice(&date_wire(date));
+    bytes
+}
+
+fn normalize_time(value: RawTime, seconds_east: i32) -> Result<RawTime, DecodeError> {
+    let date = NaiveDate::from_ymd_opt(2000, 1, 2).ok_or(DecodeError::InvalidValue {
+        row: 0,
+        message: "could not construct reference date",
+    })?;
+    let time = naive_time(value, 0)?;
+    let utc = fixed_offset(seconds_east)?
+        .from_local_datetime(&date.and_time(time))
+        .single()
+        .ok_or(DecodeError::InvalidValue {
+            row: 0,
+            message: "invalid time zone conversion",
+        })?
+        .naive_utc();
+    Ok(raw_time_from_naive(utc.time()))
+}
+
+fn normalize_timestamp(
+    date: RawDate,
+    time: RawTime,
+    seconds_east: i32,
+) -> Result<(RawDate, RawTime), DecodeError> {
+    let date = naive_date(date, 0)?;
+    let time = naive_time(time, 0)?;
+    let utc = fixed_offset(seconds_east)?
+        .from_local_datetime(&date.and_time(time))
+        .single()
+        .ok_or(DecodeError::InvalidValue {
+            row: 0,
+            message: "invalid timestamp time zone conversion",
+        })?
+        .naive_utc();
+    Ok((
+        raw_date_from_naive(utc.date())?,
+        raw_time_from_naive(utc.time()),
+    ))
+}
+
+fn raw_time_from_naive(value: NaiveTime) -> RawTime {
+    RawTime {
+        microseconds: value.nanosecond() / 1_000,
+        seconds: value.second() as u8,
+        minutes: value.minute() as u8,
+        hours: value.hour() as u8,
+    }
+}
+
+fn naive_date(value: RawDate, row: usize) -> Result<NaiveDate, DecodeError> {
+    NaiveDate::from_ymd_opt(
+        i32::from(value.year),
+        u32::from(value.month),
+        u32::from(value.day),
+    )
+    .ok_or(DecodeError::InvalidValue {
+        row,
+        message: "invalid Gregorian date",
+    })
+}
+
+fn naive_time(value: RawTime, row: usize) -> Result<NaiveTime, DecodeError> {
+    NaiveTime::from_hms_micro_opt(
+        u32::from(value.hours),
+        u32::from(value.minutes),
+        u32::from(value.seconds),
+        value.microseconds,
+    )
+    .ok_or(DecodeError::InvalidValue {
+        row,
+        message: "invalid time of day",
+    })
+}
+
+fn fixed_offset(seconds_east: i32) -> Result<FixedOffset, DecodeError> {
+    FixedOffset::east_opt(seconds_east).ok_or(DecodeError::InvalidValue {
+        row: 0,
+        message: "invalid UTC offset",
+    })
+}
+
+fn raw_date_from_naive(value: NaiveDate) -> Result<RawDate, DecodeError> {
+    Ok(RawDate {
+        day: value.day() as u8,
+        month: value.month() as u8,
+        year: i16::try_from(value.year()).map_err(|_| DecodeError::InvalidValue {
+            row: 0,
+            message: "timestamp year does not fit MonetDB's wire format",
+        })?,
+    })
+}
+
 pub fn field_for_column(column: &ResultColumn) -> Result<Field, DecodeError> {
     field_for_monet_type(column.name(), column.sql_type())
 }
@@ -120,6 +447,7 @@ pub fn field_for_monet_type(
         MonetType::Json => Some("arrow.json"),
         MonetType::Uuid => Some("arrow.uuid"),
         MonetType::MonthInterval => Some("monetdb.interval_month"),
+        MonetType::DayInterval => Some("monetdb.interval_day"),
         _ => None,
     };
     if let Some(name) = extension {
@@ -138,7 +466,7 @@ pub fn data_type_for_monet_type(data_type: &MonetType) -> Result<DataType, Decod
         MonetType::HugeInt => DataType::Decimal128(38, 0),
         MonetType::Oid => DataType::UInt64,
         MonetType::Decimal(precision, scale) => {
-            DataType::Decimal128(precision, i8::try_from(scale).expect("u8 scale fits in i8"))
+            DataType::Decimal128(precision, decimal_scale(scale)?)
         }
         MonetType::Varchar(_) | MonetType::Url | MonetType::Json | MonetType::Inet => {
             DataType::Utf8
@@ -200,14 +528,14 @@ pub fn decode_column(
         MonetType::Oid => Arc::new(UInt64Array::from(decode_signed::<8, u64>(
             bytes,
             row_count,
-            u64::MAX,
+            1u64 << 63,
             u64::from_le_bytes,
         )?)),
         MonetType::Decimal(precision, scale) => Arc::new(decode_decimal(
             bytes,
             row_count,
             precision,
-            i8::try_from(scale).expect("u8 scale fits in i8"),
+            decimal_scale(scale)?,
         )?),
         MonetType::Varchar(_) | MonetType::Url | MonetType::Json => {
             Arc::new(decode_strings(bytes, row_count)?)
@@ -359,9 +687,22 @@ fn decimal_array(
 }
 
 pub(crate) fn decode_strings(bytes: &[u8], rows: usize) -> Result<StringArray, DecodeError> {
+    if rows > bytes.len() {
+        return Err(DecodeError::Length {
+            expected: rows,
+            actual: bytes.len(),
+        });
+    }
+    if bytes.len() > i32::MAX as usize {
+        return Err(DecodeError::InvalidValue {
+            row: 0,
+            message: "UTF-8 column exceeds Arrow's 32-bit offset limit",
+        });
+    }
     let mut builder = StringBuilder::with_capacity(rows, bytes.len());
-    let mut history: Vec<Option<&str>> = Vec::with_capacity(rows);
+    let mut history: Vec<Option<&str>> = Vec::new();
     let mut pos = 0;
+    let mut value_bytes = 0usize;
     for row in 0..rows {
         let Some(&first) = bytes.get(pos) else {
             return Err(DecodeError::Length {
@@ -408,7 +749,22 @@ pub(crate) fn decode_strings(bytes: &[u8], rows: usize) -> Result<StringArray, D
             Some(string)
         };
         match value {
-            Some(value) => builder.append_value(value),
+            Some(value) => {
+                value_bytes =
+                    value_bytes
+                        .checked_add(value.len())
+                        .ok_or(DecodeError::InvalidValue {
+                            row,
+                            message: "UTF-8 column length overflows",
+                        })?;
+                if value_bytes > i32::MAX as usize {
+                    return Err(DecodeError::InvalidValue {
+                        row,
+                        message: "UTF-8 column exceeds Arrow's 32-bit offset limit",
+                    });
+                }
+                builder.append_value(value);
+            }
             None => builder.append_null(),
         }
         history.push(value);
@@ -426,9 +782,11 @@ fn long_backref(bytes: &[u8], row: usize) -> Result<(usize, usize), DecodeError>
     let mut distance = 0usize;
     let mut shift = 0u32;
     for (index, byte) in bytes.iter().copied().enumerate() {
-        let part = usize::from(byte & 0x7f)
-            .checked_shl(shift)
-            .ok_or(DecodeError::InvalidBackref { row })?;
+        let low = usize::from(byte & 0x7f);
+        if low > (usize::MAX >> shift) {
+            return Err(DecodeError::InvalidBackref { row });
+        }
+        let part = low << shift;
         distance = distance
             .checked_add(part)
             .ok_or(DecodeError::InvalidBackref { row })?;
@@ -444,8 +802,25 @@ fn long_backref(bytes: &[u8], row: usize) -> Result<(usize, usize), DecodeError>
 }
 
 fn decode_blob(bytes: &[u8], rows: usize) -> Result<BinaryArray, DecodeError> {
+    let minimum = rows.checked_mul(8).ok_or(DecodeError::InvalidValue {
+        row: 0,
+        message: "BLOB header length overflows",
+    })?;
+    if minimum > bytes.len() {
+        return Err(DecodeError::Length {
+            expected: minimum,
+            actual: bytes.len(),
+        });
+    }
+    if bytes.len().saturating_sub(minimum) > i32::MAX as usize {
+        return Err(DecodeError::InvalidValue {
+            row: 0,
+            message: "BLOB column exceeds Arrow's 32-bit offset limit",
+        });
+    }
     let mut builder = BinaryBuilder::with_capacity(rows, bytes.len());
     let mut pos = 0;
+    let mut value_bytes = 0usize;
     for row in 0..rows {
         let header = bytes.get(pos..pos + 8).ok_or(DecodeError::Length {
             expected: pos + 8,
@@ -465,6 +840,18 @@ fn decode_blob(bytes: &[u8], rows: usize) -> Result<BinaryArray, DecodeError> {
             expected: pos + length,
             actual: bytes.len(),
         })?;
+        value_bytes = value_bytes
+            .checked_add(length)
+            .ok_or(DecodeError::InvalidValue {
+                row,
+                message: "BLOB column length overflows",
+            })?;
+        if value_bytes > i32::MAX as usize {
+            return Err(DecodeError::InvalidValue {
+                row,
+                message: "BLOB column exceeds Arrow's 32-bit offset limit",
+            });
+        }
         builder.append_value(value);
         pos += length;
     }
@@ -507,12 +894,18 @@ fn date_value(value: &[u8], row: usize) -> Result<Option<i32>, DecodeError> {
         return Ok(None);
     }
     let year = i16::from_le_bytes(value[2..4].try_into().expect("date year is 2 bytes"));
-    days_from_civil(i32::from(year), month, day)
-        .map(Some)
-        .ok_or(DecodeError::InvalidValue {
+    let date = naive_date(RawDate { day, month, year }, row)?;
+    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).ok_or(DecodeError::InvalidValue {
+        row,
+        message: "could not construct Unix epoch date",
+    })?;
+    let days = date.signed_duration_since(epoch).num_days();
+    Ok(Some(i32::try_from(days).map_err(|_| {
+        DecodeError::InvalidValue {
             row,
-            message: "invalid Gregorian date",
-        })
+            message: "date is outside Arrow's Date32 range",
+        }
+    })?))
 }
 
 fn decode_time(bytes: &[u8], rows: usize) -> Result<Time64MicrosecondArray, DecodeError> {
@@ -598,30 +991,6 @@ fn decode_inet(bytes: &[u8], rows: usize) -> Result<StringArray, DecodeError> {
         }
     }
     Ok(builder.finish())
-}
-
-fn days_from_civil(year: i32, month: u8, day: u8) -> Option<i32> {
-    let days_in_month = match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if is_leap_year(year) => 29,
-        2 => 28,
-        _ => return None,
-    };
-    if day == 0 || day > days_in_month {
-        return None;
-    }
-    let year = year - i32::from(month <= 2);
-    let era = if year >= 0 { year } else { year - 399 } / 400;
-    let year_of_era = year - era * 400;
-    let month = i32::from(month);
-    let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + i32::from(day) - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    Some(era * 146_097 + day_of_era - 719_468)
-}
-
-fn is_leap_year(year: i32) -> bool {
-    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
 }
 
 #[cfg(test)]
@@ -909,6 +1278,49 @@ mod tests {
     }
 
     #[test]
+    fn rejects_hostile_variable_width_metadata_without_allocating() {
+        assert!(matches!(
+            decode_strings(b"\0", usize::MAX),
+            Err(DecodeError::Length { .. })
+        ));
+        assert!(matches!(
+            decode_blob(&[0; 8], usize::MAX),
+            Err(DecodeError::InvalidValue { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_decimal_scale_outside_arrow_range() {
+        assert!(matches!(
+            data_type_for_monet_type(&MonetType::Decimal(38, 128)),
+            Err(DecodeError::InvalidValue { .. })
+        ));
+        assert!(matches!(
+            decode_column(&MonetType::Decimal(38, 128), &[0; 16], 1),
+            Err(DecodeError::InvalidValue { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_overlong_backref_varint() {
+        if usize::BITS == 64 {
+            let mut encoded = vec![0x80; 10];
+            encoded[9] = 0x02;
+            assert!(matches!(
+                long_backref(&encoded, 1),
+                Err(DecodeError::InvalidBackref { row: 1 })
+            ));
+        }
+    }
+
+    #[test]
+    fn decodes_oid_null_sentinel() {
+        let array = decode_column(&MonetType::Oid, &(1u64 << 63).to_le_bytes(), 1).unwrap();
+        let array = array.as_any().downcast_ref::<UInt64Array>().unwrap();
+        assert!(array.is_null(0));
+    }
+
+    #[test]
     fn rejects_invalid_string_data() {
         assert!(matches!(
             decode_strings(b"unterminated", 1),
@@ -951,6 +1363,74 @@ mod tests {
         let timestamp = [time.as_slice(), date.as_slice()].concat();
         let array = decode_timestamp(&timestamp, 1, false).unwrap();
         assert_eq!(array.value(0), 3_723_123_456);
+    }
+
+    #[test]
+    fn chrono_handles_proleptic_dates_and_timezone_rollover() {
+        for (year, day, valid) in [
+            (-1, 28, true),
+            (0, 29, true),
+            (1900, 29, false),
+            (2000, 29, true),
+        ] {
+            let bytes = [day, 2, year as u8, (year >> 8) as u8];
+            assert_eq!(date_value(&bytes, 0).is_ok(), valid, "year {year}");
+        }
+
+        let time = RawTime {
+            microseconds: 123_456,
+            seconds: 0,
+            minutes: 30,
+            hours: 0,
+        };
+        assert_eq!(
+            normalize_time(time, 3_600).unwrap(),
+            RawTime {
+                microseconds: 123_456,
+                seconds: 0,
+                minutes: 30,
+                hours: 23,
+            }
+        );
+
+        let (date, time) = normalize_timestamp(
+            RawDate {
+                day: 1,
+                month: 1,
+                year: 0,
+            },
+            time,
+            3_600,
+        )
+        .unwrap();
+        assert_eq!(
+            date,
+            RawDate {
+                day: 31,
+                month: 12,
+                year: -1,
+            }
+        );
+        assert_eq!(time.hours, 23);
+        assert_eq!(time.minutes, 30);
+
+        assert!(
+            normalize_timestamp(
+                RawDate {
+                    day: 1,
+                    month: 1,
+                    year: i16::MIN,
+                },
+                RawTime {
+                    microseconds: 0,
+                    seconds: 0,
+                    minutes: 0,
+                    hours: 0,
+                },
+                3_600,
+            )
+            .is_err()
+        );
     }
 
     #[test]

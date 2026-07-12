@@ -21,6 +21,9 @@ with dbapi.connect("monetdb://user:password@localhost:50000/db") as conn:
 df = pl.read_database_uri("SELECT 1", "monetdb://localhost:50000/db", engine="adbc")
 ```
 
+The DB-API connection starts with autocommit disabled, as required by PEP 249. Call
+`conn.commit()`, use the connection context manager, or pass `autocommit=True` explicitly.
+
 The same connection works directly with pandas 3:
 
 ```python
@@ -46,6 +49,7 @@ with dbapi.connect("monetdb://user:password@localhost:50000/db") as conn:
 | Prepared statements, positional binds, and `executemany` | Supported |
 | Bulk ingest: create, append, replace, create-append, schema, temporary tables | Supported |
 | Transactions and autocommit | Supported |
+| TLS (`monetdbs://`) | System roots, certificate file, SHA-256 certificate hash, and client certificates |
 | `GetInfo`, `GetObjects`, `GetTableSchema`, `GetTableTypes`, `ExecuteSchema` | Supported |
 | Query cancellation | Not supported by the current Rust MAPI transport |
 | Partitioned results | Not supported; MAPI exposes one sequential result channel |
@@ -76,7 +80,7 @@ cargo test --workspace                 # rust tests
 # integration tests against a real server:
 docker run -d --platform linux/amd64 -p 50000:50000 \
     -e MDB_DB_ADMIN_PASS=monetdb -e MDB_CREATE_DBS=test \
-    monetdb/monetdb:Dec2025-SP3
+    monetdb/monetdb:Dec2025-SP3@sha256:a71e6e8c8402beadc51aebf944b465ee5b185c7ae4a9e6808b5d9133ee921786
 MONETDB_TEST_URI=monetdb://monetdb:monetdb@localhost:50000/test uv run pytest -m integration
 
 # run the reusable ADBC conformance suite:
@@ -89,4 +93,5 @@ Lint/typecheck: `uv run ruff check .`, `uv run ruff format --check .`, `uv run p
 
 ## License
 
-MIT. The `monetdb` protocol crate (`monetdb-rust`, our fork of MonetDB/monetdb-rust) is MPL-2.0.
+MIT. The `monetdb` protocol crate (`monetdb-rust`, our fork of MonetDB/monetdb-rust) is MPL-2.0;
+its license and corresponding-source notice are included in wheels and source distributions.

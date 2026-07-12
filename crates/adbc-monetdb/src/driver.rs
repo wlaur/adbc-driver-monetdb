@@ -2,7 +2,10 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt,
     os::raw::c_char,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use adbc_core::error::{Error, Result, Status};
@@ -16,19 +19,18 @@ use arrow_array::{
     UInt32Array, UnionArray, new_empty_array,
 };
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
-use monetdb::{
-    BinaryResult, CursorError, Endian, MonetType, Parameters, ResultColumn, parms::Parm,
-};
+use monetdb::{CursorError, Endian, MonetType, Parameters, ResultColumn, parms::Parm};
 use percent_encoding::percent_decode_str;
 
 mod metadata;
 mod parameters;
-use metadata::{like_pattern_matches, load_objects, objects_batch};
+use metadata::{like_pattern_matches, load_objects, objects_batch, table_schema};
 use parameters::{parameter_count, render_arguments, render_row};
 
 const DEFAULT_BATCH_ROWS: usize = 131_072;
 const BATCH_ROWS_OPTION: &str = "adbc.monetdb.batch_rows";
 const MINIMUM_VERSION: (u16, u16, u16) = (11, 55, 0);
+static PREPARE_SAVEPOINT_ID: AtomicU64 = AtomicU64::new(0);
 
 fn error(message: impl Into<String>, status: Status) -> Error {
     Error::with_message_and_status(message, status)
@@ -49,15 +51,25 @@ fn map_display(error: impl fmt::Display, status: Status) -> Error {
     Error::with_message_and_status(error.to_string(), status)
 }
 
+fn lock_connection(
+    connection: &Arc<Mutex<monetdb::Connection>>,
+) -> Result<MutexGuard<'_, monetdb::Connection>> {
+    connection
+        .lock()
+        .map_err(|_| error("connection mutex is poisoned", Status::Internal))
+}
+
 fn map_cursor_error(value: CursorError) -> Error {
     let status = match value {
         CursorError::Closed | CursorError::NoResultSet => Status::InvalidState,
         CursorError::IO(_) => Status::IO,
         CursorError::Framing(_) | CursorError::BadReply(_) => Status::InvalidData,
-        CursorError::Conversion { .. } | CursorError::InvalidRange { .. } => Status::InvalidData,
+        CursorError::Conversion { .. }
+        | CursorError::InvalidRange { .. }
+        | CursorError::ResultNotResident { .. } => Status::InvalidData,
         CursorError::FileTransfer(_) => Status::InvalidData,
         CursorError::PreparedResult => Status::InvalidState,
-        CursorError::Metadata(_) => Status::Internal,
+        CursorError::Metadata(_) | CursorError::Poisoned => Status::Internal,
         CursorError::Server(ref message)
             if message.starts_with("42S02!")
                 || message.starts_with("42S22!")
@@ -215,12 +227,16 @@ impl Database for MonetdbDatabase {
             .map(decode_userinfo)
             .transpose()?
             .flatten();
-        parsed_uri
-            .set_username("")
-            .map_err(|()| error("URI cannot contain a username", Status::InvalidArguments))?;
-        parsed_uri
-            .set_password(None)
-            .map_err(|()| error("URI cannot contain a password", Status::InvalidArguments))?;
+        if !parsed_uri.username().is_empty() {
+            parsed_uri
+                .set_username("")
+                .map_err(|()| error("URI user information is invalid", Status::InvalidArguments))?;
+        }
+        if parsed_uri.password().is_some() {
+            parsed_uri
+                .set_password(None)
+                .map_err(|()| error("URI user information is invalid", Status::InvalidArguments))?;
+        }
         let mut parameters = Parameters::from_url(parsed_uri.as_str())
             .map_err(|value| map_display(value, Status::InvalidArguments))?;
         if let Some(username) = self
@@ -241,8 +257,8 @@ impl Database for MonetdbDatabase {
                 .set_password(password)
                 .map_err(|value| map_display(value, Status::InvalidArguments))?;
         }
-        // Zero means "all rows" in MAPI. One keeps the result set open while
-        // the driver re-fetches every row through Xexportbin, including row 0.
+        // One minimizes the inline text prefix. Multi-row results remain open
+        // for Xexportbin; a complete scalar row is decoded directly.
         parameters
             .set_replysize(1)
             .map_err(|value| map_display(value, Status::InvalidArguments))?;
@@ -257,7 +273,16 @@ impl Database for MonetdbDatabase {
             .map_err(|value| map_display(value, Status::InvalidArguments))?
             .into_owned();
 
-        let mut connection = monetdb::Connection::new(parameters).map_err(|value| {
+        let connection_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            monetdb::Connection::new(parameters)
+        }))
+        .map_err(|_| {
+            error(
+                "MonetDB connection initialization panicked",
+                Status::InvalidArguments,
+            )
+        })?;
+        let mut connection = connection_result.map_err(|value| {
             let status = match value {
                 monetdb::ConnectError::Rejected(_) => Status::Unauthenticated,
                 monetdb::ConnectError::IO(_) => Status::IO,
@@ -334,11 +359,11 @@ impl Optionable for MonetdbConnection {
         match &key {
             OptionConnection::AutoCommit => {
                 let enabled = option_bool(&value)?;
-                self.inner
-                    .lock()
-                    .expect("connection mutex is not poisoned")
+                lock_connection(&self.inner)?
                     .set_autocommit(enabled)
                     .map_err(map_cursor_error)?;
+                self.options.set(key, enabled.to_string().into());
+                return Ok(());
             }
             OptionConnection::CurrentSchema => {
                 let OptionValue::String(schema) = &value else {
@@ -353,9 +378,12 @@ impl Optionable for MonetdbConnection {
                 )?;
             }
             OptionConnection::ReadOnly => {
-                if option_bool(&value)? {
+                let enabled = option_bool(&value)?;
+                if enabled {
                     return Err(not_implemented("read-only connections"));
                 }
+                self.options.set(key, "false".into());
+                return Ok(());
             }
             OptionConnection::IsolationLevel | OptionConnection::CurrentCatalog => {
                 return Err(not_implemented(key.as_ref()));
@@ -454,13 +482,13 @@ impl Connection for MonetdbConnection {
                 Status::NotFound,
             ));
         }
-        schema_for_query(
-            &self.inner,
-            &format!(
-                "SELECT * FROM {} LIMIT 1",
-                qualified_name(db_schema, table_name)
-            ),
-        )
+        let schema_name = db_schema
+            .or_else(|| {
+                self.options
+                    .optional_string(OptionConnection::CurrentSchema)
+            })
+            .ok_or_else(|| error("current schema is not set", Status::InvalidState))?;
+        table_schema(&self.inner, schema_name, table_name)
     }
 
     fn get_table_types(&self) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
@@ -604,12 +632,23 @@ impl Statement for MonetdbStatement {
 
     fn execute(&mut self) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
         if self.bound.is_some() {
+            if !self.prepared {
+                self.prepare()?;
+            }
             let queries = self.take_bound_queries()?;
             if queries.is_empty() {
                 return Err(error(
                     "query execution requires at least one parameter row",
                     Status::InvalidArguments,
                 ));
+            }
+            if self
+                .prepared_result_schema
+                .as_ref()
+                .is_some_and(|schema| schema.fields().is_empty())
+            {
+                execute_updates_atomic(&self.connection, &queries)?;
+                return Ok(Box::new(EmptyReader::default()));
             }
             return parameter_query_reader(&self.connection, queries, self.batch_rows);
         }
@@ -638,17 +677,7 @@ impl Statement for MonetdbStatement {
         }
         if self.bound.is_some() {
             let queries = self.take_bound_queries()?;
-            let mut total = 0i64;
-            let mut has_count = false;
-            for query in queries {
-                if let Some(rows) = execute_update(&self.connection, &query.sql)? {
-                    total = total.checked_add(rows).ok_or_else(|| {
-                        error("affected row count overflows i64", Status::Internal)
-                    })?;
-                    has_count = true;
-                }
-            }
-            return Ok(has_count.then_some(total));
+            return execute_updates_atomic(&self.connection, &queries);
         }
         let query = self
             .query
@@ -661,32 +690,18 @@ impl Statement for MonetdbStatement {
     }
 
     fn execute_schema(&mut self) -> Result<Schema> {
-        if self
-            .prepared_parameter_schema
-            .as_ref()
-            .is_some_and(|schema| !schema.fields().is_empty())
-            && let Some(schema) = &self.prepared_result_schema
-        {
+        if let Some(schema) = &self.prepared_result_schema {
             return Ok(schema.clone());
-        }
-        if self.bound.is_some() {
-            let queries = self.take_bound_queries()?;
-            if queries.len() != 1 {
-                return Err(error(
-                    format!(
-                        "execute_schema requires exactly one parameter row, found {}",
-                        queries.len()
-                    ),
-                    Status::InvalidArguments,
-                ));
-            }
-            return schema_for_query(&self.connection, &queries[0].sql);
         }
         let query = self
             .query
             .as_deref()
             .ok_or_else(|| error("SQL query is not set", Status::InvalidState))?;
-        schema_for_query(&self.connection, query)
+        let metadata = prepare_query(&self.connection, query, parameter_count(query)?)?;
+        if let Ok(connection) = lock_connection(&self.connection) {
+            connection.try_deallocate(metadata.id);
+        }
+        Ok(metadata.result)
     }
 
     fn execute_partitions(&mut self) -> Result<PartitionedResult> {
@@ -719,6 +734,11 @@ impl Statement for MonetdbStatement {
             .as_deref()
             .ok_or_else(|| error("SQL query is not set", Status::InvalidState))?;
         let parameter_count = parameter_count(query)?;
+        if parameter_count == 0 {
+            self.prepared_parameter_schema = Some(Schema::empty());
+            self.prepared = true;
+            return Ok(());
+        }
         match prepare_query(&self.connection, query, parameter_count) {
             Ok(metadata) => {
                 self.prepared_id = Some(metadata.id);
@@ -881,27 +901,18 @@ impl MonetdbStatement {
             }
         );
 
-        let originally_autocommit = self
-            .connection
-            .lock()
-            .expect("connection mutex is not poisoned")
+        let originally_autocommit = lock_connection(&self.connection)?
             .server_info()
             .map_err(map_cursor_error)?
             .autocommit;
         if originally_autocommit {
-            self.connection
-                .lock()
-                .expect("connection mutex is not poisoned")
+            lock_connection(&self.connection)?
                 .set_autocommit(false)
                 .map_err(map_cursor_error)?;
         }
 
         let result = (|| {
-            let mut cursor = self
-                .connection
-                .lock()
-                .expect("connection mutex is not poisoned")
-                .cursor();
+            let mut cursor = lock_connection(&self.connection)?.cursor();
             match mode {
                 "adbc.ingest.mode.create" => cursor.execute(&create).map_err(map_cursor_error)?,
                 "adbc.ingest.mode.append" => {}
@@ -920,6 +931,16 @@ impl MonetdbStatement {
                         Status::InvalidArguments,
                     ));
                 }
+            }
+
+            if matches!(
+                mode,
+                "adbc.ingest.mode.append" | "adbc.ingest.mode.create_append"
+            ) {
+                cursor
+                    .execute(&format!("SELECT * FROM {target} WHERE FALSE"))
+                    .map_err(map_cursor_error)?;
+                validate_append_schema(&schema, cursor.column_metadata())?;
             }
 
             let files = (0..schema.fields().len())
@@ -968,30 +989,86 @@ impl MonetdbStatement {
             Ok(rows)
         })();
 
-        if result.is_err() && originally_autocommit {
-            let mut cursor = self
-                .connection
-                .lock()
-                .expect("connection mutex is not poisoned")
-                .cursor();
+        if result.is_err()
+            && originally_autocommit
+            && let Ok(connection) = lock_connection(&self.connection)
+        {
+            let mut cursor = connection.cursor();
             let _ = cursor.execute("ROLLBACK");
             let _ = cursor.close();
         }
-        if originally_autocommit {
-            self.connection
-                .lock()
-                .expect("connection mutex is not poisoned")
-                .set_autocommit(true)
-                .map_err(map_cursor_error)?;
+        let restore_result = if originally_autocommit {
+            lock_connection(&self.connection)
+                .and_then(|connection| connection.set_autocommit(true).map_err(map_cursor_error))
+        } else {
+            Ok(())
+        };
+        match result {
+            Err(root_cause) => Err(root_cause),
+            Ok(rows) => {
+                restore_result?;
+                Ok(Some(rows))
+            }
         }
-        result.map(Some)
     }
+}
+
+fn validate_append_schema(schema: &SchemaRef, columns: &[ResultColumn]) -> Result<()> {
+    if schema.fields().len() != columns.len() {
+        return Err(error(
+            format!(
+                "append stream has {} columns but destination table has {}",
+                schema.fields().len(),
+                columns.len()
+            ),
+            Status::InvalidArguments,
+        ));
+    }
+    for (index, (field, column)) in schema.fields().iter().zip(columns).enumerate() {
+        if field.name() != column.name() {
+            return Err(error(
+                format!(
+                    "append column {index} is named {:?}, but destination column is named {:?}",
+                    field.name(),
+                    column.name()
+                ),
+                Status::InvalidArguments,
+            ));
+        }
+        let source = monetdb_arrow::monet_type_for_field(field)
+            .map_err(|value| map_display(value, Status::NotImplemented))?;
+        let destination = column.sql_type();
+        let string_wire = |data_type: &MonetType| {
+            matches!(
+                data_type,
+                MonetType::Varchar(_) | MonetType::Url | MonetType::Json
+            )
+        };
+        if source != *destination && !(string_wire(&source) && string_wire(destination)) {
+            return Err(error(
+                format!(
+                    "append column {:?} has Arrow/MonetDB type {source}, but destination type is {destination}",
+                    field.name()
+                ),
+                Status::InvalidArguments,
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl Drop for MonetdbStatement {
     fn drop(&mut self) {
         if let Some(id) = self.prepared_id.take() {
-            let _ = execute_update(&self.connection, &format!("DEALLOCATE {id}"));
+            match self.connection.try_lock() {
+                Ok(connection) => {
+                    connection.try_deallocate(id);
+                }
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    poisoned.into_inner().try_deallocate(id);
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {}
+            }
         }
     }
 }
@@ -1020,7 +1097,9 @@ fn info_value(code: InfoCode, version: (u16, u16, u16)) -> InfoValue {
         }
         InfoCode::DriverName => InfoValue::String(Some("adbc-driver-monetdb".into())),
         InfoCode::DriverVersion => InfoValue::String(Some(env!("CARGO_PKG_VERSION").into())),
-        InfoCode::DriverArrowVersion => InfoValue::String(Some("v58.3.0".into())),
+        InfoCode::DriverArrowVersion => {
+            InfoValue::String(Some(env!("ADBC_MONETDB_ARROW_VERSION").into()))
+        }
         InfoCode::DriverAdbcVersion => InfoValue::Int(1_001_000),
         _ => InfoValue::String(None),
     }
@@ -1110,6 +1189,8 @@ struct PreparedMetadata {
 struct PreparedField {
     data_type: MonetType,
     name: Option<String>,
+    origin_schema: Option<String>,
+    origin_table: Option<String>,
 }
 
 fn prepare_query(
@@ -1118,13 +1199,39 @@ fn prepare_query(
     parameter_count: usize,
 ) -> Result<PreparedMetadata> {
     let query = query.trim().trim_end_matches(';');
-    let mut cursor = connection
-        .lock()
-        .expect("connection mutex is not poisoned")
-        .cursor();
-    cursor
-        .execute(&format!("PREPARE {query}"))
-        .map_err(map_cursor_error)?;
+    let connection = lock_connection(connection)?;
+    let use_savepoint = !connection
+        .server_info()
+        .map_err(map_cursor_error)?
+        .autocommit;
+    let savepoint = use_savepoint.then(|| {
+        format!(
+            "adbc_prepare_probe_{}",
+            PREPARE_SAVEPOINT_ID.fetch_add(1, Ordering::Relaxed)
+        )
+    });
+    let mut cursor = connection.cursor();
+    if let Some(savepoint) = &savepoint {
+        cursor
+            .execute(&format!("SAVEPOINT {savepoint}"))
+            .map_err(map_cursor_error)?;
+    }
+    if let Err(root_cause) = cursor.execute(&format!("PREPARE {query}")) {
+        if let Some(savepoint) = &savepoint {
+            let recovery = cursor
+                .execute(&format!("ROLLBACK TO SAVEPOINT {savepoint}"))
+                .and_then(|_| cursor.execute(&format!("RELEASE SAVEPOINT {savepoint}")));
+            if let Err(recovery) = recovery {
+                return Err(error(
+                    format!(
+                        "PREPARE failed ({root_cause}); restoring the transaction also failed ({recovery})"
+                    ),
+                    Status::Internal,
+                ));
+            }
+        }
+        return Err(map_cursor_error(root_cause));
+    }
     let id = cursor.prepared_statement_id().ok_or_else(|| {
         error(
             "MonetDB did not return prepared statement metadata",
@@ -1151,9 +1258,21 @@ fn prepare_query(
                 .get_str(5)
                 .map_err(map_cursor_error)?
                 .map(str::to_owned);
+            let origin_schema = cursor
+                .get_str(3)
+                .map_err(map_cursor_error)?
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned);
+            let origin_table = cursor
+                .get_str(4)
+                .map_err(map_cursor_error)?
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned);
             fields.push(PreparedField {
                 data_type: prepared_monet_type(&code, digits, scale)?,
                 name,
+                origin_schema,
+                origin_table,
             });
         }
         let result_count = fields.len().checked_sub(parameter_count).ok_or_else(|| {
@@ -1165,6 +1284,7 @@ fn prepare_query(
                 Status::InvalidData,
             )
         })?;
+        restore_declared_result_types(&mut cursor, &mut fields[..result_count])?;
         let parameter_fields = fields
             .drain(result_count..)
             .enumerate()
@@ -1192,7 +1312,103 @@ fn prepare_query(
     if parsed.is_err() {
         let _ = cursor.execute(&format!("DEALLOCATE {id}"));
     }
+    if let Some(savepoint) = &savepoint {
+        cursor
+            .execute(&format!("RELEASE SAVEPOINT {savepoint}"))
+            .map_err(map_cursor_error)?;
+    }
     parsed
+}
+
+fn restore_declared_result_types(
+    cursor: &mut monetdb::Cursor,
+    fields: &mut [PreparedField],
+) -> Result<()> {
+    let table_names = fields
+        .iter()
+        .filter_map(|field| field.origin_table.as_deref())
+        .collect::<HashSet<_>>();
+    if table_names.is_empty() {
+        return Ok(());
+    }
+    let table_names = table_names
+        .into_iter()
+        .map(metadata::raw_string_literal)
+        .collect::<Result<Vec<_>>>()?;
+    cursor
+        .execute(&format!(
+            "SELECT s.name, t.name, c.name, c.type, c.type_digits, c.type_scale \
+             FROM sys.columns AS c \
+             JOIN sys.tables AS t ON t.id = c.table_id \
+             JOIN sys.schemas AS s ON s.id = t.schema_id \
+             WHERE t.name IN ({})",
+            table_names.join(", ")
+        ))
+        .map_err(map_cursor_error)?;
+
+    let mut declared = HashMap::<(String, String, String), MonetType>::new();
+    while cursor.next_row().map_err(map_cursor_error)? {
+        let schema = cursor
+            .get_str(0)
+            .map_err(map_cursor_error)?
+            .ok_or_else(|| error("catalog schema name is NULL", Status::InvalidData))?;
+        let table = cursor
+            .get_str(1)
+            .map_err(map_cursor_error)?
+            .ok_or_else(|| error("catalog table name is NULL", Status::InvalidData))?;
+        let column = cursor
+            .get_str(2)
+            .map_err(map_cursor_error)?
+            .ok_or_else(|| error("catalog column name is NULL", Status::InvalidData))?;
+        let code = cursor
+            .get_str(3)
+            .map_err(map_cursor_error)?
+            .ok_or_else(|| error("catalog column type is NULL", Status::InvalidData))?;
+        let digits = cursor
+            .get::<i32>(4)
+            .map_err(map_cursor_error)?
+            .ok_or_else(|| error("catalog type digits are NULL", Status::InvalidData))?;
+        let scale = cursor
+            .get::<i32>(5)
+            .map_err(map_cursor_error)?
+            .ok_or_else(|| error("catalog type scale is NULL", Status::InvalidData))?;
+        declared.insert(
+            (schema.to_owned(), table.to_owned(), column.to_owned()),
+            prepared_monet_type(code, digits, scale)?,
+        );
+    }
+
+    for field in fields {
+        let (Some(table), Some(column)) = (field.origin_table.as_deref(), field.name.as_deref())
+        else {
+            continue;
+        };
+        let mut candidate = None;
+        let mut ambiguous = false;
+        for ((schema, declared_table, declared_column), data_type) in &declared {
+            if declared_table != table
+                || declared_column != column
+                || field
+                    .origin_schema
+                    .as_deref()
+                    .is_some_and(|origin| origin != schema)
+            {
+                continue;
+            }
+            match candidate {
+                None => candidate = Some(*data_type),
+                Some(previous) if previous == *data_type => {}
+                Some(_) => {
+                    ambiguous = true;
+                    break;
+                }
+            }
+        }
+        if !ambiguous && let Some(data_type) = candidate {
+            field.data_type = data_type;
+        }
+    }
+    Ok(())
 }
 
 fn prepared_monet_type(code: &str, digits: i32, scale: i32) -> Result<MonetType> {
@@ -1228,18 +1444,17 @@ fn query_reader(
     query: &str,
     batch_rows: usize,
 ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-    let mut cursor = connection
-        .lock()
-        .expect("connection mutex is not poisoned")
-        .cursor();
+    let mut cursor = lock_connection(connection)?.cursor();
     cursor.execute(query).map_err(map_cursor_error)?;
     if !cursor.has_result_set() {
         return Ok(Box::new(EmptyReader::default()));
     }
-    let mut result = cursor.binary_result().map_err(map_cursor_error)?;
+    let result = cursor.binary_result().map_err(map_cursor_error)?;
     let total_rows = result.total_rows;
-    if total_rows == 1 {
-        result = retain_one_row(&mut cursor, &result.columns)?;
+    if total_rows == 1 && !result.is_server_resident() {
+        let batch = monetdb_arrow::decode_inline_row(&mut cursor, &result.columns)
+            .map_err(|value| map_display(value, Status::InvalidData))?;
+        return Ok(Box::new(SingleBatchReader::new(batch)));
     }
     let schema = schema_for_columns(&result.columns)?;
     Ok(Box::new(BinaryReader {
@@ -1251,67 +1466,6 @@ fn query_reader(
         batch_rows,
         finished: false,
     }))
-}
-
-fn retain_one_row(cursor: &mut monetdb::Cursor, columns: &[ResultColumn]) -> Result<BinaryResult> {
-    if !cursor.next_row().map_err(map_cursor_error)? {
-        return Err(error(
-            "one-row result did not contain its initial text row",
-            Status::InvalidData,
-        ));
-    }
-    let expressions = columns
-        .iter()
-        .enumerate()
-        .map(|(index, column)| {
-            let data_type = retention_sql_type(column.sql_type());
-            let value = cursor
-                .get_str(index)
-                .map_err(map_cursor_error)?
-                .map(quote_text_value)
-                .unwrap_or_else(|| "NULL".into());
-            Ok(format!(
-                "CAST({value} AS {data_type}) AS \"__adbc_c{index}\""
-            ))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    cursor
-        .execute(&format!(
-            "SELECT \"__adbc_source\".* FROM (SELECT {}) AS \"__adbc_source\" \
-             CROSS JOIN (VALUES (1), (2)) AS \"__adbc_duplicate\"(\"n\")",
-            expressions.join(", ")
-        ))
-        .map_err(map_cursor_error)?;
-    let retained = cursor.binary_result().map_err(map_cursor_error)?;
-    if retained.total_rows != 2 || retained.columns.len() != columns.len() {
-        return Err(error(
-            "one-row result could not be retained for binary export",
-            Status::Internal,
-        ));
-    }
-    Ok(BinaryResult {
-        result_id: retained.result_id,
-        total_rows: 1,
-        columns: columns.to_vec(),
-    })
-}
-
-fn retention_sql_type(data_type: &MonetType) -> String {
-    match data_type {
-        MonetType::Varchar(0) => "STRING".into(),
-        MonetType::MonthInterval => "INTERVAL MONTH".into(),
-        MonetType::DayInterval => "INTERVAL DAY".into(),
-        MonetType::SecInterval => "INTERVAL SECOND".into(),
-        MonetType::Time => "TIME(6)".into(),
-        MonetType::TimeTz => "TIME(6) WITH TIME ZONE".into(),
-        MonetType::Timestamp => "TIMESTAMP(6)".into(),
-        MonetType::TimestampTz => "TIMESTAMP(6) WITH TIME ZONE".into(),
-        _ => data_type.to_string(),
-    }
-}
-
-fn quote_text_value(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
 }
 
 fn parameter_query_reader(
@@ -1352,26 +1506,62 @@ fn scalar_string(connection: &Arc<Mutex<monetdb::Connection>>, query: &str) -> R
     Ok(values.value(0).to_owned())
 }
 
-fn schema_for_query(connection: &Arc<Mutex<monetdb::Connection>>, query: &str) -> Result<Schema> {
-    let mut cursor = connection
-        .lock()
-        .expect("connection mutex is not poisoned")
-        .cursor();
-    cursor.execute(query).map_err(map_cursor_error)?;
-    let result = cursor.binary_result().map_err(map_cursor_error)?;
-    Ok(schema_for_columns(&result.columns)?.as_ref().clone())
-}
-
 fn execute_update(
     connection: &Arc<Mutex<monetdb::Connection>>,
     query: &str,
 ) -> Result<Option<i64>> {
-    let mut cursor = connection
-        .lock()
-        .expect("connection mutex is not poisoned")
-        .cursor();
+    let mut cursor = lock_connection(connection)?.cursor();
     cursor.execute(query).map_err(map_cursor_error)?;
     Ok(cursor.affected_rows())
+}
+
+fn execute_updates_atomic(
+    connection: &Arc<Mutex<monetdb::Connection>>,
+    queries: &[ExecutableQuery],
+) -> Result<Option<i64>> {
+    let connection = lock_connection(connection)?;
+    let originally_autocommit = connection
+        .server_info()
+        .map_err(map_cursor_error)?
+        .autocommit;
+    if originally_autocommit {
+        connection.set_autocommit(false).map_err(map_cursor_error)?;
+    }
+
+    let mut cursor = connection.cursor();
+    let result = (|| {
+        let mut total = 0i64;
+        let mut has_count = false;
+        for query in queries {
+            cursor.execute(&query.sql).map_err(map_cursor_error)?;
+            if let Some(rows) = cursor.affected_rows() {
+                total = total
+                    .checked_add(rows)
+                    .ok_or_else(|| error("affected row count overflows i64", Status::Internal))?;
+                has_count = true;
+            }
+        }
+        if originally_autocommit {
+            cursor.execute("COMMIT").map_err(map_cursor_error)?;
+        }
+        Ok(has_count.then_some(total))
+    })();
+
+    if result.is_err() && originally_autocommit {
+        let _ = cursor.execute("ROLLBACK");
+    }
+    let restore_result = if originally_autocommit {
+        connection.set_autocommit(true).map_err(map_cursor_error)
+    } else {
+        Ok(())
+    };
+    match result {
+        Err(root_cause) => Err(root_cause),
+        Ok(rows) => {
+            restore_result?;
+            Ok(rows)
+        }
+    }
 }
 
 fn schema_for_columns(columns: &[ResultColumn]) -> Result<SchemaRef> {

@@ -14,6 +14,7 @@ use arrow_array::{
     },
 };
 use arrow_schema::{DataType, TimeUnit};
+use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
 
 use super::error;
 
@@ -55,6 +56,7 @@ fn render_query(query: &str, values: &[String]) -> Result<(String, usize)> {
     enum State {
         Normal,
         SingleQuote,
+        RawSingleQuote,
         DoubleQuote,
         LineComment,
         BlockComment,
@@ -66,91 +68,140 @@ fn render_query(query: &str, values: &[String]) -> Result<(String, usize)> {
     let mut state = State::Normal;
     let mut index = 0;
     let mut parameter = 0;
+    let mut terminated = false;
     while index < bytes.len() {
         let current = bytes[index];
         let next = bytes.get(index + 1).copied();
+        let third = bytes.get(index + 2).copied();
         match state {
-            State::Normal => match (current, next) {
-                (b'?', _) => {
+            State::Normal => match (current, next, third) {
+                (b';', _, _) => {
+                    if terminated {
+                        return Err(error(
+                            "multiple SQL statements are not supported",
+                            Status::InvalidArguments,
+                        ));
+                    }
+                    output.push(';');
+                    terminated = true;
+                    index += 1;
+                }
+                (_, _, _) if terminated && current.is_ascii_whitespace() => {
+                    index = copy_char(query, index, &mut output);
+                }
+                (b'-', Some(b'-'), _) => {
+                    output.push_str("--");
+                    state = State::LineComment;
+                    index += 2;
+                }
+                (b'#', _, _) => {
+                    output.push('#');
+                    state = State::LineComment;
+                    index += 1;
+                }
+                (b'/', Some(b'*'), _) => {
+                    output.push_str("/*");
+                    state = State::BlockComment;
+                    index += 2;
+                }
+                (_, _, _) if terminated => {
+                    return Err(error(
+                        "multiple SQL statements are not supported",
+                        Status::InvalidArguments,
+                    ));
+                }
+                (b'?', _, _) => {
                     if let Some(value) = values.get(parameter) {
                         output.push_str(value);
                     }
                     parameter += 1;
                     index += 1;
                 }
-                (b'\'', _) => {
+                (b'r' | b'R' | b'x' | b'X', Some(b'\''), _) => {
+                    output.push(current as char);
+                    output.push('\'');
+                    state = State::RawSingleQuote;
+                    index += 2;
+                }
+                (b'e' | b'E', Some(b'\''), _) => {
+                    output.push(current as char);
+                    output.push('\'');
+                    state = State::SingleQuote;
+                    index += 2;
+                }
+                (b'u' | b'U', Some(b'&'), Some(b'\'')) => {
+                    output.push(current as char);
+                    output.push_str("&'");
+                    state = State::RawSingleQuote;
+                    index += 3;
+                }
+                (b'u' | b'U', Some(b'&'), Some(b'"')) => {
+                    output.push(current as char);
+                    output.push_str("&\"");
+                    state = State::DoubleQuote;
+                    index += 3;
+                }
+                (b'\'', _, _) => {
                     output.push('\'');
                     state = State::SingleQuote;
                     index += 1;
                 }
-                (b'"', _) => {
+                (b'"', _, _) => {
                     output.push('"');
                     state = State::DoubleQuote;
                     index += 1;
                 }
-                (b'-', Some(b'-')) => {
-                    output.push_str("--");
-                    state = State::LineComment;
-                    index += 2;
-                }
-                (b'/', Some(b'*')) => {
-                    output.push_str("/*");
-                    state = State::BlockComment;
-                    index += 2;
-                }
                 _ => {
-                    output.push(current as char);
-                    index += 1;
+                    index = copy_char(query, index, &mut output);
                 }
             },
             State::SingleQuote => {
-                output.push(current as char);
-                if current == b'\\'
-                    && let Some(next) = next
-                {
-                    output.push(next as char);
-                    index += 2;
+                index = copy_char(query, index, &mut output);
+                if current == b'\\' && index < bytes.len() {
+                    index = copy_char(query, index, &mut output);
                 } else if current == b'\'' {
                     if next == Some(b'\'') {
                         output.push('\'');
-                        index += 2;
+                        index += 1;
                     } else {
                         state = State::Normal;
-                        index += 1;
                     }
-                } else {
-                    index += 1;
+                }
+            }
+            State::RawSingleQuote => {
+                index = copy_char(query, index, &mut output);
+                if current == b'\'' {
+                    if next == Some(b'\'') {
+                        output.push('\'');
+                        index += 1;
+                    } else {
+                        state = State::Normal;
+                    }
                 }
             }
             State::DoubleQuote => {
-                output.push(current as char);
+                index = copy_char(query, index, &mut output);
                 if current == b'"' {
                     if next == Some(b'"') {
                         output.push('"');
-                        index += 2;
+                        index += 1;
                     } else {
                         state = State::Normal;
-                        index += 1;
                     }
-                } else {
-                    index += 1;
                 }
             }
             State::LineComment => {
-                output.push(current as char);
-                index += 1;
+                index = copy_char(query, index, &mut output);
                 if current == b'\n' {
                     state = State::Normal;
                 }
             }
             State::BlockComment => {
-                output.push(current as char);
+                index = copy_char(query, index, &mut output);
                 if current == b'*' && next == Some(b'/') {
                     output.push('/');
-                    index += 2;
-                    state = State::Normal;
-                } else {
                     index += 1;
+                    state = State::Normal;
                 }
             }
         }
@@ -162,6 +213,15 @@ fn render_query(query: &str, values: &[String]) -> Result<(String, usize)> {
         ));
     }
     Ok((output, parameter))
+}
+
+fn copy_char(query: &str, index: usize, output: &mut String) -> usize {
+    let character = query[index..]
+        .chars()
+        .next()
+        .expect("index is within the UTF-8 query");
+    output.push(character);
+    index + character.len_utf8()
 }
 
 fn literal(array: &dyn Array, row: usize) -> Result<String> {
@@ -220,9 +280,9 @@ fn literal(array: &dyn Array, row: usize) -> Result<String> {
         DataType::FixedSizeBinary(_) => blob_literal(
             downcast::<FixedSizeBinaryArray>(array, array.data_type().clone())?.value(row),
         ),
-        DataType::Date32 => {
-            date_literal(downcast::<Date32Array>(array, DataType::Date32)?.value(row))
-        }
+        DataType::Date32 => date_literal(i64::from(
+            downcast::<Date32Array>(array, DataType::Date32)?.value(row),
+        ))?,
         DataType::Date64 => {
             let millis = downcast::<Date64Array>(array, DataType::Date64)?.value(row);
             if millis % 86_400_000 != 0 {
@@ -231,10 +291,7 @@ fn literal(array: &dyn Array, row: usize) -> Result<String> {
                     Status::InvalidData,
                 ));
             }
-            date_literal(
-                i32::try_from(millis / 86_400_000)
-                    .map_err(|_| error("Date64 parameter is out of range", Status::InvalidData))?,
-            )
+            date_literal(millis / 86_400_000)?
         }
         DataType::Time32(unit) => time32_literal(array, *unit, row)?,
         DataType::Time64(unit) => time64_literal(array, *unit, row)?,
@@ -324,9 +381,8 @@ fn blob_literal(value: &[u8]) -> String {
     output
 }
 
-fn date_literal(days: i32) -> String {
-    let (year, month, day) = civil_from_days(days);
-    format!("DATE '{year:04}-{month:02}-{day:02}'")
+fn date_literal(days: i64) -> Result<String> {
+    Ok(format!("DATE '{}'", date_from_days(days)?))
 }
 
 fn time32_literal(array: &dyn Array, unit: TimeUnit, row: usize) -> Result<String> {
@@ -405,12 +461,12 @@ fn timestamp_literal(
             nanos / 1_000
         }
     };
-    let days = i32::try_from(micros.div_euclid(86_400_000_000))
-        .map_err(|_| error("timestamp parameter is out of range", Status::InvalidData))?;
-    let (year, month, day) = civil_from_days(days);
+    let timestamp = DateTime::<Utc>::from_timestamp_micros(micros)
+        .ok_or_else(|| error("timestamp parameter is out of range", Status::InvalidData))?;
+    let date = timestamp.date_naive();
     let time = format_time(micros.rem_euclid(86_400_000_000))?;
     Ok(format!(
-        "{} '{year:04}-{month:02}-{day:02} {time}{}'",
+        "{} '{date} {time}{}'",
         if timezone { "TIMESTAMPTZ" } else { "TIMESTAMP" },
         if timezone { "+00:00" } else { "" }
     ))
@@ -509,18 +565,14 @@ fn dictionary_value<K: ArrowDictionaryKeyType>(
     }
 }
 
-fn civil_from_days(days: i32) -> (i32, u8, u8) {
-    let days = i64::from(days) + 719_468;
-    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
-    let doe = days - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let mut year = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = mp + if mp < 10 { 3 } else { -9 };
-    year += i64::from(month <= 2);
-    (year as i32, month as u8, day as u8)
+fn date_from_days(days: i64) -> Result<NaiveDate> {
+    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1)
+        .ok_or_else(|| error("could not construct Unix epoch date", Status::Internal))?;
+    let delta = TimeDelta::try_days(days)
+        .ok_or_else(|| error("date parameter is out of range", Status::InvalidData))?;
+    epoch
+        .checked_add_signed(delta)
+        .ok_or_else(|| error("date parameter is out of range", Status::InvalidData))
 }
 
 #[cfg(test)]
@@ -554,9 +606,22 @@ mod tests {
     #[test]
     fn validates_parameter_counts_and_lexing() {
         assert_eq!(parameter_count("SELECT ? /* ? */").unwrap(), 1);
+        assert_eq!(parameter_count("SELECT R';?' /* ; */;").unwrap(), 0);
+        assert!(parameter_count("SELECT 1; DELETE FROM important").is_err());
         assert!(parameter_count("SELECT 'unterminated").is_err());
         let batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
         assert!(render_row("SELECT ?", &batch, 0).is_err());
+    }
+
+    #[test]
+    fn preserves_utf8_in_every_lexer_state() {
+        let query = "SELECT ä, 'ö\\界', R'tail\\', X'00ff', U&'\\0061', \"列\", ? -- коммент\n/* 注釈 */ # ?";
+        let (rendered, count) = render_query(query, &["42".into()]).unwrap();
+        assert_eq!(
+            rendered,
+            "SELECT ä, 'ö\\界', R'tail\\', X'00ff', U&'\\0061', \"列\", 42 -- коммент\n/* 注釈 */ # ?"
+        );
+        assert_eq!(count, 1);
     }
 
     #[test]
@@ -564,7 +629,21 @@ mod tests {
         assert_eq!(decimal_literal(-123, 2).unwrap(), "-1.23");
         assert_eq!(float_literal(3.5).unwrap(), "3.5e0");
         assert_eq!(float_literal(f64::MAX).unwrap(), "1.7976931348623157e308");
-        assert_eq!(date_literal(0), "DATE '1970-01-01'");
+        assert_eq!(date_literal(0).unwrap(), "DATE '1970-01-01'");
+        let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        for (date, expected) in [
+            (
+                NaiveDate::from_ymd_opt(0, 2, 29).unwrap(),
+                "DATE '0000-02-29'",
+            ),
+            (
+                NaiveDate::from_ymd_opt(-1, 12, 31).unwrap(),
+                "DATE '-0001-12-31'",
+            ),
+        ] {
+            let days = date.signed_duration_since(epoch).num_days();
+            assert_eq!(date_literal(days).unwrap(), expected);
+        }
         assert_eq!(format_time(3_723_123_456).unwrap(), "01:02:03.123456");
     }
 }

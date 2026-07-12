@@ -9,7 +9,7 @@ def connect(
     uri: str,
     /,
     *,
-    autocommit: bool = True,
+    autocommit: bool = False,
     db_kwargs: dict[str, str] | None = None,
     conn_kwargs: dict[str, str] | None = None,
 ) -> adbc_driver_manager.dbapi.Connection:

@@ -71,6 +71,8 @@ as upstream-shaped MPL-2.0 changes so they can be offered back to
       not accumulate in memory
 - [x] expose the server fingerprint: endianness (challenge field 5), `BINARY` level,
       `monet_version`
+- [x] TLS 1.3 with `mapi/9` ALPN, system or file-based trust, SHA-256 certificate
+      pinning, and client certificates
 - [x] result-set header parsing that carries decimal digits/scale and column types
       through to the consumer
 
@@ -101,7 +103,8 @@ as upstream-shaped MPL-2.0 changes so they can be offered back to
       `adbc.ingest.temporary`; DDL generated from the Arrow schema; multi-batch streams
       chunked into successive `COPY BINARY` statements inside one transaction
 - [x] `GetInfo` (vendor_name = "MonetDB" — polars introspects it), `GetTableTypes`
-- [x] `GetTableSchema` and `ExecuteSchema` from a zero-row query result header
+- [x] `GetTableSchema` from `sys.columns` declarations; `ExecuteSchema` from PREPARE metadata
+      reconciled with unambiguous source-column declarations, without executing the query
 - [x] `GetObjects` via `sys.tables` / `sys.columns` / `sys.keys`, including filters,
       XDBC column attributes, and primary/unique/foreign-key constraint usage
 - [x] prepared statements with positional (qmark) parameters: native server-side
@@ -129,6 +132,22 @@ as upstream-shaped MPL-2.0 changes so they can be offered back to
 - [x] publish the ADBC validation feature matrix in the README
 - [ ] announce on MonetDB/MonetDB#7464 and offer the protocol work upstream
 
+### M5 — production hardening
+
+- [x] expose inline-row residency in the MAPI fork and decode a fully included one-row
+      result directly; scalar queries perform no retention query or second round trip
+- [x] make malformed frame sizes, variable-width offsets, decimal scales, and overlong
+      back-references return errors instead of panicking or allocating from unchecked metadata
+- [x] fix Unix-socket connection failures, make upload refusal connection-preserving, enable
+      unsafe-block lints in the MAPI fork, and document every unsafe invariant
+- [x] preserve UTF-8 through parameter rendering; use `chrono`, `uuid`, and standard-library
+      address parsing for general-purpose formats
+- [x] validate append destination schemas before binary COPY and make multi-row DML atomic
+- [x] make `ExecuteSchema` metadata-only and keep bound streams intact
+- [x] push `GetObjects` filters into SQL and make wildcard matching time-bounded
+- [x] expand failure, memory, concurrency, one-row dtype, timezone, and boundary coverage
+- [x] harden wheel/sdist licensing and CI coverage, then run every local, wheel, and live gate
+
 ## ADBC feature mapping
 
 | ADBC | MonetDB mechanism |
@@ -137,7 +156,7 @@ as upstream-shaped MPL-2.0 changes so they can be offered back to
 | bulk ingest (all four modes) | DDL from Arrow schema + `COPY BINARY INTO ... ON CLIENT` |
 | `adbc.ingest.temporary` | `CREATE LOCAL TEMPORARY TABLE` |
 | prepared statements / bind | `PREPARE`/`EXECUTE`, literal parameter rendering |
-| `GetTableSchema` | zero-row `SELECT * FROM t WHERE FALSE` result header |
+| `GetTableSchema` | declared types and nullability from `sys.columns` |
 | `GetObjects` | SQL over `sys.*` catalogs |
 | transactions / autocommit | handshake option + `Xauto_commit` + SQL |
 | partitioned results | unsupported (MAPI is a single sequential channel) |

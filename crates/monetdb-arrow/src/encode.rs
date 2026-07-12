@@ -20,6 +20,7 @@ use arrow_array::{
     },
 };
 use arrow_schema::{DataType, Field, TimeUnit};
+use chrono::{Datelike, NaiveDate, TimeDelta};
 use monetdb::MonetType;
 
 #[derive(Debug)]
@@ -61,6 +62,7 @@ pub fn monet_type_for_field(field: &Field) -> Result<MonetType, EncodeError> {
         DataType::Boolean => MonetType::Bool,
         DataType::Int8 => MonetType::TinyInt,
         DataType::Int16 => MonetType::SmallInt,
+        DataType::Int32 if extension == Some("monetdb.interval_month") => MonetType::MonthInterval,
         DataType::Int32 => MonetType::Int,
         DataType::Int64 => MonetType::BigInt,
         DataType::UInt8 => MonetType::SmallInt,
@@ -91,6 +93,9 @@ pub fn monet_type_for_field(field: &Field) -> Result<MonetType, EncodeError> {
         DataType::Time32(_) | DataType::Time64(_) => MonetType::Time,
         DataType::Timestamp(_, timezone) if timezone.is_some() => MonetType::TimestampTz,
         DataType::Timestamp(_, _) => MonetType::Timestamp,
+        DataType::Duration(_) if extension == Some("monetdb.interval_day") => {
+            MonetType::DayInterval
+        }
         DataType::Duration(_) => MonetType::SecInterval,
         data_type => return Err(EncodeError::Unsupported(data_type.clone())),
     })
@@ -113,11 +118,11 @@ pub fn sql_type_for_field(field: &Field) -> Result<String, EncodeError> {
         MonetType::SecInterval => "INTERVAL SECOND".into(),
         MonetType::MonthInterval => "INTERVAL MONTH".into(),
         MonetType::DayInterval => "INTERVAL DAY".into(),
-        MonetType::Time => "TIME".into(),
-        MonetType::TimeTz => "TIME WITH TIME ZONE".into(),
+        MonetType::Time => "TIME(6)".into(),
+        MonetType::TimeTz => "TIME(6) WITH TIME ZONE".into(),
         MonetType::Date => "DATE".into(),
-        MonetType::Timestamp => "TIMESTAMP".into(),
-        MonetType::TimestampTz => "TIMESTAMP WITH TIME ZONE".into(),
+        MonetType::Timestamp => "TIMESTAMP(6)".into(),
+        MonetType::TimestampTz => "TIMESTAMP(6) WITH TIME ZONE".into(),
         MonetType::Blob => "BLOB".into(),
         MonetType::Url => "URL".into(),
         MonetType::Inet => "INET".into(),
@@ -467,7 +472,7 @@ fn encode_date32(array: &Date32Array, out: &mut Vec<u8>) -> Result<(), EncodeErr
         if array.is_null(row) {
             out.extend_from_slice(&[0xff; 4]);
         } else {
-            append_date(array.value(row), row, out)?;
+            append_date(i64::from(array.value(row)), row, out)?;
         }
     }
     Ok(())
@@ -483,19 +488,19 @@ fn encode_date64(array: &Date64Array, out: &mut Vec<u8>) -> Result<(), EncodeErr
                 message: "Date64 is not a whole day",
             });
         } else {
-            append_date((array.value(row) / 86_400_000) as i32, row, out)?;
+            append_date(array.value(row) / 86_400_000, row, out)?;
         }
     }
     Ok(())
 }
 
-fn append_date(days: i32, row: usize, out: &mut Vec<u8>) -> Result<(), EncodeError> {
-    let (year, month, day) = civil_from_days(days);
-    let year = i16::try_from(year).map_err(|_| EncodeError::InvalidValue {
+fn append_date(days: i64, row: usize, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+    let date = date_from_days(days, row)?;
+    let year = i16::try_from(date.year()).map_err(|_| EncodeError::InvalidValue {
         row,
         message: "date year is outside MonetDB's range",
     })?;
-    out.extend_from_slice(&[day, month]);
+    out.extend_from_slice(&[date.day() as u8, date.month() as u8]);
     out.extend_from_slice(&year.to_le_bytes());
     Ok(())
 }
@@ -647,16 +652,7 @@ where
 
 fn append_timestamp(micros: i64, row: usize, out: &mut Vec<u8>) -> Result<(), EncodeError> {
     append_time(micros.rem_euclid(86_400_000_000), row, out)?;
-    append_date(
-        i32::try_from(micros.div_euclid(86_400_000_000)).map_err(|_| {
-            EncodeError::InvalidValue {
-                row,
-                message: "timestamp date is outside Arrow's Date32 range",
-            }
-        })?,
-        row,
-        out,
-    )
+    append_date(micros.div_euclid(86_400_000_000), row, out)
 }
 
 fn encode_duration(
@@ -700,30 +696,40 @@ where
                 message: "duration is not millisecond-aligned",
             });
         } else {
-            (array.value(row) / divisor).checked_mul(multiplier).ok_or(
+            let value = (array.value(row) / divisor).checked_mul(multiplier).ok_or(
                 EncodeError::InvalidValue {
                     row,
                     message: "duration overflows milliseconds",
                 },
-            )?
+            )?;
+            if value == i64::MIN {
+                return Err(EncodeError::InvalidValue {
+                    row,
+                    message: "duration collides with MonetDB's NULL sentinel",
+                });
+            }
+            value
         };
         out.extend_from_slice(&value.to_le_bytes());
     }
     Ok(())
 }
 
-fn civil_from_days(days: i32) -> (i32, u8, u8) {
-    let days = i64::from(days) + 719_468;
-    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
-    let doe = days - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let mut year = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = mp + if mp < 10 { 3 } else { -9 };
-    year += i64::from(month <= 2);
-    (year as i32, month as u8, day as u8)
+fn date_from_days(days: i64, row: usize) -> Result<NaiveDate, EncodeError> {
+    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).ok_or(EncodeError::InvalidValue {
+        row,
+        message: "could not construct Unix epoch date",
+    })?;
+    let delta = TimeDelta::try_days(days).ok_or(EncodeError::InvalidValue {
+        row,
+        message: "date offset is outside chrono's range",
+    })?;
+    epoch
+        .checked_add_signed(delta)
+        .ok_or(EncodeError::InvalidValue {
+            row,
+            message: "date is outside chrono's range",
+        })
 }
 
 #[cfg(test)]
@@ -812,6 +818,40 @@ mod tests {
     }
 
     #[test]
+    fn preserves_interval_extensions_on_write() {
+        let month = Field::new("m", DataType::Int32, true).with_metadata(
+            [(
+                "ARROW:extension:name".to_owned(),
+                "monetdb.interval_month".to_owned(),
+            )]
+            .into(),
+        );
+        assert_eq!(
+            monet_type_for_field(&month).unwrap(),
+            MonetType::MonthInterval
+        );
+
+        let day = Field::new("d", DataType::Duration(TimeUnit::Millisecond), true).with_metadata(
+            [(
+                "ARROW:extension:name".to_owned(),
+                "monetdb.interval_day".to_owned(),
+            )]
+            .into(),
+        );
+        assert_eq!(monet_type_for_field(&day).unwrap(), MonetType::DayInterval);
+    }
+
+    #[test]
+    fn rejects_duration_null_sentinel_collision() {
+        let field = Field::new("duration", DataType::Duration(TimeUnit::Millisecond), true);
+        let values = DurationMillisecondArray::from(vec![Some(i64::MIN)]);
+        assert!(matches!(
+            encode_column(&field, &values),
+            Err(EncodeError::InvalidValue { row: 0, .. })
+        ));
+    }
+
+    #[test]
     fn rejects_nul_inside_strings() {
         let field = Field::new("s", DataType::Utf8, true);
         let array = StringArray::from(vec!["not\0representable"]);
@@ -852,6 +892,21 @@ mod tests {
         let encoded = encode_column(&field, &array).unwrap();
         assert_eq!(&encoded[..12], &[64, 226, 1, 0, 3, 2, 1, 0, 1, 1, 178, 7]);
         assert_eq!(&encoded[12..], &[0xff; 12]);
+    }
+
+    #[test]
+    fn chrono_date_conversion_round_trips_bce_and_boundary_years() {
+        let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        let dates = [-32_768, -1, 0, 1, 1582, 1900, 2000, 32_767]
+            .map(|year| NaiveDate::from_ymd_opt(year, 3, 1).unwrap());
+        let days =
+            dates.map(|date| i32::try_from(date.signed_duration_since(epoch).num_days()).unwrap());
+        let array = Date32Array::from(days.to_vec());
+        let field = Field::new("date", DataType::Date32, false);
+        let bytes = encode_column(&field, &array).unwrap();
+        let decoded = crate::decode::decode_column(&MonetType::Date, &bytes, dates.len()).unwrap();
+        let decoded = decoded.as_any().downcast_ref::<Date32Array>().unwrap();
+        assert_eq!(decoded.values(), array.values());
     }
 
     #[test]
