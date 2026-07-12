@@ -1,5 +1,6 @@
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
+from typing import cast
 
 import polars as pl
 import pytest
@@ -28,6 +29,33 @@ def test_empty_and_null_results(monetdb_uri: str) -> None:
     assert empty.schema == {"value": pl.Int32}
     assert empty.height == 0
     assert values.to_dict(as_series=False) == {"i": [1, 2, 3], "s": ["a", None, "c"]}
+
+
+@pytest.mark.integration
+def test_metadata_and_schema_apis(monetdb_uri: str) -> None:
+    with dbapi.connect(monetdb_uri) as conn:
+        info = conn.adbc_get_info()
+        assert info["vendor_name"] == "MonetDB"
+        assert info["vendor_version"] == "11.55.7"
+        assert info["driver_name"] == "adbc-driver-monetdb"
+        assert info["driver_adbc_version"] == 1_001_000
+        assert "TABLE" in conn.adbc_get_table_types()
+        assert "LOCAL TEMPORARY TABLE" in conn.adbc_get_table_types()
+        table_schema = cast(
+            object,
+            conn.adbc_get_table_schema(  # pyright: ignore[reportUnknownMemberType]
+                "table_types", db_schema_filter="sys"
+            ),
+        )
+        assert str(table_schema) == "table_type_id: int16\ntable_type_name: string"
+        with conn.cursor() as cursor:
+            query_schema = cast(
+                object,
+                cursor.adbc_execute_schema(  # pyright: ignore[reportUnknownMemberType]
+                    "SELECT CAST(1 AS INT) AS value WHERE FALSE"
+                ),
+            )
+            assert str(query_schema) == "value: int32"
 
 
 @pytest.mark.integration

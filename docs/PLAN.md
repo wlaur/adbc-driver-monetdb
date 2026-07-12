@@ -97,9 +97,9 @@ as upstream-shaped MPL-2.0 changes so they can be offered back to
 - [x] bulk ingest: modes `create` / `append` / `replace` / `create_append` +
       `adbc.ingest.temporary`; DDL generated from the Arrow schema; multi-batch streams
       chunked into successive `COPY BINARY` statements inside one transaction
-- [ ] `GetInfo` (vendor_name = "MonetDB" — polars introspects it), `GetTableTypes`
-- [ ] `GetObjects` / `GetTableSchema` via `sys.tables` / `sys.columns` / `sys.keys`
-      (and `PREPARE SELECT * FROM t` for schemas)
+- [x] `GetInfo` (vendor_name = "MonetDB" — polars introspects it), `GetTableTypes`
+- [x] `GetTableSchema` and `ExecuteSchema` from a zero-row query result header
+- [ ] `GetObjects` via `sys.tables` / `sys.columns` / `sys.keys`
 - [ ] prepared statements with positional (qmark) parameters rendered as SQL literals
       (MonetDB has no wire-level binary bind; bulk data goes through ingest)
 - [x] error mapping: MAPI error strings → ADBC status + SQLSTATE (MonetDB prefixes
@@ -128,7 +128,7 @@ as upstream-shaped MPL-2.0 changes so they can be offered back to
 | bulk ingest (all four modes) | DDL from Arrow schema + `COPY BINARY INTO ... ON CLIENT` |
 | `adbc.ingest.temporary` | `CREATE LOCAL TEMPORARY TABLE` |
 | prepared statements / bind | `PREPARE`/`EXECUTE`, literal parameter rendering |
-| `GetTableSchema` | `PREPARE SELECT * FROM t` (no execution) |
+| `GetTableSchema` | zero-row `SELECT * FROM t WHERE FALSE` result header |
 | `GetObjects` | SQL over `sys.*` catalogs |
 | transactions / autocommit | handshake option + `Xauto_commit` + SQL |
 | partitioned results | unsupported (MAPI is a single sequential channel) |

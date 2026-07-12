@@ -9,9 +9,13 @@ use adbc_core::error::{Error, Result, Status};
 use adbc_core::options::{
     InfoCode, ObjectDepth, OptionConnection, OptionDatabase, OptionStatement, OptionValue,
 };
+use adbc_core::schemas::{GET_INFO_SCHEMA, GET_TABLE_TYPES_SCHEMA};
 use adbc_core::{Connection, Database, Driver, Optionable, PartitionedResult, Statement};
-use arrow_array::{RecordBatch, RecordBatchReader};
-use arrow_schema::{ArrowError, Schema, SchemaRef};
+use arrow_array::{
+    ArrayRef, BooleanArray, Int64Array, RecordBatch, RecordBatchReader, StringArray, UInt32Array,
+    UnionArray, new_empty_array,
+};
+use arrow_schema::{ArrowError, DataType, Schema, SchemaRef};
 use monetdb::{CursorError, Endian, Parameters, ResultColumn};
 use percent_encoding::percent_decode_str;
 
@@ -265,7 +269,7 @@ impl Database for MonetdbDatabase {
         let mut result = MonetdbConnection {
             inner: Arc::new(Mutex::new(connection)),
             options: Options::default(),
-            _version: version,
+            version,
         };
         for (key, value) in opts {
             result.set_option(key, value)?;
@@ -287,7 +291,7 @@ fn decode_userinfo(value: &str) -> Result<Option<String>> {
 pub struct MonetdbConnection {
     inner: Arc<Mutex<monetdb::Connection>>,
     options: Options,
-    _version: (u16, u16, u16),
+    version: (u16, u16, u16),
 }
 
 impl Optionable for MonetdbConnection {
@@ -366,9 +370,12 @@ impl Connection for MonetdbConnection {
 
     fn get_info(
         &self,
-        _codes: Option<HashSet<InfoCode>>,
+        codes: Option<HashSet<InfoCode>>,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-        Err(not_implemented("get_info"))
+        Ok(Box::new(SingleBatchReader::new(info_batch(
+            self.version,
+            codes,
+        )?)))
     }
 
     fn get_objects(
@@ -385,15 +392,41 @@ impl Connection for MonetdbConnection {
 
     fn get_table_schema(
         &self,
-        _catalog: Option<&str>,
-        _db_schema: Option<&str>,
-        _table_name: &str,
+        catalog: Option<&str>,
+        db_schema: Option<&str>,
+        table_name: &str,
     ) -> Result<Schema> {
-        Err(not_implemented("get_table_schema"))
+        if catalog.is_some() {
+            return Err(error(
+                "MonetDB does not support cross-catalog table lookup",
+                Status::NotImplemented,
+            ));
+        }
+        schema_for_query(
+            &self.inner,
+            &format!(
+                "SELECT * FROM {} WHERE FALSE",
+                qualified_name(db_schema, table_name)
+            ),
+        )
     }
 
     fn get_table_types(&self) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-        Err(not_implemented("get_table_types"))
+        let values = StringArray::from(vec![
+            "TABLE",
+            "VIEW",
+            "MERGE TABLE",
+            "REMOTE TABLE",
+            "REPLICA TABLE",
+            "UNLOGGED TABLE",
+            "SYSTEM TABLE",
+            "SYSTEM VIEW",
+            "GLOBAL TEMPORARY TABLE",
+            "LOCAL TEMPORARY TABLE",
+            "LOCAL TEMPORARY VIEW",
+        ]);
+        let batch = RecordBatch::try_new(GET_TABLE_TYPES_SCHEMA.clone(), vec![Arc::new(values)])?;
+        Ok(Box::new(SingleBatchReader::new(batch)))
     }
 
     fn get_statistic_names(&self) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
@@ -507,50 +540,13 @@ impl Statement for MonetdbStatement {
 
     fn execute(&mut self) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
         if self.bound.is_some() {
-            return Err(not_implemented("bulk ingestion"));
+            return Err(not_implemented("query parameters"));
         }
         let query = self
             .query
             .as_deref()
             .ok_or_else(|| error("SQL query is not set", Status::InvalidState))?;
-        let mut cursor = self
-            .connection
-            .lock()
-            .expect("connection mutex is not poisoned")
-            .cursor();
-        cursor.execute(query).map_err(map_cursor_error)?;
-        if !cursor.has_result_set() {
-            return Ok(Box::new(EmptyReader::default()));
-        }
-        let mut result = cursor.binary_result().map_err(map_cursor_error)?;
-        let total_rows = result.total_rows;
-        if total_rows == 1 {
-            let query = query.trim().trim_end_matches(';');
-            cursor
-                .execute(&format!(
-                    "WITH \"__adbc_source\" AS ({query}) \
-                     SELECT \"__adbc_source\".* FROM \"__adbc_source\" \
-                     CROSS JOIN (VALUES (1), (2)) AS \"__adbc_duplicate\"(\"n\")"
-                ))
-                .map_err(map_cursor_error)?;
-            result = cursor.binary_result().map_err(map_cursor_error)?;
-            if result.total_rows < 2 {
-                return Err(error(
-                    "one-row query could not be retained for binary export",
-                    Status::Internal,
-                ));
-            }
-        }
-        let schema = schema_for_columns(&result.columns)?;
-        Ok(Box::new(BinaryReader {
-            cursor,
-            columns: result.columns,
-            schema,
-            next_row: 0,
-            total_rows,
-            batch_rows: self.batch_rows,
-            finished: false,
-        }))
+        query_reader(&self.connection, query, self.batch_rows)
     }
 
     fn execute_update(&mut self) -> Result<Option<i64>> {
@@ -565,7 +561,14 @@ impl Statement for MonetdbStatement {
     }
 
     fn execute_schema(&mut self) -> Result<Schema> {
-        Err(not_implemented("execute_schema"))
+        if self.bound.is_some() {
+            return Err(not_implemented("parameterized execute_schema"));
+        }
+        let query = self
+            .query
+            .as_deref()
+            .ok_or_else(|| error("SQL query is not set", Status::InvalidState))?;
+        schema_for_query(&self.connection, query)
     }
 
     fn execute_partitions(&mut self) -> Result<PartitionedResult> {
@@ -768,6 +771,161 @@ impl MonetdbStatement {
     }
 }
 
+enum InfoValue {
+    String(Option<String>),
+    Bool(bool),
+    Int(i64),
+}
+
+fn info_value(code: InfoCode, version: (u16, u16, u16)) -> InfoValue {
+    match code {
+        InfoCode::VendorName => InfoValue::String(Some("MonetDB".into())),
+        InfoCode::VendorVersion => {
+            InfoValue::String(Some(format!("{}.{}.{}", version.0, version.1, version.2)))
+        }
+        InfoCode::VendorArrowVersion => InfoValue::String(None),
+        InfoCode::VendorSql => InfoValue::Bool(true),
+        InfoCode::VendorSubstrait => InfoValue::Bool(false),
+        InfoCode::VendorSubstraitMinVersion | InfoCode::VendorSubstraitMaxVersion => {
+            InfoValue::String(None)
+        }
+        InfoCode::DriverName => InfoValue::String(Some("adbc-driver-monetdb".into())),
+        InfoCode::DriverVersion => InfoValue::String(Some(env!("CARGO_PKG_VERSION").into())),
+        InfoCode::DriverArrowVersion => InfoValue::String(Some("58.3.0".into())),
+        InfoCode::DriverAdbcVersion => InfoValue::Int(1_001_000),
+        _ => InfoValue::String(None),
+    }
+}
+
+fn info_batch(version: (u16, u16, u16), codes: Option<HashSet<InfoCode>>) -> Result<RecordBatch> {
+    let mut codes = match codes {
+        Some(codes) => codes.into_iter().collect::<Vec<_>>(),
+        None => vec![
+            InfoCode::VendorName,
+            InfoCode::VendorVersion,
+            InfoCode::VendorArrowVersion,
+            InfoCode::VendorSql,
+            InfoCode::VendorSubstrait,
+            InfoCode::VendorSubstraitMinVersion,
+            InfoCode::VendorSubstraitMaxVersion,
+            InfoCode::DriverName,
+            InfoCode::DriverVersion,
+            InfoCode::DriverArrowVersion,
+            InfoCode::DriverAdbcVersion,
+        ],
+    };
+    codes.sort_by_key(|code| u32::from(code));
+
+    let mut names = Vec::with_capacity(codes.len());
+    let mut type_ids = Vec::with_capacity(codes.len());
+    let mut offsets = Vec::with_capacity(codes.len());
+    let mut strings = Vec::new();
+    let mut bools = Vec::new();
+    let mut ints = Vec::new();
+    for code in codes {
+        names.push(u32::from(&code));
+        let (type_id, offset) = match info_value(code, version) {
+            InfoValue::String(value) => {
+                strings.push(value);
+                (0, strings.len() - 1)
+            }
+            InfoValue::Bool(value) => {
+                bools.push(Some(value));
+                (1, bools.len() - 1)
+            }
+            InfoValue::Int(value) => {
+                ints.push(Some(value));
+                (2, ints.len() - 1)
+            }
+        };
+        type_ids.push(type_id);
+        offsets.push(
+            i32::try_from(offset)
+                .map_err(|_| error("get_info union offset exceeds i32", Status::Internal))?,
+        );
+    }
+
+    let DataType::Union(fields, _) = GET_INFO_SCHEMA.field(1).data_type() else {
+        return Err(error("invalid canonical get_info schema", Status::Internal));
+    };
+    let string_child: ArrayRef = Arc::new(StringArray::from(strings));
+    let bool_child: ArrayRef = Arc::new(BooleanArray::from(bools));
+    let int_child: ArrayRef = Arc::new(Int64Array::from(ints));
+    let children = fields
+        .iter()
+        .map(|(type_id, field)| match type_id {
+            0 => Arc::clone(&string_child),
+            1 => Arc::clone(&bool_child),
+            2 => Arc::clone(&int_child),
+            _ => new_empty_array(field.data_type()),
+        })
+        .collect();
+    let values = UnionArray::try_new(
+        fields.clone(),
+        type_ids.into(),
+        Some(offsets.into()),
+        children,
+    )?;
+    Ok(RecordBatch::try_new(
+        GET_INFO_SCHEMA.clone(),
+        vec![Arc::new(UInt32Array::from(names)), Arc::new(values)],
+    )?)
+}
+
+fn query_reader(
+    connection: &Arc<Mutex<monetdb::Connection>>,
+    query: &str,
+    batch_rows: usize,
+) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
+    let mut cursor = connection
+        .lock()
+        .expect("connection mutex is not poisoned")
+        .cursor();
+    cursor.execute(query).map_err(map_cursor_error)?;
+    if !cursor.has_result_set() {
+        return Ok(Box::new(EmptyReader::default()));
+    }
+    let mut result = cursor.binary_result().map_err(map_cursor_error)?;
+    let total_rows = result.total_rows;
+    if total_rows == 1 {
+        let query = query.trim().trim_end_matches(';');
+        cursor
+            .execute(&format!(
+                "WITH \"__adbc_source\" AS ({query}) \
+                 SELECT \"__adbc_source\".* FROM \"__adbc_source\" \
+                 CROSS JOIN (VALUES (1), (2)) AS \"__adbc_duplicate\"(\"n\")"
+            ))
+            .map_err(map_cursor_error)?;
+        result = cursor.binary_result().map_err(map_cursor_error)?;
+        if result.total_rows < 2 {
+            return Err(error(
+                "one-row query could not be retained for binary export",
+                Status::Internal,
+            ));
+        }
+    }
+    let schema = schema_for_columns(&result.columns)?;
+    Ok(Box::new(BinaryReader {
+        cursor,
+        columns: result.columns,
+        schema,
+        next_row: 0,
+        total_rows,
+        batch_rows,
+        finished: false,
+    }))
+}
+
+fn schema_for_query(connection: &Arc<Mutex<monetdb::Connection>>, query: &str) -> Result<Schema> {
+    let mut cursor = connection
+        .lock()
+        .expect("connection mutex is not poisoned")
+        .cursor();
+    cursor.execute(query).map_err(map_cursor_error)?;
+    let result = cursor.binary_result().map_err(map_cursor_error)?;
+    Ok(schema_for_columns(&result.columns)?.as_ref().clone())
+}
+
 fn execute_update(
     connection: &Arc<Mutex<monetdb::Connection>>,
     query: &str,
@@ -936,5 +1094,22 @@ mod tests {
     #[test]
     fn quotes_identifiers() {
         assert_eq!(quote_identifier("a\"b"), "\"a\"\"b\"");
+    }
+
+    #[test]
+    fn builds_canonical_info_batches() {
+        let batch = info_batch((11, 55, 7), None).unwrap();
+        assert_eq!(batch.schema(), GET_INFO_SCHEMA.clone());
+        assert_eq!(batch.num_rows(), 11);
+        let names = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        assert_eq!(names.value(0), u32::from(&InfoCode::VendorName));
+
+        let empty = info_batch((11, 55, 7), Some(HashSet::new())).unwrap();
+        assert_eq!(empty.schema(), GET_INFO_SCHEMA.clone());
+        assert_eq!(empty.num_rows(), 0);
     }
 }

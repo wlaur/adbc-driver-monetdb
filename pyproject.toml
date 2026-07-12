@@ -31,6 +31,7 @@ dev = [
     "pyright",
     "polars>=1.42",
     "pymonetdb>=1.9",
+    "pyarrow>=25.0.0",
 ]
 
 [project.urls]
