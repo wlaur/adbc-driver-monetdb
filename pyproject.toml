@@ -9,7 +9,6 @@ license = "MIT"
 license-files = ["LICENSE"]
 keywords = ["monetdb", "adbc", "arrow", "polars", "database", "driver", "olap"]
 classifiers = [
-    "Development Status :: 2 - Pre-Alpha",
     "Intended Audience :: Developers",
     "Operating System :: Microsoft :: Windows",
     "Operating System :: POSIX :: Linux",
