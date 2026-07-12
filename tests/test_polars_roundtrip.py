@@ -21,6 +21,20 @@ def test_read_database(monetdb_uri: str) -> None:
 
 
 @pytest.mark.integration
+def test_one_row_query_executes_once(monetdb_uri: str) -> None:
+    with dbapi.connect(monetdb_uri) as conn, conn.cursor() as cursor:
+        try:
+            cursor.execute("DROP SEQUENCE IF EXISTS adbc_single_execution")  # pyright: ignore[reportUnknownMemberType]
+            cursor.execute("CREATE SEQUENCE adbc_single_execution AS BIGINT START WITH 1")  # pyright: ignore[reportUnknownMemberType]
+            cursor.execute("SELECT NEXT VALUE FOR adbc_single_execution")  # pyright: ignore[reportUnknownMemberType]
+            assert cursor.fetchone() == (1,)  # pyright: ignore[reportUnknownMemberType]
+            cursor.execute("SELECT NEXT VALUE FOR adbc_single_execution")  # pyright: ignore[reportUnknownMemberType]
+            assert cursor.fetchone() == (2,)  # pyright: ignore[reportUnknownMemberType]
+        finally:
+            cursor.execute("DROP SEQUENCE IF EXISTS adbc_single_execution")  # pyright: ignore[reportUnknownMemberType]
+
+
+@pytest.mark.integration
 def test_non_binary_type_error_recommends_cast(monetdb_uri: str) -> None:
     with dbapi.connect(monetdb_uri) as conn:
         with pytest.raises(

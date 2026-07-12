@@ -16,7 +16,9 @@ use arrow_array::{
     UInt32Array, UnionArray, new_empty_array,
 };
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
-use monetdb::{CursorError, Endian, MonetType, Parameters, ResultColumn, parms::Parm};
+use monetdb::{
+    BinaryResult, CursorError, Endian, MonetType, Parameters, ResultColumn, parms::Parm,
+};
 use percent_encoding::percent_decode_str;
 
 mod metadata;
@@ -616,10 +618,9 @@ impl Statement for MonetdbStatement {
             .as_deref()
             .ok_or_else(|| error("SQL query is not set", Status::InvalidState))?;
         if let Some(id) = self.prepared_id {
-            return query_reader_with_source(
+            return query_reader(
                 &self.connection,
                 &format!("EXECUTE {id}()"),
-                query,
                 self.batch_rows,
             );
         }
@@ -797,15 +798,14 @@ impl MonetdbStatement {
                 ));
             }
             for row in 0..batch.num_rows() {
-                let source = render_row(&query, &batch, row)?;
                 let sql = match self.prepared_id {
                     Some(id) => format!(
                         "EXECUTE {id}({})",
                         render_arguments(&batch, row)?.join(", ")
                     ),
-                    None => source.clone(),
+                    None => render_row(&query, &batch, row)?,
                 };
-                queries.push(ExecutableQuery { sql, source });
+                queries.push(ExecutableQuery { sql });
             }
         }
         Ok(queries)
@@ -998,7 +998,6 @@ impl Drop for MonetdbStatement {
 
 struct ExecutableQuery {
     sql: String,
-    source: String,
 }
 
 enum InfoValue {
@@ -1229,15 +1228,6 @@ fn query_reader(
     query: &str,
     batch_rows: usize,
 ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-    query_reader_with_source(connection, query, query, batch_rows)
-}
-
-fn query_reader_with_source(
-    connection: &Arc<Mutex<monetdb::Connection>>,
-    query: &str,
-    source_query: &str,
-    batch_rows: usize,
-) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
     let mut cursor = connection
         .lock()
         .expect("connection mutex is not poisoned")
@@ -1249,21 +1239,7 @@ fn query_reader_with_source(
     let mut result = cursor.binary_result().map_err(map_cursor_error)?;
     let total_rows = result.total_rows;
     if total_rows == 1 {
-        let query = source_query.trim().trim_end_matches(';');
-        cursor
-            .execute(&format!(
-                "WITH \"__adbc_source\" AS (\n{query}\n) \
-                 SELECT \"__adbc_source\".* FROM \"__adbc_source\" \
-                 CROSS JOIN (VALUES (1), (2)) AS \"__adbc_duplicate\"(\"n\")"
-            ))
-            .map_err(map_cursor_error)?;
-        result = cursor.binary_result().map_err(map_cursor_error)?;
-        if result.total_rows < 2 {
-            return Err(error(
-                "one-row query could not be retained for binary export",
-                Status::Internal,
-            ));
-        }
+        result = retain_one_row(&mut cursor, &result.columns)?;
     }
     let schema = schema_for_columns(&result.columns)?;
     Ok(Box::new(BinaryReader {
@@ -1277,6 +1253,67 @@ fn query_reader_with_source(
     }))
 }
 
+fn retain_one_row(cursor: &mut monetdb::Cursor, columns: &[ResultColumn]) -> Result<BinaryResult> {
+    if !cursor.next_row().map_err(map_cursor_error)? {
+        return Err(error(
+            "one-row result did not contain its initial text row",
+            Status::InvalidData,
+        ));
+    }
+    let expressions = columns
+        .iter()
+        .enumerate()
+        .map(|(index, column)| {
+            let data_type = retention_sql_type(column.sql_type());
+            let value = cursor
+                .get_str(index)
+                .map_err(map_cursor_error)?
+                .map(quote_text_value)
+                .unwrap_or_else(|| "NULL".into());
+            Ok(format!(
+                "CAST({value} AS {data_type}) AS \"__adbc_c{index}\""
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    cursor
+        .execute(&format!(
+            "SELECT \"__adbc_source\".* FROM (SELECT {}) AS \"__adbc_source\" \
+             CROSS JOIN (VALUES (1), (2)) AS \"__adbc_duplicate\"(\"n\")",
+            expressions.join(", ")
+        ))
+        .map_err(map_cursor_error)?;
+    let retained = cursor.binary_result().map_err(map_cursor_error)?;
+    if retained.total_rows != 2 || retained.columns.len() != columns.len() {
+        return Err(error(
+            "one-row result could not be retained for binary export",
+            Status::Internal,
+        ));
+    }
+    Ok(BinaryResult {
+        result_id: retained.result_id,
+        total_rows: 1,
+        columns: columns.to_vec(),
+    })
+}
+
+fn retention_sql_type(data_type: &MonetType) -> String {
+    match data_type {
+        MonetType::Varchar(0) => "STRING".into(),
+        MonetType::MonthInterval => "INTERVAL MONTH".into(),
+        MonetType::DayInterval => "INTERVAL DAY".into(),
+        MonetType::SecInterval => "INTERVAL SECOND".into(),
+        MonetType::Time => "TIME(6)".into(),
+        MonetType::TimeTz => "TIME(6) WITH TIME ZONE".into(),
+        MonetType::Timestamp => "TIMESTAMP(6)".into(),
+        MonetType::TimestampTz => "TIMESTAMP(6) WITH TIME ZONE".into(),
+        _ => data_type.to_string(),
+    }
+}
+
+fn quote_text_value(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
 fn parameter_query_reader(
     connection: &Arc<Mutex<monetdb::Connection>>,
     queries: Vec<ExecutableQuery>,
@@ -1286,7 +1323,7 @@ fn parameter_query_reader(
     let first = queries
         .pop_front()
         .ok_or_else(|| error("no parameter rows to execute", Status::InvalidArguments))?;
-    let current = query_reader_with_source(connection, &first.sql, &first.source, batch_rows)?;
+    let current = query_reader(connection, &first.sql, batch_rows)?;
     let schema = current.schema();
     Ok(Box::new(ParameterQueryReader {
         connection: Arc::clone(connection),
@@ -1418,12 +1455,7 @@ impl Iterator for ParameterQueryReader {
             }
             self.current = None;
             let query = self.queries.pop_front()?;
-            match query_reader_with_source(
-                &self.connection,
-                &query.sql,
-                &query.source,
-                self.batch_rows,
-            ) {
+            match query_reader(&self.connection, &query.sql, self.batch_rows) {
                 Ok(reader) if reader.schema() == self.schema => self.current = Some(reader),
                 Ok(_) => {
                     return Some(Err(ArrowError::SchemaError(

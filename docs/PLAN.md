@@ -176,6 +176,9 @@ convert to UTC → TIMESTAMPTZ; float NaN and null both map to NULL (MonetDB sem
   *client-requested* byte order; column data is in the *server's native* order.
 - The first `reply_size` rows of every result set arrive as text inside the execute
   response — negotiate a small reply size and fetch the bulk via `Xexportbin`.
+- A one-row result is closed after that initial text row, so it cannot be fetched with
+  `Xexportbin`; the driver retains the returned values in a typed constant result instead
+  of executing the source query a second time.
 - `Q_PREPARE` result sets cannot be fetched with `Xexport*` (protocol limitation);
   prepared-statement metadata is text-only. `EXECUTE` results are ordinary `Q_TABLE`s.
 - String backrefs are ingest-oriented; current servers do not emit them on export, but the
