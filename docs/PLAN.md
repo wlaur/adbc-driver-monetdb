@@ -26,7 +26,7 @@ that ceiling entirely, and bulk ingest replaces `executemany` row loops.
 ## Architecture
 
 ```
-python/adbc_driver_monetdb    thin shim: dbapi.connect() -> adbc_driver_manager
+adbc_driver_monetdb           thin shim: dbapi.connect() -> adbc_driver_manager
                               (module name is load-bearing: polars resolves
                               adbc_driver_{scheme} for monetdb:// URIs)
 crates/adbc-monetdb           ADBC object model (adbc_core traits) exported as a
@@ -34,7 +34,7 @@ crates/adbc-monetdb           ADBC object model (adbc_core traits) exported as a
                               (AdbcDriverMonetdbInit + AdbcDriverInit fallback)
 crates/monetdb-arrow          wire format <-> Arrow: Xexportbin frame parsing (done),
                               per-type decoders/encoders (M2)
-vendor/monetdb-rust           fork of the official MAPI client crate (submodule):
+monetdb-rust                  fork of the official MAPI client crate (submodule):
                               framing, auth, TLS, URL parsing exist; the pieces the
                               driver needs are added here (M1)
 ```
@@ -57,7 +57,7 @@ as upstream-shaped MPL-2.0 changes so they can be offered back to
 - [ ] measure where bulk-insert time goes (client serialization vs server ingest) to size
       the write-path win
 
-### M1 — protocol layer (vendor/monetdb-rust)
+### M1 — protocol layer (the monetdb-rust fork)
 
 - [ ] `Xexportbin <resid> <start> <count>` command + binary response framing
 - [ ] `Xreply_size` control (small text prefix, bulk via binary windows)

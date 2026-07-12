@@ -1,9 +1,9 @@
 [workspace]
 resolver = "3"
 members = ["crates/monetdb-arrow", "crates/adbc-monetdb"]
-# The monetdb-rust fork (git submodule) keeps its own workspace; it is consumed
-# as a path dependency, not as a member.
-exclude = ["vendor/monetdb-rust"]
+# The monetdb-rust fork (git submodule of wlaur/monetdb-rust) keeps its own
+# workspace; it is consumed as a path dependency, not as a member.
+exclude = ["monetdb-rust"]
 
 [workspace.package]
 version = "0.1.0"
@@ -18,7 +18,7 @@ adbc_ffi = "0.23"
 arrow-array = "58"
 arrow-buffer = "58"
 arrow-schema = "58"
-monetdb = { path = "vendor/monetdb-rust" }
+monetdb = { path = "monetdb-rust" }
 monetdb-arrow = { path = "crates/monetdb-arrow" }
 pyo3 = "0.28"
 

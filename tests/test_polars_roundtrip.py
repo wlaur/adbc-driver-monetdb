@@ -1,5 +1,6 @@
 import polars as pl
 import pytest
+
 from adbc_driver_monetdb import dbapi
 
 

@@ -49,7 +49,7 @@ build-backend = "maturin"
 # The module MUST be importable as adbc_driver_monetdb: polars resolves the driver for
 # monetdb:// URIs from the module name (adbc_driver_{scheme}).
 manifest-path = "crates/adbc-monetdb/Cargo.toml"
-python-source = "python"
+python-source = "."
 module-name = "adbc_driver_monetdb._native"
 features = ["python"]
 
@@ -68,7 +68,7 @@ environment = { PATH = "$HOME/.cargo/bin:$PATH" }
 [tool.ruff]
 line-length = 120
 target-version = "py313"
-exclude = [".venv", "vendor", "target", "dist", "build", "**/*.pyi"]
+exclude = [".venv", "monetdb-rust", "target", "dist", "build", "**/*.pyi"]
 lint.select = [
     "E",
     "W",
@@ -94,7 +94,7 @@ lint.ignore = ["ISC001"]
 max-complexity = 10
 
 [tool.pyright]
-include = ["python", "tests"]
+include = ["adbc_driver_monetdb", "tests"]
 venvPath = "."
 venv = ".venv"
 typeCheckingMode = "strict"

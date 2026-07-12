@@ -33,8 +33,8 @@ df = pl.read_database_uri("SELECT 1", "monetdb://localhost:50000/db", engine="ad
 |---|---|
 | `crates/adbc-monetdb` | the ADBC driver (cdylib exporting `AdbcDriverMonetdbInit`) |
 | `crates/monetdb-arrow` | MonetDB binary wire format ⇄ Arrow conversion |
-| `vendor/monetdb-rust` | fork of [MonetDB/monetdb-rust](https://github.com/MonetDB/monetdb-rust) (git submodule, MPL-2.0) — MAPI protocol layer |
-| `python/adbc_driver_monetdb` | Python shim over `adbc-driver-manager`; ships the cdylib as `adbc_driver_monetdb._native` |
+| `monetdb-rust` | [our fork](https://github.com/wlaur/monetdb-rust) of [MonetDB/monetdb-rust](https://github.com/MonetDB/monetdb-rust) (git submodule, MPL-2.0) — MAPI protocol layer |
+| `adbc_driver_monetdb` | Python shim over `adbc-driver-manager`; ships the cdylib as `adbc_driver_monetdb._native` |
 
 ## Development
 
@@ -55,4 +55,4 @@ Lint/typecheck: `uv run ruff check .`, `uv run ruff format --check .`, `uv run p
 
 ## License
 
-MIT. The vendored `monetdb` protocol crate (`vendor/monetdb-rust`) is MPL-2.0.
+MIT. The `monetdb` protocol crate (`monetdb-rust`, our fork of MonetDB/monetdb-rust) is MPL-2.0.

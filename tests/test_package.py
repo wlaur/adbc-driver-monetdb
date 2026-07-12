@@ -1,7 +1,8 @@
 from pathlib import Path
 
-import adbc_driver_monetdb
 import pytest
+
+import adbc_driver_monetdb
 from adbc_driver_monetdb import dbapi
 
 

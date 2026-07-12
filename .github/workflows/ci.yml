@@ -97,7 +97,7 @@ jobs:
         with:
           path: wheelhouse
           name: wheels-${{ matrix.os }}
-      - name: Install the prebuilt wheel + run the suite
+      - name: Install the prebuilt wheel
         shell: bash
         run: |
           python -m pip install --upgrade pip
@@ -105,7 +105,12 @@ jobs:
           # is not rebuilt from source; deps + test deps come from PyPI
           version=$(python -c 'from pathlib import Path; wheels = sorted(Path("wheelhouse").glob("adbc_driver_monetdb-*.whl")); assert len(wheels) == 1, f"expected exactly one wheel, found {len(wheels)}"; print(wheels[0].name.split("-")[1])')
           pip install --find-links wheelhouse "adbc-driver-monetdb==$version" pytest polars
-          python -m pytest tests -q -m "not integration"
+      - name: Run the suite against the installed wheel
+        # NOT from the workspace: the adbc_driver_monetdb source dir at the repo root
+        # would shadow the installed wheel on sys.path (no compiled _native there)
+        working-directory: ${{ runner.temp }}
+        shell: bash
+        run: python -m pytest "$GITHUB_WORKSPACE/tests" -q -m "not integration"
 
   integration:
     name: integration (MonetDB Dec2025)
@@ -151,7 +156,11 @@ jobs:
           else:
               raise SystemExit(f"MonetDB never became ready: {last}")
           PY
-      - run: python -m pytest tests -q -m integration
+      - name: Run the integration suite against the installed wheel
+        # NOT from the workspace: the adbc_driver_monetdb source dir at the repo root
+        # would shadow the installed wheel on sys.path (no compiled _native there)
+        working-directory: ${{ runner.temp }}
+        run: python -m pytest "$GITHUB_WORKSPACE/tests" -q -m integration
 
   publish:
     name: publish to PyPI
