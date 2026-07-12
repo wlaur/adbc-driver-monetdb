@@ -49,6 +49,7 @@ with dbapi.connect("monetdb://user:password@localhost:50000/db") as conn:
 | Prepared statements, positional binds, and `executemany` | Supported |
 | Bulk ingest: create, append, replace, create-append, schema, temporary tables | Supported |
 | Transactions and autocommit | Supported |
+| TLS (`monetdbs://`) | System roots, certificate file, SHA-256 certificate hash, and client certificates |
 | `GetInfo`, `GetObjects`, `GetTableSchema`, `GetTableTypes`, `ExecuteSchema` | Supported |
 | Query cancellation | Not supported by the current Rust MAPI transport |
 | Partitioned results | Not supported; MAPI exposes one sequential result channel |

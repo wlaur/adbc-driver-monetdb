@@ -1,6 +1,7 @@
 import os
 import socket
 from pathlib import Path
+from threading import Thread
 
 import adbc_driver_manager
 import pytest
@@ -41,10 +42,13 @@ def test_connect_rejects_missing_unix_socket(tmp_path: Path) -> None:
         dbapi.connect("still-not-a-uri")
 
 
-def test_connect_reports_disabled_tls_cleanly() -> None:
+def test_connect_reports_tls_handshake_failure_cleanly() -> None:
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         listener.listen(1)
         port = listener.getsockname()[1]
-        with pytest.raises(adbc_driver_manager.ProgrammingError, match=r"TLS.*not.*enabled|TLS.*unsupported"):
+        thread = Thread(target=lambda: listener.accept()[0].close())
+        thread.start()
+        with pytest.raises(adbc_driver_manager.OperationalError):
             dbapi.connect(f"monetdbs://127.0.0.1:{port}/test?connect_timeout=1")
+        thread.join()

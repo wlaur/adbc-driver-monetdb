@@ -71,6 +71,8 @@ as upstream-shaped MPL-2.0 changes so they can be offered back to
       not accumulate in memory
 - [x] expose the server fingerprint: endianness (challenge field 5), `BINARY` level,
       `monet_version`
+- [x] TLS 1.3 with `mapi/9` ALPN, system or file-based trust, SHA-256 certificate
+      pinning, and client certificates
 - [x] result-set header parsing that carries decimal digits/scale and column types
       through to the consumer
 
