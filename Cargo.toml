@@ -1,0 +1,38 @@
+[workspace]
+resolver = "3"
+members = ["crates/monetdb-arrow", "crates/adbc-monetdb"]
+# The monetdb-rust fork (git submodule) keeps its own workspace; it is consumed
+# as a path dependency, not as a member.
+exclude = ["vendor/monetdb-rust"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/wlaur/adbc-driver-monetdb"
+
+[workspace.dependencies]
+# adbc_core/adbc_ffi 0.23 require arrow >=53.1,<59 -- one arrow major per workspace
+adbc_core = "0.23"
+adbc_ffi = "0.23"
+arrow-array = "58"
+arrow-buffer = "58"
+arrow-schema = "58"
+monetdb = { path = "vendor/monetdb-rust" }
+monetdb-arrow = { path = "crates/monetdb-arrow" }
+pyo3 = "0.28"
+
+[workspace.lints.rust]
+# require `unsafe {}` inside an `unsafe fn` body (no implicit unsafe scope)
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+# every `unsafe {}` block must carry a `// SAFETY:` comment
+undocumented_unsafe_blocks = "warn"
+
+# Size-optimized release: the cdylib statically links arrow, so LTO prunes a lot of
+# unused code and strip drops debug symbols (the wheel is mostly this library).
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

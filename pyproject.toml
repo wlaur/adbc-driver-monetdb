@@ -1,0 +1,114 @@
+[project]
+name = "adbc-driver-monetdb"
+version = "0.1.0a0"
+description = "ADBC driver for MonetDB: Arrow-native reads and writes for polars, pandas, and the wider ADBC ecosystem"
+authors = [{ name = "William Laurén", email = "lauren.william.a@gmail.com" }]
+requires-python = ">=3.13"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["monetdb", "adbc", "arrow", "polars", "database", "driver", "olap"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Rust",
+    "Topic :: Database",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+dependencies = ["adbc-driver-manager>=1.11"]
+
+[dependency-groups]
+dev = [
+    "maturin>=1.8.2,<2",
+    "ruff",
+    "pytest",
+    "pyright",
+    "polars>=1.42",
+    "pymonetdb>=1.9",
+]
+
+[project.urls]
+Homepage = "https://github.com/wlaur/adbc-driver-monetdb"
+Repository = "https://github.com/wlaur/adbc-driver-monetdb"
+Issues = "https://github.com/wlaur/adbc-driver-monetdb/issues"
+
+[build-system]
+requires = ["maturin>=1.8.2,<2"]
+build-backend = "maturin"
+
+[tool.maturin]
+# Mixed Python + Rust project: the ADBC driver cdylib (crates/adbc-monetdb) is shipped
+# inside the Python package as the extension module adbc_driver_monetdb._native.
+# The ADBC driver manager dlopens that file by path (see adbc_driver_monetdb.driver_path).
+# The module MUST be importable as adbc_driver_monetdb: polars resolves the driver for
+# monetdb:// URIs from the module name (adbc_driver_{scheme}).
+manifest-path = "crates/adbc-monetdb/Cargo.toml"
+python-source = "python"
+module-name = "adbc_driver_monetdb._native"
+features = ["python"]
+
+[tool.cibuildwheel]
+# abi3 (cp313) -> one wheel per platform covers CPython >= 3.13.
+# Targets: Linux x86_64 + aarch64 (manylinux), macOS arm64 only, Windows x86_64.
+build = "cp313-*"
+skip = ["*-musllinux*", "*_i686", "*-win32"]
+test-command = 'python -c "import adbc_driver_monetdb as m; print(m.driver_path())"'
+
+[tool.cibuildwheel.linux]
+# the manylinux image lacks Rust (needed by maturin); install it, then build
+before-all = "curl -sSf https://sh.rustup.rs | sh -s -- -y"
+environment = { PATH = "$HOME/.cargo/bin:$PATH" }
+
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+exclude = [".venv", "vendor", "target", "dist", "build", "**/*.pyi"]
+lint.select = [
+    "E",
+    "W",
+    "F",
+    "B",
+    "I",
+    "N",
+    "UP",
+    "ANN",
+    "C4",
+    "ISC",
+    "ICN",
+    "SIM",
+    "ARG",
+    "PTH",
+    "INT",
+    "FLY",
+    "RUF",
+]
+lint.ignore = ["ISC001"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.pyright]
+include = ["python", "tests"]
+venvPath = "."
+venv = ".venv"
+typeCheckingMode = "strict"
+reportUnnecessaryTypeIgnoreComment = "error"
+useLibraryCodeForTypes = true
+enableTypeIgnoreComments = false
+strictListInference = true
+strictDictionaryInference = true
+strictSetInference = true
+reportUnusedImport = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: requires a running MonetDB server (set MONETDB_TEST_URI)",
+]

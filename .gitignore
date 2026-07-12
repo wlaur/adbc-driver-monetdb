@@ -1,0 +1,22 @@
+# Rust
+/target/
+vendor/monetdb-rust/target/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+dist/
+wheelhouse/
+.pytest_cache/
+.ruff_cache/
+
+# maturin develop drops the compiled extension module into the package (keep _native.pyi)
+python/adbc_driver_monetdb/_native*.so
+python/adbc_driver_monetdb/_native*.pyd
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/

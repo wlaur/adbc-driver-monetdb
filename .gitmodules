@@ -1,0 +1,3 @@
+[submodule "vendor/monetdb-rust"]
+	path = vendor/monetdb-rust
+	url = https://github.com/wlaur/monetdb-rust

@@ -1,0 +1,29 @@
+[package]
+name = "adbc-monetdb"
+description = "ADBC driver for MonetDB"
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["lib", "cdylib"]
+
+[features]
+default = []
+# built by maturin (see /pyproject.toml): adds the stub pyo3 extension module so the
+# cdylib is shipped inside the Python wheel as adbc_driver_monetdb._native
+python = ["dep:pyo3", "pyo3/extension-module", "pyo3/abi3-py313"]
+
+[dependencies]
+adbc_core.workspace = true
+adbc_ffi.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+monetdb.workspace = true
+monetdb-arrow.workspace = true
+pyo3 = { workspace = true, optional = true }
+
+[lints]
+workspace = true

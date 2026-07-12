@@ -1,0 +1,192 @@
+name: CI/release
+
+# lint          -> ruff check + format, pyright (strict)
+# rust          -> cargo fmt, clippy (-D warnings), workspace tests
+# build-wheels  -> one abi3 (cp313) wheel per platform via cibuildwheel + maturin
+# test          -> install each prebuilt wheel + run the python suite, every OS x py
+# integration   -> wheel against a dockerized MonetDB (Dec2025-SP3)
+# publish       -> only on a `v*` tag, via PyPI Trusted Publishing (OIDC, no token)
+# github-release-> after a successful publish, create the GitHub Release
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    name: lint (ruff + pyright)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: true
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          python-version: "3.13"
+      # uv sync builds the extension via maturin (rust is preinstalled on the runner),
+      # so pyright checks against the real _native module and installed deps
+      - run: uv sync --locked
+      - run: uv run --no-sync ruff check .
+      - run: uv run --no-sync ruff format --check .
+      - run: uv run --no-sync pyright
+
+  rust:
+    name: rust fmt/clippy/test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: true
+      - name: Install Rust components
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup component add rustfmt clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  build-wheels:
+    name: build ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest      # manylinux x86_64
+          - ubuntu-24.04-arm   # manylinux aarch64
+          - macos-14           # macOS arm64 (Apple Silicon; Intel x86_64 intentionally unsupported)
+          - windows-latest     # Windows x86_64
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: true
+      - name: Build wheels
+        uses: pypa/cibuildwheel@a0a973acdc9e7b7f8b04ac5c80e6883a5a102615 # v4.1.0
+        with:
+          package-dir: .
+          output-dir: wheelhouse
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wheels-${{ matrix.os }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+
+  test:
+    name: test ${{ matrix.os }} py${{ matrix.python }}
+    needs: build-wheels
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-14, windows-latest]
+        python: ["3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: wheelhouse
+          name: wheels-${{ matrix.os }}
+      - name: Install the prebuilt wheel + run the suite
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          # install the PREBUILT wheel by name (abi3 cp313 installs on 3.14 too) so it
+          # is not rebuilt from source; deps + test deps come from PyPI
+          version=$(python -c 'from pathlib import Path; wheels = sorted(Path("wheelhouse").glob("adbc_driver_monetdb-*.whl")); assert len(wheels) == 1, f"expected exactly one wheel, found {len(wheels)}"; print(wheels[0].name.split("-")[1])')
+          pip install --find-links wheelhouse "adbc-driver-monetdb==$version" pytest polars
+          python -m pytest tests -q -m "not integration"
+
+  integration:
+    name: integration (MonetDB Dec2025)
+    needs: build-wheels
+    runs-on: ubuntu-latest
+    services:
+      monetdb:
+        image: monetdb/monetdb:Dec2025-SP3
+        ports:
+          - 50000:50000
+        env:
+          MDB_DB_ADMIN_PASS: monetdb
+          MDB_CREATE_DBS: test
+    env:
+      MONETDB_TEST_URI: monetdb://monetdb:monetdb@localhost:50000/test
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.13"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: wheelhouse
+          name: wheels-ubuntu-latest
+      - name: Install the prebuilt wheel
+        run: |
+          python -m pip install --upgrade pip
+          version=$(python -c 'from pathlib import Path; wheels = sorted(Path("wheelhouse").glob("adbc_driver_monetdb-*.whl")); assert len(wheels) == 1; print(wheels[0].name.split("-")[1])')
+          pip install --find-links wheelhouse "adbc-driver-monetdb==$version" pytest polars pymonetdb
+      - name: Wait for MonetDB to accept connections
+        run: |
+          python - <<'PY'
+          import time
+          import pymonetdb
+          for attempt in range(60):
+              try:
+                  pymonetdb.connect("monetdb://monetdb:monetdb@localhost:50000/test").close()
+                  print(f"MonetDB ready after {attempt + 1} attempts")
+                  break
+              except Exception as exc:
+                  last = exc
+                  time.sleep(2)
+          else:
+              raise SystemExit(f"MonetDB never became ready: {last}")
+          PY
+      - run: python -m pytest tests -q -m integration
+
+  publish:
+    name: publish to PyPI
+    needs: [lint, rust, build-wheels, test, integration]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: pypi               # configure the Trusted Publisher against this env
+    permissions:
+      id-token: write               # OIDC -> PyPI; no API token/secret is used
+      contents: read                # checkout below reads pyproject.toml to guard the tag
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Verify the tag matches the pyproject version
+        run: |
+          version=$(grep -m1 '^version' pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match pyproject version $version (expected v$version)"
+            exit 1
+          fi
+          echo "tag $GITHUB_REF_NAME matches pyproject version $version"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          pattern: wheels-*
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
+
+  github-release:
+    name: create GitHub release
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create the GitHub Release with auto-generated notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
