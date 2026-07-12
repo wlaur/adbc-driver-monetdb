@@ -49,10 +49,20 @@ impl fmt::Display for DecodeError {
             Self::InvalidUtf8 { row } => write!(f, "invalid UTF-8 at row {row}"),
             Self::InvalidBackref { row } => write!(f, "invalid string back-reference at row {row}"),
             Self::Unsupported(data_type) => {
-                write!(
-                    f,
-                    "MonetDB type {data_type} is not supported by the binary protocol"
-                )
+                if matches!(
+                    data_type,
+                    MonetType::Geometry | MonetType::GeometryA | MonetType::Xml
+                ) {
+                    write!(
+                        f,
+                        "MonetDB type {data_type} is not available through Xexportbin; cast the column to VARCHAR in SQL"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "MonetDB type {data_type} is not supported by the binary protocol"
+                    )
+                }
             }
             Self::Arrow(error) => error.fmt(f),
         }
@@ -138,6 +148,9 @@ fn data_type(data_type: &MonetType) -> Result<DataType, DecodeError> {
         MonetType::TimestampTz => DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
         MonetType::Blob => DataType::Binary,
         MonetType::Uuid => DataType::FixedSizeBinary(16),
+        MonetType::Geometry | MonetType::GeometryA | MonetType::Xml => {
+            return Err(DecodeError::Unsupported(*data_type));
+        }
     })
 }
 
@@ -225,6 +238,9 @@ pub fn decode_column(
         MonetType::Blob => Arc::new(decode_blob(bytes, row_count)?),
         MonetType::Uuid => Arc::new(decode_uuid(bytes, row_count)?),
         MonetType::Inet => Arc::new(decode_inet(bytes, row_count)?),
+        MonetType::Geometry | MonetType::GeometryA | MonetType::Xml => {
+            return Err(DecodeError::Unsupported(*data_type));
+        }
     })
 }
 
@@ -721,5 +737,9 @@ mod tests {
             decode_column(&MonetType::Bool, &[2], 1),
             Err(DecodeError::InvalidValue { .. })
         ));
+        assert_eq!(
+            data_type(&MonetType::Geometry).unwrap_err().to_string(),
+            "MonetDB type GEOMETRY is not available through Xexportbin; cast the column to VARCHAR in SQL"
+        );
     }
 }

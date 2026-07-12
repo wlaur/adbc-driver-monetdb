@@ -51,9 +51,9 @@ as upstream-shaped MPL-2.0 changes so they can be offered back to
 - [x] decode int/double/varchar columns to Arrow, hand to polars via the C stream interface
 - [ ] benchmark a large (multi-million row, mixed numeric/string) fetch against pymonetdb
       (text and binary modes) to quantify the win before building everything else
-- [ ] pin down the error-offset semantics of the trailing negative `toc_pos`
-      (docs say offset-from-start; pymonetdb reads it relative to the end — see the
-      TODO in `crates/monetdb-arrow/src/exportbin.rs`)
+- [x] pin down the trailing negative `toc_pos` as the negated byte offset from the
+      start of the response, as specified by `binary-resultset.rst`; malformed offsets
+      are rejected instead of scanned heuristically
 - [ ] measure where bulk-insert time goes (client serialization vs server ingest) to size
       the write-path win
 
@@ -105,7 +105,7 @@ as upstream-shaped MPL-2.0 changes so they can be offered back to
       (MonetDB has no wire-level binary bind; bulk data goes through ingest)
 - [x] error mapping: MAPI error strings → ADBC status + SQLSTATE (MonetDB prefixes
       errors with a 5-character SQLSTATE)
-- [ ] geometry/xml columns: fail with guidance to cast to text in SQL
+- [x] geometry/xml columns: fail with guidance to cast to text in SQL
 
 ### M4 — packaging and release
 

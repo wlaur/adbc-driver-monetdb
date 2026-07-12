@@ -2,6 +2,7 @@ from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from typing import cast
 
+import adbc_driver_manager
 import polars as pl
 import pytest
 
@@ -16,6 +17,21 @@ def test_read_database(monetdb_uri: str) -> None:
     assert df.shape == (1, 2)
     assert df.get_column("answer").item() == 42
     assert df.get_column("name").item() == "monetdb"
+
+
+@pytest.mark.integration
+def test_non_binary_type_error_recommends_cast(monetdb_uri: str) -> None:
+    with dbapi.connect(monetdb_uri) as conn:
+        with pytest.raises(
+            adbc_driver_manager.DataError,
+            match=r"GEOMETRY.*cast the column to VARCHAR",
+        ):
+            conn.execute("SELECT ST_Point(1, 2) AS geom")  # pyright: ignore[reportUnknownMemberType]
+        casted = pl.read_database(  # pyright: ignore[reportUnknownMemberType]
+            "SELECT CAST(ST_Point(1, 2) AS VARCHAR(100)) AS geom",
+            conn,
+        )
+    assert casted.get_column("geom").item() == "POINT (1 2)"
 
 
 @pytest.mark.integration

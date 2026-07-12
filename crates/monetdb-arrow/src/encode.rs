@@ -123,6 +123,9 @@ pub fn sql_type_for_field(field: &Field) -> Result<String, EncodeError> {
         MonetType::Inet => "INET".into(),
         MonetType::Json => "JSON".into(),
         MonetType::Uuid => "UUID".into(),
+        MonetType::Geometry => "GEOMETRY".into(),
+        MonetType::GeometryA => "GEOMETRYA".into(),
+        MonetType::Xml => "XML".into(),
     })
 }
 

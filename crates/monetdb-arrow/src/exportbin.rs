@@ -69,7 +69,7 @@ pub fn parse_frame(frame: &[u8]) -> Result<ExportbinFrame<'_>, FrameError> {
 
     let toc_pos = i64::from_le_bytes(frame[frame.len() - 8..].try_into().expect("8 bytes"));
     if toc_pos < 0 {
-        return Err(FrameError::Server(find_error_message(frame, toc_pos)));
+        return Err(FrameError::Server(find_error_message(frame, toc_pos)?));
     }
     let toc_pos = usize::try_from(toc_pos).expect("non-negative");
     let toc_len = header.column_count * TOC_ENTRY_SIZE;
@@ -162,18 +162,17 @@ fn column_range(
 
 /// Locate the NUL-terminated error message a negative `toc_pos` points at.
 ///
-/// The protocol documentation says the negated value is the offset of the
-/// message from the start of the response, while pymonetdb interprets it
-/// relative to the end. Accept the documented form first and fall back to
-/// scanning for the leading `!`.
-/// TODO(phase 0): pin down the server behavior against a live MonetDB and drop
-/// the fallback.
-fn find_error_message(frame: &[u8], toc_pos: i64) -> String {
-    let from_start = usize::try_from(-toc_pos)
-        .ok()
-        .filter(|&off| frame.get(off) == Some(&b'!'));
-    let offset = from_start.unwrap_or_else(|| frame.iter().position(|&b| b == b'!').unwrap_or(0));
-    read_error_message(frame, offset)
+/// `documentation/source/binary-resultset.rst` defines the negated value as
+/// the byte offset from the start of the response.
+fn find_error_message(frame: &[u8], toc_pos: i64) -> Result<String, FrameError> {
+    let Some(offset) = toc_pos
+        .checked_neg()
+        .and_then(|offset| usize::try_from(offset).ok())
+        .filter(|&offset| frame.get(offset) == Some(&b'!'))
+    else {
+        return Err(FrameError::Malformed("invalid in-frame error offset"));
+    };
+    Ok(read_error_message(frame, offset))
 }
 
 /// Read a `!`-prefixed, NUL-terminated error message starting at `offset`.
@@ -251,6 +250,15 @@ mod tests {
 
         let err = parse_frame(&frame).unwrap_err();
         assert_eq!(err, FrameError::Server("wrong".into()));
+    }
+
+    #[test]
+    fn rejects_in_frame_error_with_invalid_offset() {
+        let mut frame = b"&6 1 1 0 0\n!wrong\0".to_vec();
+        frame.extend_from_slice(&(-1i64).to_le_bytes());
+
+        let err = parse_frame(&frame).unwrap_err();
+        assert_eq!(err, FrameError::Malformed("invalid in-frame error offset"));
     }
 
     #[test]
