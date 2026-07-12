@@ -70,6 +70,8 @@ jobs:
         run: |
           uv build dist/*.tar.gz --wheel --out-dir sdist-wheel
           wheel=$(find sdist-wheel -maxdepth 1 -name 'adbc_driver_monetdb-*.whl' -print -quit)
+          wheel=$(realpath "$wheel")
+          cd "$RUNNER_TEMP"
           uv run --isolated --no-project --python 3.13 --with "$wheel" \
             python -c "import adbc_driver_monetdb as m; assert m.__version__; print(m.driver_path())"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
