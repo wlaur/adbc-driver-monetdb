@@ -44,6 +44,7 @@ fn map_cursor_error(value: CursorError) -> Error {
         CursorError::IO(_) => Status::IO,
         CursorError::Framing(_) | CursorError::BadReply(_) => Status::InvalidData,
         CursorError::Conversion { .. } | CursorError::InvalidRange { .. } => Status::InvalidData,
+        CursorError::FileTransfer(_) => Status::InvalidData,
         CursorError::Metadata(_) => Status::Internal,
         CursorError::Server(_) => Status::Unknown,
     };
@@ -518,6 +519,9 @@ impl Statement for MonetdbStatement {
             .expect("connection mutex is not poisoned")
             .cursor();
         cursor.execute(query).map_err(map_cursor_error)?;
+        if !cursor.has_result_set() {
+            return Ok(Box::new(EmptyReader::default()));
+        }
         let mut result = cursor.binary_result().map_err(map_cursor_error)?;
         let total_rows = result.total_rows;
         if total_rows == 1 {
@@ -551,7 +555,7 @@ impl Statement for MonetdbStatement {
 
     fn execute_update(&mut self) -> Result<Option<i64>> {
         if self.bound.is_some() {
-            return Err(not_implemented("bulk ingestion"));
+            return self.ingest();
         }
         let query = self
             .query
@@ -587,6 +591,180 @@ impl Statement for MonetdbStatement {
 
     fn cancel(&mut self) -> Result<()> {
         Err(not_implemented("cancel"))
+    }
+}
+
+impl MonetdbStatement {
+    fn ingest(&mut self) -> Result<Option<i64>> {
+        let mut reader = self
+            .bound
+            .take()
+            .ok_or_else(|| error("no Arrow data is bound", Status::InvalidState))?;
+        let table = self
+            .options
+            .optional_string(OptionStatement::TargetTable)
+            .ok_or_else(|| error("ingest target table is required", Status::InvalidState))?;
+        let mode = self
+            .options
+            .optional_string(OptionStatement::IngestMode)
+            .unwrap_or("adbc.ingest.mode.create");
+        let temporary = self
+            .options
+            .get(OptionStatement::Temporary)
+            .map(option_bool)
+            .transpose()?
+            .unwrap_or(false);
+        if self
+            .options
+            .optional_string(OptionStatement::TargetCatalog)
+            .is_some()
+        {
+            return Err(not_implemented("ingest target catalogs"));
+        }
+        let schema_name = self
+            .options
+            .optional_string(OptionStatement::TargetDbSchema);
+        if temporary && schema_name.is_some() {
+            return Err(error(
+                "temporary ingestion cannot specify a schema",
+                Status::InvalidArguments,
+            ));
+        }
+        let target = qualified_name(schema_name, table);
+        let schema = reader.schema();
+        if schema.fields().is_empty() {
+            return Err(error(
+                "cannot ingest a zero-column stream",
+                Status::InvalidArguments,
+            ));
+        }
+
+        let columns = schema
+            .fields()
+            .iter()
+            .map(|field| {
+                let sql_type = monetdb_arrow::sql_type_for_field(field)
+                    .map_err(|value| map_display(value, Status::NotImplemented))?;
+                Ok(format!(
+                    "{} {}{}",
+                    quote_identifier(field.name()),
+                    sql_type,
+                    if field.is_nullable() { "" } else { " NOT NULL" }
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let create = format!(
+            "CREATE {}TABLE {} ({}){}",
+            if temporary { "LOCAL TEMPORARY " } else { "" },
+            target,
+            columns.join(", "),
+            if temporary {
+                " ON COMMIT PRESERVE ROWS"
+            } else {
+                ""
+            }
+        );
+
+        let originally_autocommit = self
+            .connection
+            .lock()
+            .expect("connection mutex is not poisoned")
+            .server_info()
+            .map_err(map_cursor_error)?
+            .autocommit;
+        if originally_autocommit {
+            self.connection
+                .lock()
+                .expect("connection mutex is not poisoned")
+                .set_autocommit(false)
+                .map_err(map_cursor_error)?;
+        }
+
+        let result = (|| {
+            let mut cursor = self
+                .connection
+                .lock()
+                .expect("connection mutex is not poisoned")
+                .cursor();
+            match mode {
+                "adbc.ingest.mode.create" => cursor.execute(&create).map_err(map_cursor_error)?,
+                "adbc.ingest.mode.append" => {}
+                "adbc.ingest.mode.replace" => {
+                    cursor
+                        .execute(&format!("DROP TABLE IF EXISTS {target}"))
+                        .map_err(map_cursor_error)?;
+                    cursor.execute(&create).map_err(map_cursor_error)?;
+                }
+                "adbc.ingest.mode.create_append" => cursor
+                    .execute(&create.replacen("TABLE ", "TABLE IF NOT EXISTS ", 1))
+                    .map_err(map_cursor_error)?,
+                value => {
+                    return Err(error(
+                        format!("unknown ingest mode '{value}'"),
+                        Status::InvalidArguments,
+                    ));
+                }
+            }
+
+            let files = (0..schema.fields().len())
+                .map(|index| format!("'c{index}'"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let copy = format!("COPY LITTLE ENDIAN BINARY INTO {target} FROM {files} ON CLIENT");
+            let mut rows = 0i64;
+            for batch in &mut reader {
+                let batch = batch.map_err(Error::from)?;
+                if batch.schema() != schema {
+                    return Err(error(
+                        "record batch schema changed within ingest stream",
+                        Status::InvalidData,
+                    ));
+                }
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                let uploads = schema
+                    .fields()
+                    .iter()
+                    .zip(batch.columns())
+                    .enumerate()
+                    .map(|(index, (field, array))| {
+                        monetdb_arrow::encode_column(field, array.as_ref())
+                            .map(|bytes| (format!("c{index}"), bytes))
+                            .map_err(|value| map_display(value, Status::InvalidData))
+                    })
+                    .collect::<Result<HashMap<_, _>>>()?;
+                cursor
+                    .execute_with_binary_uploads(&copy, &uploads)
+                    .map_err(map_cursor_error)?;
+                rows = rows
+                    .checked_add(batch.num_rows() as i64)
+                    .ok_or_else(|| error("ingested row count overflows i64", Status::Internal))?;
+            }
+            if originally_autocommit {
+                cursor.execute("COMMIT").map_err(map_cursor_error)?;
+            }
+            cursor.close().map_err(map_cursor_error)?;
+            Ok(rows)
+        })();
+
+        if result.is_err() && originally_autocommit {
+            let mut cursor = self
+                .connection
+                .lock()
+                .expect("connection mutex is not poisoned")
+                .cursor();
+            let _ = cursor.execute("ROLLBACK");
+            let _ = cursor.close();
+        }
+        if originally_autocommit {
+            self.connection
+                .lock()
+                .expect("connection mutex is not poisoned")
+                .set_autocommit(true)
+                .map_err(map_cursor_error)?;
+        }
+        result.map(Some)
     }
 }
 
@@ -692,8 +870,41 @@ impl RecordBatchReader for SingleBatchReader {
     }
 }
 
+struct EmptyReader {
+    schema: SchemaRef,
+}
+
+impl Default for EmptyReader {
+    fn default() -> Self {
+        Self {
+            schema: Arc::new(Schema::empty()),
+        }
+    }
+}
+
+impl Iterator for EmptyReader {
+    type Item = std::result::Result<RecordBatch, ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        None
+    }
+}
+
+impl RecordBatchReader for EmptyReader {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+}
+
 fn quote_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+fn qualified_name(schema: Option<&str>, table: &str) -> String {
+    match schema {
+        Some(schema) => format!("{}.{}", quote_identifier(schema), quote_identifier(table)),
+        None => quote_identifier(table),
+    }
 }
 
 #[cfg(test)]

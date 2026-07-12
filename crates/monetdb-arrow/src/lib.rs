@@ -15,6 +15,8 @@
 //! supported.
 
 mod decode;
+mod encode;
 pub mod exportbin;
 
 pub use decode::{DecodeError, decode_column, decode_frame, field_for_column};
+pub use encode::{EncodeError, encode_column, monet_type_for_field, sql_type_for_field};

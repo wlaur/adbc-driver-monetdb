@@ -1,3 +1,6 @@
+from datetime import UTC, date, datetime, time, timedelta
+from decimal import Decimal
+
 import polars as pl
 import pytest
 
@@ -28,7 +31,6 @@ def test_empty_and_null_results(monetdb_uri: str) -> None:
 
 
 @pytest.mark.integration
-@pytest.mark.xfail(reason="driver skeleton: ingestion is not implemented yet", strict=False)
 def test_write_database_roundtrip(monetdb_uri: str) -> None:
     df = pl.DataFrame(
         {
@@ -38,6 +40,108 @@ def test_write_database_roundtrip(monetdb_uri: str) -> None:
         }
     )
     with dbapi.connect(monetdb_uri) as conn:
-        df.write_database("roundtrip_smoke", conn, if_table_exists="replace", engine="adbc")  # pyright: ignore[reportUnknownMemberType]
-        back = pl.read_database("SELECT id, value, name FROM roundtrip_smoke ORDER BY id", conn)  # pyright: ignore[reportUnknownMemberType]
-    assert back.equals(df)
+        try:
+            df.write_database("roundtrip_smoke", conn, if_table_exists="replace", engine="adbc")  # pyright: ignore[reportUnknownMemberType]
+            back = pl.read_database(  # pyright: ignore[reportUnknownMemberType]
+                "SELECT id, value, name FROM roundtrip_smoke ORDER BY id", conn
+            )
+            assert back.equals(df)
+        finally:
+            conn.cursor().execute("DROP TABLE IF EXISTS roundtrip_smoke")  # pyright: ignore[reportUnknownMemberType]
+
+
+@pytest.mark.integration
+def test_ingest_modes_and_temporary_table(monetdb_uri: str) -> None:
+    first = pl.concat(
+        [pl.DataFrame({"value": [1]}), pl.DataFrame({"value": [2]})],
+        rechunk=False,
+    )
+    assert first.n_chunks() == 2
+    second = pl.DataFrame({"value": [3]})
+    with dbapi.connect(monetdb_uri) as conn:
+        try:
+            with conn.cursor() as cursor:
+                assert cursor.adbc_ingest("ingest_modes", first, mode="create") == 2  # pyright: ignore[reportUnknownMemberType]
+                assert cursor.adbc_ingest("ingest_modes", second, mode="append") == 1  # pyright: ignore[reportUnknownMemberType]
+                assert cursor.adbc_ingest("ingest_modes", second, mode="create_append") == 1  # pyright: ignore[reportUnknownMemberType]
+                assert cursor.adbc_ingest("ingest_temporary", first, mode="create", temporary=True) == 2  # pyright: ignore[reportUnknownMemberType]
+            values = pl.read_database("SELECT value FROM ingest_modes ORDER BY value", conn)  # pyright: ignore[reportUnknownMemberType]
+            temporary = pl.read_database("SELECT value FROM ingest_temporary ORDER BY value", conn)  # pyright: ignore[reportUnknownMemberType]
+            assert values.get_column("value").to_list() == [1, 2, 3, 3]
+            assert temporary.get_column("value").to_list() == [1, 2]
+            assert first.write_database("ingest_modes", conn, if_table_exists="replace", engine="adbc") == 2  # pyright: ignore[reportUnknownMemberType]
+        finally:
+            conn.cursor().execute("DROP TABLE IF EXISTS ingest_modes")  # pyright: ignore[reportUnknownMemberType]
+            conn.cursor().execute("DROP TABLE IF EXISTS ingest_temporary")  # pyright: ignore[reportUnknownMemberType]
+
+
+@pytest.mark.integration
+def test_dtype_matrix_roundtrip(monetdb_uri: str) -> None:
+    frame = pl.DataFrame(
+        [
+            pl.Series("bool", [True, None, False], dtype=pl.Boolean),
+            pl.Series("i8", [1, None, -2], dtype=pl.Int8),
+            pl.Series("i16", [1, None, -2], dtype=pl.Int16),
+            pl.Series("i32", [1, None, -2], dtype=pl.Int32),
+            pl.Series("i64", [1, None, -2], dtype=pl.Int64),
+            pl.Series("u8", [1, None, 255], dtype=pl.UInt8),
+            pl.Series("u16", [1, None, 65_535], dtype=pl.UInt16),
+            pl.Series("u32", [1, None, 4_294_967_295], dtype=pl.UInt32),
+            pl.Series("u64", [1, None, 18_446_744_073_709_551_615], dtype=pl.UInt64),
+            pl.Series("f32", [1.5, None, -2.25], dtype=pl.Float32),
+            pl.Series("f64", [1.5, None, -2.25], dtype=pl.Float64),
+            pl.Series("str", ["a", None, "a"], dtype=pl.String),
+            pl.Series("bin", [b"a", None, b""], dtype=pl.Binary),
+            pl.Series("date", [date(1970, 1, 1), None, date(2025, 12, 31)], dtype=pl.Date),
+            pl.Series("time", [time(1, 2, 3, 123456), None, time(23, 59, 59, 999999)], dtype=pl.Time),
+            pl.Series(
+                "ts",
+                [datetime(1970, 1, 1, 1, 2, 3, 123456), None, datetime(2025, 12, 31, 23, 59, 59, 999999)],
+                dtype=pl.Datetime("us"),
+            ),
+            pl.Series(
+                "tstz",
+                [
+                    datetime(1970, 1, 1, 1, 2, 3, 123456, tzinfo=UTC),
+                    None,
+                    datetime(2025, 12, 31, 23, 59, 59, 999999, tzinfo=UTC),
+                ],
+                dtype=pl.Datetime("us", "UTC"),
+            ),
+            pl.Series("dur", [timedelta(milliseconds=1234), None, timedelta(milliseconds=-5)], dtype=pl.Duration("ms")),
+            pl.Series("dec", [Decimal("1.23"), None, Decimal("-4.56")], dtype=pl.Decimal(9, 2)),
+        ]
+    )
+    expected = frame.with_columns(  # pyright: ignore[reportUnknownMemberType]
+        pl.col("u8").cast(pl.Int16),
+        pl.col("u16").cast(pl.Int32),
+        pl.col("u32").cast(pl.Int64),
+        pl.col("u64").cast(pl.Decimal(38, 0)),
+    )
+    with dbapi.connect(monetdb_uri) as conn:
+        try:
+            assert frame.write_database("dtype_matrix", conn, if_table_exists="replace", engine="adbc") == 3  # pyright: ignore[reportUnknownMemberType]
+            back = pl.read_database("SELECT * FROM dtype_matrix", conn)  # pyright: ignore[reportUnknownMemberType]
+            assert back.equals(expected)
+        finally:
+            conn.cursor().execute("DROP TABLE IF EXISTS dtype_matrix")  # pyright: ignore[reportUnknownMemberType]
+
+
+@pytest.mark.integration
+def test_categorical_and_enum_ingest(monetdb_uri: str) -> None:
+    frame = pl.DataFrame(
+        {
+            "category": pl.Series(["a", "b", "a", None], dtype=pl.Categorical),
+            "enum": pl.Series(["x", "y", "x", None], dtype=pl.Enum(["x", "y"])),
+        }
+    )
+    with dbapi.connect(monetdb_uri) as conn:
+        try:
+            assert frame.write_database("categoricals", conn, if_table_exists="replace", engine="adbc") == 4  # pyright: ignore[reportUnknownMemberType]
+            back = pl.read_database("SELECT * FROM categoricals", conn)  # pyright: ignore[reportUnknownMemberType]
+            assert back.to_dict(as_series=False) == {
+                "category": ["a", "b", "a", None],
+                "enum": ["x", "y", "x", None],
+            }
+        finally:
+            conn.cursor().execute("DROP TABLE IF EXISTS categoricals")  # pyright: ignore[reportUnknownMemberType]

@@ -33,7 +33,7 @@ crates/adbc-monetdb           ADBC object model (adbc_core traits) exported as a
                               C-ABI cdylib via adbc_ffi::export_driver!
                               (AdbcDriverMonetdbInit + AdbcDriverInit fallback)
 crates/monetdb-arrow          wire format <-> Arrow: Xexportbin frame parsing (done),
-                              per-type decoders/encoders (M2)
+                              per-type decoders/encoders
 monetdb-rust                  fork of the official MAPI client crate (submodule):
                               framing, auth, TLS, URL parsing exist; the pieces the
                               driver needs are added here (M1)
@@ -64,7 +64,7 @@ as upstream-shaped MPL-2.0 changes so they can be offered back to
 - [x] transactions: autocommit handshake option, `Xauto_commit`, commit/rollback
 - [ ] `PREPARE` / `EXECUTE` (text descriptions; `Q_PREPARE` result sets are text-only
       in the MAPI protocol)
-- [ ] file-transfer uploads (the `rb` subprotocol) for `COPY BINARY ... ON CLIENT`,
+- [x] file-transfer uploads (the `rb` subprotocol) for `COPY BINARY ... ON CLIENT`,
       serving named "files" from in-memory column buffers
 - [x] expose the server fingerprint: endianness (challenge field 5), `BINARY` level,
       `monet_version`
@@ -82,7 +82,7 @@ as upstream-shaped MPL-2.0 changes so they can be offered back to
       back-reference decoding (defensive on read — servers currently emit backrefs only
       on ingest, but the format allows them)
 - [x] blob (i64 length prefix, `~0` = NULL), uuid (16 B, all-zero = NULL), inet4/inet6
-- [ ] encoders for every type above (COPY BINARY little-endian), including
+- [x] encoders for every type above (COPY BINARY little-endian), including
       dictionary/categorical strings → back-reference encoding
 - [ ] golden-fixture tests for every type (bytes captured from a real server), plus
       property tests for the string/backref codec
@@ -94,7 +94,7 @@ as upstream-shaped MPL-2.0 changes so they can be offered back to
 - [x] `ExecuteQuery` → `RecordBatchReader`: one batch per `Xexportbin` window; window size
       as a statement option (`adbc.monetdb.batch_rows`, default ~128k rows)
 - [x] `ExecuteUpdate` for DML/DDL (affected-row counts from the text header)
-- [ ] bulk ingest: modes `create` / `append` / `replace` / `create_append` +
+- [x] bulk ingest: modes `create` / `append` / `replace` / `create_append` +
       `adbc.ingest.temporary`; DDL generated from the Arrow schema; multi-batch streams
       chunked into successive `COPY BINARY` statements inside one transaction
 - [ ] `GetInfo` (vendor_name = "MonetDB" — polars introspects it), `GetTableTypes`
@@ -177,8 +177,7 @@ convert to UTC → TIMESTAMPTZ; float NaN and null both map to NULL (MonetDB sem
 ## Testing
 
 - **Unit (no server):** frame/codec tests with synthetic and golden fixtures in
-  `monetdb-arrow`; the Python package chain is smoke-tested by asserting the skeleton's
-  `NotImplemented` error surfaces through driver-manager dlopen.
+  `monetdb-arrow`; the Python package chain is smoke-tested through driver-manager dlopen.
 - **Integration (dockerized `monetdb/monetdb:Dec2025-SP3`):** polars round-trips over the
   full dtype matrix — nulls in every type, empty vs NULL strings, decimal extremes at each
   backing width, temporal edge values, 0-row and multi-window results, wide tables.
