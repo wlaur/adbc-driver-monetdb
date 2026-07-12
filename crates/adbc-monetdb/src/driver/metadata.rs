@@ -59,7 +59,25 @@ pub(super) fn load_objects(
     table_types: Option<&[&str]>,
     column_filter: Option<&str>,
 ) -> Result<Vec<ObjectSchema>> {
-    let query = r#"
+    let schema_predicate = like_predicate("s.name", schema_filter)?;
+    let table_predicate = like_predicate("t.name", table_filter)?;
+    let column_predicate = like_predicate("c.name", column_filter)?;
+    let type_predicate = in_predicate("tt.table_type_name", table_types)?;
+    let schema_where = schema_predicate
+        .as_deref()
+        .map(|predicate| format!("WHERE {predicate}"))
+        .unwrap_or_default();
+    let table_join_filters = [table_predicate.as_deref(), type_predicate.as_deref()]
+        .into_iter()
+        .flatten()
+        .map(|predicate| format!(" AND {predicate}"))
+        .collect::<String>();
+    let column_join_filter = column_predicate
+        .as_deref()
+        .map(|predicate| format!(" AND {predicate}"))
+        .unwrap_or_default();
+    let query = format!(
+        r#"
         SELECT s.name AS schema_name,
                t.name AS table_name,
                tt.table_type_name AS table_type,
@@ -72,13 +90,20 @@ pub(super) fn load_objects(
                c."default" AS column_default,
                cm.remark
           FROM sys.schemas AS s
-          LEFT OUTER JOIN sys.tables AS t ON t.schema_id = s.id
+          LEFT OUTER JOIN (
+              SELECT t.*, tt.table_type_name
+                FROM sys.tables AS t
+                JOIN sys.table_types AS tt ON tt.table_type_id = t.type
+               WHERE TRUE {table_join_filters}
+          ) AS t ON t.schema_id = s.id
           LEFT OUTER JOIN sys.table_types AS tt ON tt.table_type_id = t.type
-          LEFT OUTER JOIN sys.columns AS c ON c.table_id = t.id
+          LEFT OUTER JOIN sys.columns AS c ON c.table_id = t.id{column_join_filter}
           LEFT OUTER JOIN sys.comments AS cm ON cm.id = c.id
+         {schema_where}
          ORDER BY s.name, t.name, c.number
-    "#;
-    let mut reader = query_reader(connection, query, super::DEFAULT_BATCH_ROWS)?;
+    "#
+    );
+    let mut reader = query_reader(connection, &query, super::DEFAULT_BATCH_ROWS)?;
     let mut schemas = Vec::<ObjectSchema>::new();
     for batch in &mut reader {
         let batch = batch.map_err(Error::from)?;
@@ -153,15 +178,38 @@ pub(super) fn load_objects(
                 });
         }
     }
-    load_constraints(connection, &mut schemas)?;
+    load_constraints(
+        connection,
+        &mut schemas,
+        schema_filter,
+        table_filter,
+        table_types,
+    )?;
     Ok(schemas)
 }
 
 fn load_constraints(
     connection: &Arc<Mutex<monetdb::Connection>>,
     schemas: &mut [ObjectSchema],
+    schema_filter: Option<&str>,
+    table_filter: Option<&str>,
+    table_types: Option<&[&str]>,
 ) -> Result<()> {
-    let query = r#"
+    let predicates = [
+        like_predicate("s.name", schema_filter)?,
+        like_predicate("t.name", table_filter)?,
+        in_predicate("tt.table_type_name", table_types)?,
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    let where_clause = if predicates.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", predicates.join(" AND "))
+    };
+    let query = format!(
+        r#"
         SELECT s.name AS schema_name,
                t.name AS table_name,
                k.name AS constraint_name,
@@ -174,14 +222,17 @@ fn load_constraints(
           FROM sys.keys AS k
           JOIN sys.tables AS t ON t.id = k.table_id
           JOIN sys.schemas AS s ON s.id = t.schema_id
+          JOIN sys.table_types AS tt ON tt.table_type_id = t.type
           LEFT OUTER JOIN sys.objects AS kc ON kc.id = k.id
           LEFT OUTER JOIN sys.keys AS pk ON pk.id = k.rkey
           LEFT OUTER JOIN sys.tables AS pt ON pt.id = pk.table_id
           LEFT OUTER JOIN sys.schemas AS ps ON ps.id = pt.schema_id
           LEFT OUTER JOIN sys.objects AS pc ON pc.id = pk.id AND pc.nr = kc.nr
+         {where_clause}
          ORDER BY s.name, t.name, k.name, kc.nr
-    "#;
-    let mut reader = query_reader(connection, query, super::DEFAULT_BATCH_ROWS)?;
+    "#
+    );
+    let mut reader = query_reader(connection, &query, super::DEFAULT_BATCH_ROWS)?;
     for batch in &mut reader {
         let batch = batch.map_err(Error::from)?;
         let schema_names = array_as::<StringArray>(&batch, 0)?;
@@ -270,33 +321,91 @@ fn matches_filter(filter: Option<&str>, value: &str) -> bool {
         .unwrap_or(true)
 }
 
+fn like_predicate(column: &str, pattern: Option<&str>) -> Result<Option<String>> {
+    pattern
+        .map(|pattern| {
+            Ok(format!(
+                "{column} LIKE {} ESCAPE R'\\'",
+                raw_string_literal(pattern)?
+            ))
+        })
+        .transpose()
+}
+
+fn in_predicate(column: &str, values: Option<&[&str]>) -> Result<Option<String>> {
+    values
+        .map(|values| {
+            if values.is_empty() {
+                return Ok("FALSE".to_owned());
+            }
+            let values = values
+                .iter()
+                .map(|value| raw_string_literal(value))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(format!("{column} IN ({})", values.join(", ")))
+        })
+        .transpose()
+}
+
+fn raw_string_literal(value: &str) -> Result<String> {
+    if value.contains('\0') {
+        return Err(error(
+            "metadata filter contains a NUL byte",
+            Status::InvalidArguments,
+        ));
+    }
+    Ok(format!("R'{}'", value.replace('\'', "''")))
+}
+
 pub(super) fn like_pattern_matches(pattern: &str, value: &str) -> bool {
-    fn matches(pattern: &[char], value: &[char], p: usize, v: usize) -> bool {
-        if p == pattern.len() {
-            return v == value.len();
-        }
-        match pattern[p] {
-            '%' => {
-                matches(pattern, value, p + 1, v)
-                    || (v < value.len() && matches(pattern, value, p, v + 1))
-            }
-            '_' => v < value.len() && matches(pattern, value, p + 1, v + 1),
-            '\\' if p + 1 < pattern.len() => {
-                v < value.len()
-                    && pattern[p + 1] == value[v]
-                    && matches(pattern, value, p + 2, v + 1)
-            }
-            character => {
-                v < value.len() && character == value[v] && matches(pattern, value, p + 1, v + 1)
-            }
+    #[derive(Clone, Copy)]
+    enum Token {
+        Many,
+        One,
+        Literal(char),
+    }
+    let mut chars = pattern.chars();
+    let mut tokens = Vec::new();
+    while let Some(character) = chars.next() {
+        match character {
+            '%' => tokens.push(Token::Many),
+            '_' => tokens.push(Token::One),
+            '\\' => tokens.push(Token::Literal(chars.next().unwrap_or('\\'))),
+            character => tokens.push(Token::Literal(character)),
         }
     }
-    matches(
-        &pattern.chars().collect::<Vec<_>>(),
-        &value.chars().collect::<Vec<_>>(),
-        0,
-        0,
-    )
+    let value = value.chars().collect::<Vec<_>>();
+    let (mut token, mut character) = (0, 0);
+    let (mut star, mut retry) = (None, 0);
+    while character < value.len() {
+        match tokens.get(token) {
+            Some(Token::Literal(expected)) if *expected == value[character] => {
+                token += 1;
+                character += 1;
+            }
+            Some(Token::One) => {
+                token += 1;
+                character += 1;
+            }
+            Some(Token::Many) => {
+                star = Some(token);
+                token += 1;
+                retry = character;
+            }
+            _ => match star {
+                Some(star) => {
+                    token = star + 1;
+                    retry += 1;
+                    character = retry;
+                }
+                None => return false,
+            },
+        }
+    }
+    while matches!(tokens.get(token), Some(Token::Many)) {
+        token += 1;
+    }
+    token == tokens.len()
 }
 
 pub(super) fn objects_batch(
@@ -588,5 +697,8 @@ mod tests {
         assert!(like_pattern_matches("_ublic", "public"));
         assert!(like_pattern_matches(r"a\%b", "a%b"));
         assert!(!like_pattern_matches("sys", "public"));
+        let adversarial = format!("{}x", "%".repeat(100_000));
+        assert!(!like_pattern_matches(&adversarial, &"a".repeat(100_000)));
+        assert_eq!(raw_string_literal("a'b\\c").unwrap(), "R'a''b\\c'");
     }
 }

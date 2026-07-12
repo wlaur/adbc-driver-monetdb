@@ -129,6 +129,22 @@ as upstream-shaped MPL-2.0 changes so they can be offered back to
 - [x] publish the ADBC validation feature matrix in the README
 - [ ] announce on MonetDB/MonetDB#7464 and offer the protocol work upstream
 
+### M5 — production hardening
+
+- [x] expose inline-row residency in the MAPI fork and decode a fully included one-row
+      result directly; scalar queries perform no retention query or second round trip
+- [x] make malformed frame sizes, variable-width offsets, decimal scales, and overlong
+      back-references return errors instead of panicking or allocating from unchecked metadata
+- [x] fix Unix-socket connection failures, make upload refusal connection-preserving, enable
+      unsafe-block lints in the MAPI fork, and document every unsafe invariant
+- [x] preserve UTF-8 through parameter rendering; use `chrono`, `uuid`, and standard-library
+      address parsing for general-purpose formats
+- [x] validate append destination schemas before binary COPY and make multi-row DML atomic
+- [x] make `ExecuteSchema` metadata-only and keep bound streams intact
+- [x] push `GetObjects` filters into SQL and make wildcard matching time-bounded
+- [ ] expand failure, memory, concurrency, one-row dtype, timezone, and boundary coverage
+- [ ] harden wheel/sdist licensing and CI coverage, then run every local, wheel, and live gate
+
 ## ADBC feature mapping
 
 | ADBC | MonetDB mechanism |

@@ -71,9 +71,19 @@ pub fn parse_frame(frame: &[u8]) -> Result<ExportbinFrame<'_>, FrameError> {
     if toc_pos < 0 {
         return Err(FrameError::Server(find_error_message(frame, toc_pos)?));
     }
-    let toc_pos = usize::try_from(toc_pos).expect("non-negative");
-    let toc_len = header.column_count * TOC_ENTRY_SIZE;
-    if toc_pos < body_start || toc_pos.checked_add(toc_len + 8) != Some(frame.len()) {
+    let toc_pos = usize::try_from(toc_pos)
+        .map_err(|_| FrameError::Malformed("table of contents offset does not fit in memory"))?;
+    let toc_len = header
+        .column_count
+        .checked_mul(TOC_ENTRY_SIZE)
+        .ok_or(FrameError::Malformed("table of contents length overflows"))?;
+    let expected_end = toc_pos
+        .checked_add(toc_len)
+        .and_then(|end| end.checked_add(8));
+    if header.column_count > frame.len() / TOC_ENTRY_SIZE
+        || toc_pos < body_start
+        || expected_end != Some(frame.len())
+    {
         return Err(FrameError::Malformed("table of contents out of bounds"));
     }
 
@@ -275,5 +285,16 @@ mod tests {
         frame[len - 8..].copy_from_slice(&(len as i64).to_le_bytes());
         let err = parse_frame(&frame).unwrap_err();
         assert!(matches!(err, FrameError::Malformed(_)));
+    }
+
+    #[test]
+    fn rejects_hostile_column_count_without_allocating() {
+        let mut frame = format!("&6 1 {} 0 0\n", usize::MAX).into_bytes();
+        let toc_pos = frame.len() as i64;
+        frame.extend_from_slice(&toc_pos.to_le_bytes());
+        assert_eq!(
+            parse_frame(&frame),
+            Err(FrameError::Malformed("table of contents length overflows"))
+        );
     }
 }

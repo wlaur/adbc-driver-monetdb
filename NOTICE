@@ -1,0 +1,8 @@
+adbc-driver-monetdb includes monetdb-rust, licensed under the Mozilla Public
+License 2.0, in its compiled driver library. The MPL-2.0 license text is
+distributed as monetdb-rust/LICENSE.
+
+The corresponding monetdb-rust source is included in this project's source
+distribution and is publicly available from:
+
+https://github.com/wlaur/monetdb-rust

@@ -11,7 +11,9 @@ repository.workspace = true
 arrow-array.workspace = true
 arrow-buffer.workspace = true
 arrow-schema.workspace = true
+chrono.workspace = true
 monetdb.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 proptest = "1"

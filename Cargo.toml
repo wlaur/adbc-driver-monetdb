@@ -18,11 +18,13 @@ adbc_ffi = "0.23"
 arrow-array = "58"
 arrow-buffer = "58"
 arrow-schema = "58"
+chrono = "0.4"
 monetdb = { path = "monetdb-rust" }
 monetdb-arrow = { path = "crates/monetdb-arrow" }
 pyo3 = "0.28"
 percent-encoding = "2"
 url = "2.5"
+uuid = "1"
 
 [workspace.lints.rust]
 # require `unsafe {}` inside an `unsafe fn` body (no implicit unsafe scope)
