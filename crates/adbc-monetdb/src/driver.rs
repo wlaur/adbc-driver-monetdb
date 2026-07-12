@@ -939,19 +939,23 @@ impl MonetdbStatement {
                 if batch.num_rows() == 0 {
                     continue;
                 }
-                let uploads = schema
-                    .fields()
-                    .iter()
-                    .zip(batch.columns())
-                    .enumerate()
-                    .map(|(index, (field, array))| {
-                        monetdb_arrow::encode_column(field, array.as_ref())
-                            .map(|bytes| (format!("c{index}"), bytes))
-                            .map_err(|value| map_display(value, Status::InvalidData))
-                    })
-                    .collect::<Result<HashMap<_, _>>>()?;
                 cursor
-                    .execute_with_binary_uploads(&copy, &uploads)
+                    .execute_with_binary_uploads_lazy(&copy, |filename| {
+                        let index = filename
+                            .strip_prefix('c')
+                            .and_then(|value| value.parse::<usize>().ok())
+                            .filter(|index| *index < schema.fields().len())
+                            .ok_or_else(|| {
+                                CursorError::FileTransfer(format!(
+                                    "server requested unknown file {filename:?}"
+                                ))
+                            })?;
+                        monetdb_arrow::encode_column(
+                            &schema.fields()[index],
+                            batch.column(index).as_ref(),
+                        )
+                        .map_err(|value| CursorError::FileTransfer(value.to_string()))
+                    })
                     .map_err(map_cursor_error)?;
                 rows = rows
                     .checked_add(batch.num_rows() as i64)
