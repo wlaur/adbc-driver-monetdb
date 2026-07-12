@@ -1,0 +1,32 @@
+// part: metadata
+
+[tags]
+partial-support = true
+caveats = ["Nanosecond TIME input must be microsecond-aligned; MonetDB returns microseconds."]
+
+// part: setup_query
+
+CREATE TABLE test_time (
+    idx INT,
+    res TIME(6)
+);
+
+// part: bind
+
+{"idx": 0, "res": 0}
+{"idx": 1, "res": null}
+{"idx": 2, "res": 49531123456000}
+{"idx": 3, "res": 45045500000000}
+{"idx": 4, "res": 86399999999000}
+
+// part: expected_schema
+
+{"format":"+s","children":[{"name":"res","format":"ttu","flags":["nullable"]}]}
+
+// part: expected
+
+{"res": 0}
+{"res": null}
+{"res": 49531123456}
+{"res": 45045500000}
+{"res": 86399999999}

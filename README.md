@@ -21,11 +21,40 @@ with dbapi.connect("monetdb://user:password@localhost:50000/db") as conn:
 df = pl.read_database_uri("SELECT 1", "monetdb://localhost:50000/db", engine="adbc")
 ```
 
+The same connection works directly with pandas 3:
+
+```python
+import pandas as pd
+
+with dbapi.connect("monetdb://user:password@localhost:50000/db") as conn:
+    df = pd.read_sql("SELECT * FROM trades", conn, dtype_backend="pyarrow")
+    df.to_sql("trades_copy", conn, if_exists="append", index=False)
+```
+
 ## Support policy
 
 - MonetDB **Dec2025 (11.55) and newer**, little-endian servers only
-- Python **3.13+** (one abi3 wheel per platform), current-stable polars / adbc-driver-manager
+- Python **3.13+** (one abi3 wheel per platform), polars **1.42+**, pandas **3.0+**,
+  adbc-driver-manager **1.11+**
 - Platforms: Linux x86_64 + aarch64 (manylinux), macOS arm64, Windows x86_64
+
+## ADBC coverage
+
+| Surface | Status |
+|---|---|
+| Arrow query streams and affected-row counts | Supported |
+| Prepared statements, positional binds, and `executemany` | Supported |
+| Bulk ingest: create, append, replace, create-append, schema, temporary tables | Supported |
+| Transactions and autocommit | Supported |
+| `GetInfo`, `GetObjects`, `GetTableSchema`, `GetTableTypes`, `ExecuteSchema` | Supported |
+| Query cancellation | Not supported by the current Rust MAPI transport |
+| Partitioned results | Not supported; MAPI exposes one sequential result channel |
+| Substrait plans | Not supported by MonetDB |
+| `GetStatistics` | Not implemented |
+
+The reusable ADBC validation suite currently passes 242 tests and three subtests against
+Dec2025-SP3. Its six skips cover four cross-catalog operations, statistics, and
+negative-scale decimals that MonetDB itself does not support.
 
 ## Repository layout
 
@@ -45,9 +74,14 @@ uv run pytest -m "not integration"     # python tests (no server needed)
 cargo test --workspace                 # rust tests
 
 # integration tests against a real server:
-docker run -d -p 50000:50000 -e MDB_DB_ADMIN_PASS=monetdb -e MDB_CREATE_DBS=test \
+docker run -d --platform linux/amd64 -p 50000:50000 \
+    -e MDB_DB_ADMIN_PASS=monetdb -e MDB_CREATE_DBS=test \
     monetdb/monetdb:Dec2025-SP3
 MONETDB_TEST_URI=monetdb://monetdb:monetdb@localhost:50000/test uv run pytest -m integration
+
+# run the reusable ADBC conformance suite:
+MONETDB_TEST_URI=monetdb://monetdb:monetdb@localhost:50000/test \
+    uv run pytest tests/validation
 ```
 
 Lint/typecheck: `uv run ruff check .`, `uv run ruff format --check .`, `uv run pyright`,

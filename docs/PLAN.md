@@ -3,7 +3,7 @@
 An ADBC driver for MonetDB in Rust: reads decode MonetDB's binary result-set protocol
 (`Xexportbin`) directly into Arrow record batches; writes stream Arrow columns through
 `COPY BINARY ... ON CLIENT`. Consumers get MonetDB through the standard ADBC surface —
-polars, pandas ≥ 2.2, R (`adbi`), and anything else that speaks ADBC — instead of
+polars, pandas ≥ 3.0, R (`adbi`), and anything else that speaks ADBC — instead of
 per-value Python object materialization.
 
 Context: [MonetDB/MonetDB#7464](https://github.com/MonetDB/MonetDB/issues/7464) asked for
@@ -33,7 +33,7 @@ crates/adbc-monetdb           ADBC object model (adbc_core traits) exported as a
                               C-ABI cdylib via adbc_ffi::export_driver!
                               (AdbcDriverMonetdbInit + AdbcDriverInit fallback)
 crates/monetdb-arrow          wire format <-> Arrow: Xexportbin frame parsing (done),
-                              per-type decoders/encoders (M2)
+                              per-type decoders/encoders
 monetdb-rust                  fork of the official MAPI client crate (submodule):
                               framing, auth, TLS, URL parsing exist; the pieces the
                               driver needs are added here (M1)
@@ -47,77 +47,86 @@ as upstream-shaped MPL-2.0 changes so they can be offered back to
 
 ### M0 — spike: validate the read path end to end
 
-- [ ] `Xexportbin` issued over a raw MAPI connection against a live Dec2025 server
-- [ ] decode int/double/varchar columns to Arrow, hand to polars via the C stream interface
-- [ ] benchmark a large (multi-million row, mixed numeric/string) fetch against pymonetdb
-      (text and binary modes) to quantify the win before building everything else
-- [ ] pin down the error-offset semantics of the trailing negative `toc_pos`
-      (docs say offset-from-start; pymonetdb reads it relative to the end — see the
-      TODO in `crates/monetdb-arrow/src/exportbin.rs`)
-- [ ] measure where bulk-insert time goes (client serialization vs server ingest) to size
-      the write-path win
+- [x] `Xexportbin` issued over a raw MAPI connection against a live Dec2025 server
+- [x] decode int/double/varchar columns to Arrow, hand to polars via the C stream interface
+- [x] benchmark a large (three-million-row, mixed numeric/string) fetch against pymonetdb
+      binary mode: warmed release builds completed in 0.56 s at 635 MiB peak RSS versus
+      1.04 s at 1,315 MiB for pymonetdb against the same Dec2025-SP3 container
+- [x] pin down the trailing negative `toc_pos` as the negated byte offset from the
+      start of the response, as specified by `binary-resultset.rst`; malformed offsets
+      are rejected instead of scanned heuristically
+- [x] measure bulk ingest separately from DataFrame construction: three million mixed rows
+      ingest in about 1.4 s in a warmed release build; producing the source frame takes
+      about 0.08 s, so encoding, transfer, and server COPY dominate the operation
 
 ### M1 — protocol layer (the monetdb-rust fork)
 
-- [ ] `Xexportbin <resid> <start> <count>` command + binary response framing
-- [ ] `Xreply_size` control (small text prefix, bulk via binary windows)
-- [ ] transactions: autocommit handshake option, `Xauto_commit`, commit/rollback
-- [ ] `PREPARE` / `EXECUTE` (text descriptions; `Q_PREPARE` result sets are text-only
-      in the MAPI protocol)
-- [ ] file-transfer uploads (the `rb` subprotocol) for `COPY BINARY ... ON CLIENT`,
-      serving named "files" from in-memory column buffers
-- [ ] expose the server fingerprint: endianness (challenge field 5), `BINARY` level,
+- [x] `Xexportbin <resid> <start> <count>` command + binary response framing
+- [x] `Xreply_size` control (small text prefix, bulk via binary windows)
+- [x] transactions: autocommit handshake option, `Xauto_commit`, commit/rollback
+- [x] `PREPARE` / `EXECUTE`, including typed text metadata from `Q_PREPARE`; the driver
+      falls back to literal execution only when MonetDB cannot infer an untyped parameter
+- [x] file-transfer uploads (the `rb` subprotocol) for `COPY BINARY ... ON CLIENT`,
+      producing each named "file" only when the server requests it so encoded columns do
+      not accumulate in memory
+- [x] expose the server fingerprint: endianness (challenge field 5), `BINARY` level,
       `monet_version`
-- [ ] result-set header parsing that carries decimal digits/scale and column types
+- [x] result-set header parsing that carries decimal digits/scale and column types
       through to the consumer
 
 ### M2 — Arrow conversion (crates/monetdb-arrow)
 
 - [x] `Xexportbin` frame parsing (header, 32-byte-aligned columns, TOC, in-frame errors)
-- [ ] fixed-width decoders: ints (sentinel `INT_MIN` per width), floats (NaN = NULL),
+- [x] fixed-width decoders: ints (sentinel `INT_MIN` per width), floats (NaN = NULL),
       bool (`0x80` = NULL), decimal as scaled int8/16/32/64/128 → `decimal128(p, s)`
-- [ ] temporal decoders: date (4 B struct), time (8 B), timestamp (12 B) → `date32` /
+- [x] temporal decoders: date (4 B struct), time (8 B), timestamp (12 B) → `date32` /
       `time64[us]` / `timestamp[us]`; **the wire field named `ms` holds microseconds**
-- [ ] string decoder: NUL-terminated UTF-8 → offsets + data buffer; `80 00` = NULL;
+- [x] string decoder: NUL-terminated UTF-8 → offsets + data buffer; `80 00` = NULL;
       back-reference decoding (defensive on read — servers currently emit backrefs only
       on ingest, but the format allows them)
-- [ ] blob (i64 length prefix, `~0` = NULL), uuid (16 B, all-zero = NULL), inet4/inet6
-- [ ] encoders for every type above (COPY BINARY little-endian), including
+- [x] blob (i64 length prefix, `~0` = NULL), uuid (16 B, all-zero = NULL), inet4/inet6
+- [x] encoders for every type above (COPY BINARY little-endian), including
       dictionary/categorical strings → back-reference encoding
-- [ ] golden-fixture tests for every type (bytes captured from a real server), plus
-      property tests for the string/backref codec
+- [x] golden-fixture tests for every supported type (column bytes captured from
+      Dec2025-SP3), plus property tests for the string/backref codec
 
 ### M3 — ADBC surface (crates/adbc-monetdb)
 
-- [ ] connection lifecycle: URI/username/password options, MAPI connect via the protocol
+- [x] connection lifecycle: URI/username/password options, MAPI connect via the protocol
       crate, Dec2025+ / little-endian gate with clear errors
-- [ ] `ExecuteQuery` → `RecordBatchReader`: one batch per `Xexportbin` window; window size
+- [x] `ExecuteQuery` → `RecordBatchReader`: one batch per `Xexportbin` window; window size
       as a statement option (`adbc.monetdb.batch_rows`, default ~128k rows)
-- [ ] `ExecuteUpdate` for DML/DDL (affected-row counts from the text header)
-- [ ] bulk ingest: modes `create` / `append` / `replace` / `create_append` +
+- [x] `ExecuteUpdate` for DML/DDL (affected-row counts from the text header)
+- [x] bulk ingest: modes `create` / `append` / `replace` / `create_append` +
       `adbc.ingest.temporary`; DDL generated from the Arrow schema; multi-batch streams
       chunked into successive `COPY BINARY` statements inside one transaction
-- [ ] `GetInfo` (vendor_name = "MonetDB" — polars introspects it), `GetTableTypes`
-- [ ] `GetObjects` / `GetTableSchema` via `sys.tables` / `sys.columns` / `sys.keys`
-      (and `PREPARE SELECT * FROM t` for schemas)
-- [ ] prepared statements with positional (qmark) parameters rendered as SQL literals
-      (MonetDB has no wire-level binary bind; bulk data goes through ingest)
-- [ ] error mapping: MAPI error strings → ADBC status + SQLSTATE (MonetDB prefixes
+- [x] `GetInfo` (vendor_name = "MonetDB" — polars introspects it), `GetTableTypes`
+- [x] `GetTableSchema` and `ExecuteSchema` from a zero-row query result header
+- [x] `GetObjects` via `sys.tables` / `sys.columns` / `sys.keys`, including filters,
+      XDBC column attributes, and primary/unique/foreign-key constraint usage
+- [x] prepared statements with positional (qmark) parameters: native server-side
+      `PREPARE` / `EXECUTE` with typed SQL literals, falling back to direct literal
+      execution for parameters MonetDB cannot infer (bulk data goes through ingest)
+- [x] error mapping: MAPI error strings → ADBC status + SQLSTATE (MonetDB prefixes
       errors with a 5-character SQLSTATE)
-- [ ] geometry/xml columns: fail with guidance to cast to text in SQL
+- [x] geometry/xml columns: fail with guidance to cast to text in SQL
 
 ### M4 — packaging and release
 
 - [x] CI: lint (ruff + pyright strict), rust (fmt/clippy/test), abi3 wheels for all four
       platforms (cibuildwheel + maturin), wheel smoke tests on 3.13/3.14, integration job
       against a dockerized MonetDB
-- [ ] sdist build + PyPI publish via trusted publishing (tag-driven, already scaffolded)
+- [x] sdist build, rebuild-from-sdist smoke test, and release artifact upload in CI
+- [ ] PyPI publish via trusted publishing (tag-driven, already scaffolded)
 - [ ] TOML driver manifest so non-Python driver managers (and `dbc install`) can resolve
       the driver by name
 - [ ] register `monetdb` in
       [adbc-drivers/name-mappings](https://github.com/adbc-drivers/name-mappings)
-- [ ] run the [adbc-drivers/validation](https://github.com/adbc-drivers/validation)
-      pytest suite via a `DriverQuirks` class; publish the feature matrix in the README
+- [x] run the [adbc-drivers/validation](https://github.com/adbc-drivers/validation)
+      pytest suite via a pinned `DriverQuirks` harness: 242 passed, 6 intentional feature
+      skips, and 3 subtests passed against Dec2025-SP3. MonetDB-specific fixtures document
+      the signed-integer NULL sentinels, microsecond temporal precision, and BLOB syntax
+- [x] publish the ADBC validation feature matrix in the README
 - [ ] announce on MonetDB/MonetDB#7464 and offer the protocol work upstream
 
 ## ADBC feature mapping
@@ -128,7 +137,7 @@ as upstream-shaped MPL-2.0 changes so they can be offered back to
 | bulk ingest (all four modes) | DDL from Arrow schema + `COPY BINARY INTO ... ON CLIENT` |
 | `adbc.ingest.temporary` | `CREATE LOCAL TEMPORARY TABLE` |
 | prepared statements / bind | `PREPARE`/`EXECUTE`, literal parameter rendering |
-| `GetTableSchema` | `PREPARE SELECT * FROM t` (no execution) |
+| `GetTableSchema` | zero-row `SELECT * FROM t WHERE FALSE` result header |
 | `GetObjects` | SQL over `sys.*` catalogs |
 | transactions / autocommit | handshake option + `Xauto_commit` + SQL |
 | partitioned results | unsupported (MAPI is a single sequential channel) |
@@ -167,6 +176,9 @@ convert to UTC → TIMESTAMPTZ; float NaN and null both map to NULL (MonetDB sem
   *client-requested* byte order; column data is in the *server's native* order.
 - The first `reply_size` rows of every result set arrive as text inside the execute
   response — negotiate a small reply size and fetch the bulk via `Xexportbin`.
+- A one-row result is closed after that initial text row, so it cannot be fetched with
+  `Xexportbin`; the driver retains the returned values in a typed constant result instead
+  of executing the source query a second time.
 - `Q_PREPARE` result sets cannot be fetched with `Xexport*` (protocol limitation);
   prepared-statement metadata is text-only. `EXECUTE` results are ordinary `Q_TABLE`s.
 - String backrefs are ingest-oriented; current servers do not emit them on export, but the
@@ -177,14 +189,14 @@ convert to UTC → TIMESTAMPTZ; float NaN and null both map to NULL (MonetDB sem
 ## Testing
 
 - **Unit (no server):** frame/codec tests with synthetic and golden fixtures in
-  `monetdb-arrow`; the Python package chain is smoke-tested by asserting the skeleton's
-  `NotImplemented` error surfaces through driver-manager dlopen.
+  `monetdb-arrow`; the Python package chain is smoke-tested through driver-manager dlopen.
 - **Integration (dockerized `monetdb/monetdb:Dec2025-SP3`):** polars round-trips over the
   full dtype matrix — nulls in every type, empty vs NULL strings, decimal extremes at each
   backing width, temporal edge values, 0-row and multi-window results, wide tables.
   Tests are written first and marked `xfail(strict=False)` until their milestone lands.
 - **Conformance:** the ADBC validation suite (M4) drives the driver through the Python
-  driver manager, so it exercises the same artifact users install.
+  driver manager, so it exercises the same artifact users install. Its driver quirks live
+  under `tests/validation`; validation dependencies are pinned in `uv.lock`.
 
 ## References
 

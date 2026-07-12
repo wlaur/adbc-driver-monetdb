@@ -1,0 +1,17 @@
+// part: metadata
+
+[tags]
+partial-support = true
+caveats = ["MonetDB TIMESTAMP values are returned at microsecond precision."]
+
+// part: expected_schema
+
+{"format":"+s","children":[{"name":"res","format":"tsu:","flags":["nullable"]}]}
+
+// part: expected
+
+{"res": null}
+{"res": -62135596800000000}
+{"res": 946684800000000}
+{"res": 1684158330000000}
+{"res": 253402300799000000}

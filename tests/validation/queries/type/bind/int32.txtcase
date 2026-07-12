@@ -1,0 +1,23 @@
+// part: metadata
+
+[tags]
+partial-support = true
+caveats = ["MonetDB reserves -2147483648 as the INTEGER binary NULL sentinel."]
+
+// part: bind
+
+{"res": 42}
+{"res": 131072}
+{"res": 2147483647}
+{"res": -2147483647}
+{"res": 0}
+{"res": null}
+
+// part: expected
+
+{"res": null}
+{"res": -2147483647}
+{"res": 0}
+{"res": 42}
+{"res": 131072}
+{"res": 2147483647}

@@ -1,0 +1,3 @@
+// part: query
+
+SELECT CAST('13:45:31.123456' AS TIME(6)) AS res

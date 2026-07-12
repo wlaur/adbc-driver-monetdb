@@ -5,7 +5,7 @@ from importlib.metadata import PackageNotFoundError, version
 try:
     __version__ = version("adbc-driver-monetdb")
 except PackageNotFoundError:  # pragma: no cover - source checkout without an installed wheel
-    __version__ = "0.0.0.dev0"
+    __version__ = "0.0.0"
 
 ENTRYPOINT = "AdbcDriverMonetdbInit"
 

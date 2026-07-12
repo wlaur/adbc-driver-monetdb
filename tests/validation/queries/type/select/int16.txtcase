@@ -1,0 +1,26 @@
+// part: metadata
+
+[tags]
+partial-support = true
+caveats = ["MonetDB reserves -32768 as the SMALLINT binary NULL sentinel."]
+
+// part: setup_query
+
+CREATE TABLE test_int16 (
+    idx INTEGER,
+    res SMALLINT
+);
+
+INSERT INTO test_int16 (idx, res) VALUES (1, 16384);
+INSERT INTO test_int16 (idx, res) VALUES (2, 32767);
+INSERT INTO test_int16 (idx, res) VALUES (3, -32767);
+INSERT INTO test_int16 (idx, res) VALUES (4, 0);
+INSERT INTO test_int16 (idx, res) VALUES (5, NULL);
+
+// part: expected
+
+{"res": 16384}
+{"res": 32767}
+{"res": -32767}
+{"res": 0}
+{"res": null}

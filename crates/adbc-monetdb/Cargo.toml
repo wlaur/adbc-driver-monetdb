@@ -24,6 +24,8 @@ arrow-schema.workspace = true
 monetdb.workspace = true
 monetdb-arrow.workspace = true
 pyo3 = { workspace = true, optional = true }
+percent-encoding.workspace = true
+url.workspace = true
 
 [lints]
 workspace = true
