@@ -48,7 +48,7 @@ as upstream-shaped MPL-2.0 changes so they can be offered back to
 ### M0 — spike: validate the read path end to end
 
 - [x] `Xexportbin` issued over a raw MAPI connection against a live Dec2025 server
-- [ ] decode int/double/varchar columns to Arrow, hand to polars via the C stream interface
+- [x] decode int/double/varchar columns to Arrow, hand to polars via the C stream interface
 - [ ] benchmark a large (multi-million row, mixed numeric/string) fetch against pymonetdb
       (text and binary modes) to quantify the win before building everything else
 - [ ] pin down the error-offset semantics of the trailing negative `toc_pos`
@@ -61,7 +61,7 @@ as upstream-shaped MPL-2.0 changes so they can be offered back to
 
 - [x] `Xexportbin <resid> <start> <count>` command + binary response framing
 - [x] `Xreply_size` control (small text prefix, bulk via binary windows)
-- [ ] transactions: autocommit handshake option, `Xauto_commit`, commit/rollback
+- [x] transactions: autocommit handshake option, `Xauto_commit`, commit/rollback
 - [ ] `PREPARE` / `EXECUTE` (text descriptions; `Q_PREPARE` result sets are text-only
       in the MAPI protocol)
 - [ ] file-transfer uploads (the `rb` subprotocol) for `COPY BINARY ... ON CLIENT`,
@@ -89,11 +89,11 @@ as upstream-shaped MPL-2.0 changes so they can be offered back to
 
 ### M3 — ADBC surface (crates/adbc-monetdb)
 
-- [ ] connection lifecycle: URI/username/password options, MAPI connect via the protocol
+- [x] connection lifecycle: URI/username/password options, MAPI connect via the protocol
       crate, Dec2025+ / little-endian gate with clear errors
-- [ ] `ExecuteQuery` → `RecordBatchReader`: one batch per `Xexportbin` window; window size
+- [x] `ExecuteQuery` → `RecordBatchReader`: one batch per `Xexportbin` window; window size
       as a statement option (`adbc.monetdb.batch_rows`, default ~128k rows)
-- [ ] `ExecuteUpdate` for DML/DDL (affected-row counts from the text header)
+- [x] `ExecuteUpdate` for DML/DDL (affected-row counts from the text header)
 - [ ] bulk ingest: modes `create` / `append` / `replace` / `create_append` +
       `adbc.ingest.temporary`; DDL generated from the Arrow schema; multi-batch streams
       chunked into successive `COPY BINARY` statements inside one transaction
@@ -102,7 +102,7 @@ as upstream-shaped MPL-2.0 changes so they can be offered back to
       (and `PREPARE SELECT * FROM t` for schemas)
 - [ ] prepared statements with positional (qmark) parameters rendered as SQL literals
       (MonetDB has no wire-level binary bind; bulk data goes through ingest)
-- [ ] error mapping: MAPI error strings → ADBC status + SQLSTATE (MonetDB prefixes
+- [x] error mapping: MAPI error strings → ADBC status + SQLSTATE (MonetDB prefixes
       errors with a 5-character SQLSTATE)
 - [ ] geometry/xml columns: fail with guidance to cast to text in SQL
 

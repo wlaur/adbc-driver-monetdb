@@ -12,7 +12,9 @@ dependencies = [
  "arrow-schema",
  "monetdb",
  "monetdb-arrow",
+ "percent-encoding",
  "pyo3",
+ "url",
 ]
 
 [[package]]
