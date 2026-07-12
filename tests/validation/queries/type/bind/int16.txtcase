@@ -1,0 +1,23 @@
+// part: metadata
+
+[tags]
+partial-support = true
+caveats = ["MonetDB reserves -32768 as the SMALLINT binary NULL sentinel."]
+
+// part: bind
+
+{"res": 42}
+{"res": 16384}
+{"res": 32767}
+{"res": -32767}
+{"res": 0}
+{"res": null}
+
+// part: expected
+
+{"res": null}
+{"res": -32767}
+{"res": 0}
+{"res": 42}
+{"res": 16384}
+{"res": 32767}

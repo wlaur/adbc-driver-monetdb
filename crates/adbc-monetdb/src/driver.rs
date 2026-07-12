@@ -450,7 +450,7 @@ impl Connection for MonetdbConnection {
         schema_for_query(
             &self.inner,
             &format!(
-                "SELECT * FROM {} WHERE FALSE",
+                "SELECT * FROM {} LIMIT 1",
                 qualified_name(db_schema, table_name)
             ),
         )

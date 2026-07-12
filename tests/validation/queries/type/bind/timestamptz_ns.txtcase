@@ -1,0 +1,33 @@
+// part: metadata
+
+[tags]
+partial-support = true
+caveats = ["Nanosecond zoned timestamps must be microsecond-aligned; MonetDB returns UTC microseconds."]
+
+// part: setup_query
+
+CREATE TABLE test_timestamptz (
+    idx INT,
+    res TIMESTAMP(6) WITH TIME ZONE,
+    res2 TIMESTAMP(6) WITH TIME ZONE
+);
+
+// part: bind
+
+{"idx": 3, "res": 1684158330000000000, "res2": 1684158330000000000}
+{"idx": 2, "res": 946684800000000000, "res2": 946684800000000000}
+{"idx": 1, "res": -9223372036854775000, "res2": -9223372036854775000}
+{"idx": 4, "res": 9223372036854775000, "res2": 9223372036854775000}
+{"idx": 0, "res": null, "res2": null}
+
+// part: expected_schema
+
+{"format":"+s","children":[{"name":"res","format":"tsu:UTC","flags":["nullable"]},{"name":"res2","format":"tsu:UTC","flags":["nullable"]}]}
+
+// part: expected
+
+{"res": null, "res2": null}
+{"res": -9223372036854775, "res2": -9223372036854775}
+{"res": 946684800000000, "res2": 946684800000000}
+{"res": 1684158330000000, "res2": 1684158330000000}
+{"res": 9223372036854775, "res2": 9223372036854775}

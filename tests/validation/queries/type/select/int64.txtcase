@@ -1,0 +1,26 @@
+// part: metadata
+
+[tags]
+partial-support = true
+caveats = ["MonetDB reserves -9223372036854775808 as the BIGINT binary NULL sentinel."]
+
+// part: setup_query
+
+CREATE TABLE test_int64 (
+    idx INTEGER,
+    res BIGINT
+);
+
+INSERT INTO test_int64 (idx, res) VALUES (1, 4294967296);
+INSERT INTO test_int64 (idx, res) VALUES (2, 9223372036854775807);
+INSERT INTO test_int64 (idx, res) VALUES (3, -9223372036854775807);
+INSERT INTO test_int64 (idx, res) VALUES (4, 0);
+INSERT INTO test_int64 (idx, res) VALUES (5, NULL);
+
+// part: expected
+
+{"res": 4294967296}
+{"res": 9223372036854775807}
+{"res": -9223372036854775807}
+{"res": 0}
+{"res": null}

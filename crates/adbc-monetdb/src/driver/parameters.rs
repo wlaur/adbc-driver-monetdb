@@ -2,12 +2,12 @@ use adbc_core::error::{Result, Status};
 use arrow_array::{
     Array, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
     DictionaryArray, DurationMicrosecondArray, DurationMillisecondArray, DurationNanosecondArray,
-    DurationSecondArray, FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array,
-    Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch, StringArray,
-    StringViewArray, Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray,
-    Time64NanosecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-    TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
-    UInt64Array,
+    DurationSecondArray, FixedSizeBinaryArray, Float16Array, Float32Array, Float64Array, Int8Array,
+    Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch,
+    StringArray, StringViewArray, Time32MillisecondArray, Time32SecondArray,
+    Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
+    UInt16Array, UInt32Array, UInt64Array,
     types::{
         ArrowDictionaryKeyType, Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type,
         UInt32Type, UInt64Type,
@@ -184,6 +184,9 @@ fn literal(array: &dyn Array, row: usize) -> Result<String> {
         DataType::UInt16 => primitive!(UInt16Array, DataType::UInt16),
         DataType::UInt32 => primitive!(UInt32Array, DataType::UInt32),
         DataType::UInt64 => primitive!(UInt64Array, DataType::UInt64),
+        DataType::Float16 => float_literal(f64::from(
+            downcast::<Float16Array>(array, DataType::Float16)?.value(row),
+        ))?,
         DataType::Float32 => float_literal(f64::from(
             downcast::<Float32Array>(array, DataType::Float32)?.value(row),
         ))?,
@@ -261,7 +264,7 @@ fn float_literal(value: f64) -> Result<String> {
     if value.is_nan() {
         Ok("NULL".into())
     } else if value.is_finite() {
-        Ok(value.to_string())
+        Ok(format!("{value:e}"))
     } else {
         Err(error(
             "infinite float parameters are not supported by MonetDB",
@@ -555,6 +558,8 @@ mod tests {
     #[test]
     fn formats_decimal_and_temporal_literals() {
         assert_eq!(decimal_literal(-123, 2).unwrap(), "-1.23");
+        assert_eq!(float_literal(3.5).unwrap(), "3.5e0");
+        assert_eq!(float_literal(f64::MAX).unwrap(), "1.7976931348623157e308");
         assert_eq!(date_literal(0), "DATE '1970-01-01'");
         assert_eq!(format_time(3_723_123_456).unwrap(), "01:02:03.123456");
     }

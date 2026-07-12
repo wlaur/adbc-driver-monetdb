@@ -1,0 +1,10 @@
+// part: metadata
+
+[tags]
+sql-type-name = "BLOB"
+
+// part: setup_query
+
+CREATE TABLE test_large_binary (
+    res BLOB
+);
