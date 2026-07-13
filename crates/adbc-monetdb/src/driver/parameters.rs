@@ -56,6 +56,7 @@ fn render_query(query: &str, values: &[String]) -> Result<(String, usize)> {
     enum State {
         Normal,
         SingleQuote,
+        EscapedSingleQuote,
         RawSingleQuote,
         DoubleQuote,
         LineComment,
@@ -126,7 +127,7 @@ fn render_query(query: &str, values: &[String]) -> Result<(String, usize)> {
                 (b'e' | b'E', Some(b'\''), _) => {
                     output.push(current as char);
                     output.push('\'');
-                    state = State::SingleQuote;
+                    state = State::EscapedSingleQuote;
                     index += 2;
                 }
                 (b'u' | b'U', Some(b'&'), Some(b'\'')) => {
@@ -156,6 +157,23 @@ fn render_query(query: &str, values: &[String]) -> Result<(String, usize)> {
                 }
             },
             State::SingleQuote => {
+                if current == b'\\' && next == Some(b'\'') {
+                    return Err(error(
+                        "backslash-escaped quotes in ordinary SQL strings depend on the server's raw_strings setting; use E'...' or R'...'",
+                        Status::InvalidArguments,
+                    ));
+                }
+                index = copy_char(query, index, &mut output);
+                if current == b'\'' {
+                    if next == Some(b'\'') {
+                        output.push('\'');
+                        index += 1;
+                    } else {
+                        state = State::Normal;
+                    }
+                }
+            }
+            State::EscapedSingleQuote => {
                 index = copy_char(query, index, &mut output);
                 if current == b'\\' && index < bytes.len() {
                     index = copy_char(query, index, &mut output);
@@ -363,10 +381,7 @@ fn quote_string(value: &str) -> Result<String> {
             Status::InvalidData,
         ));
     }
-    Ok(format!(
-        "'{}'",
-        value.replace('\\', "\\\\").replace('\'', "\\'")
-    ))
+    Ok(format!("R'{}'", value.replace('\'', "''")))
 }
 
 fn blob_literal(value: &[u8]) -> String {
@@ -599,7 +614,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             render_row("SELECT ?, '?', \"?\", ? -- ?", &batch, 0).unwrap(),
-            "SELECT 42, '?', \"?\", 'a\\'b' -- ?"
+            "SELECT 42, '?', \"?\", R'a''b' -- ?"
         );
     }
 
@@ -609,6 +624,8 @@ mod tests {
         assert_eq!(parameter_count("SELECT R';?' /* ; */;").unwrap(), 0);
         assert!(parameter_count("SELECT 1; DELETE FROM important").is_err());
         assert!(parameter_count("SELECT 'unterminated").is_err());
+        assert!(parameter_count("SELECT '\\''").is_err());
+        assert_eq!(parameter_count("SELECT E'a\\'b?', R'\\?'").unwrap(), 0);
         let batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
         assert!(render_row("SELECT ?", &batch, 0).is_err());
     }
