@@ -105,6 +105,16 @@ fn decimal_scale(scale: u8) -> Result<i8, DecodeError> {
     })
 }
 
+fn decimal_data_type(precision: u8, scale: u8) -> Result<DataType, DecodeError> {
+    if !(1..=38).contains(&precision) || scale > precision {
+        return Err(DecodeError::InvalidValue {
+            row: 0,
+            message: "decimal precision/scale must satisfy 1 <= precision <= 38 and scale <= precision",
+        });
+    }
+    Ok(DataType::Decimal128(precision, decimal_scale(scale)?))
+}
+
 pub fn decode_frame(frame: &[u8], columns: &[ResultColumn]) -> Result<RecordBatch, DecodeError> {
     let frame = parse_frame(frame)?;
     if columns.len() != frame.columns.len() {
@@ -465,9 +475,7 @@ pub fn data_type_for_monet_type(data_type: &MonetType) -> Result<DataType, Decod
         MonetType::BigInt => DataType::Int64,
         MonetType::HugeInt => DataType::Decimal128(38, 0),
         MonetType::Oid => DataType::UInt64,
-        MonetType::Decimal(precision, scale) => {
-            DataType::Decimal128(precision, decimal_scale(scale)?)
-        }
+        MonetType::Decimal(precision, scale) => decimal_data_type(precision, scale)?,
         MonetType::Varchar(_) | MonetType::Url | MonetType::Json | MonetType::Inet => {
             DataType::Utf8
         }
@@ -683,6 +691,23 @@ fn decimal_array(
     precision: u8,
     scale: i8,
 ) -> Result<Decimal128Array, DecodeError> {
+    if !(1..=38).contains(&precision) || scale < 0 || scale > precision as i8 {
+        return Err(DecodeError::InvalidValue {
+            row: 0,
+            message: "decimal precision/scale must satisfy 1 <= precision <= 38 and 0 <= scale <= precision",
+        });
+    }
+    let limit = 10i128.pow(u32::from(precision));
+    if let Some((row, _)) = values
+        .iter()
+        .enumerate()
+        .find(|(_, value)| value.is_some_and(|value| value <= -limit || value >= limit))
+    {
+        return Err(DecodeError::InvalidValue {
+            row,
+            message: "decimal value exceeds its declared precision",
+        });
+    }
     Ok(Decimal128Array::from(values).with_precision_and_scale(precision, scale)?)
 }
 
@@ -696,7 +721,7 @@ pub(crate) fn decode_strings(bytes: &[u8], rows: usize) -> Result<StringArray, D
     if bytes.len() > i32::MAX as usize {
         return Err(DecodeError::InvalidValue {
             row: 0,
-            message: "UTF-8 column exceeds Arrow's 32-bit offset limit",
+            message: "UTF-8 column exceeds Arrow's 32-bit offset limit; lower adbc.monetdb.batch_rows",
         });
     }
     let mut builder = StringBuilder::with_capacity(rows, bytes.len());
@@ -760,7 +785,7 @@ pub(crate) fn decode_strings(bytes: &[u8], rows: usize) -> Result<StringArray, D
                 if value_bytes > i32::MAX as usize {
                     return Err(DecodeError::InvalidValue {
                         row,
-                        message: "UTF-8 column exceeds Arrow's 32-bit offset limit",
+                        message: "UTF-8 column exceeds Arrow's 32-bit offset limit; lower adbc.monetdb.batch_rows",
                     });
                 }
                 builder.append_value(value);
@@ -828,9 +853,15 @@ fn decode_blob(bytes: &[u8], rows: usize) -> Result<BinaryArray, DecodeError> {
         })?;
         let length = i64::from_le_bytes(header.try_into().expect("blob header is 8 bytes"));
         pos += 8;
-        if length < 0 {
+        if length == -1 {
             builder.append_null();
             continue;
+        }
+        if length < -1 {
+            return Err(DecodeError::InvalidValue {
+                row,
+                message: "BLOB length is negative but is not the -1 NULL sentinel",
+            });
         }
         let length = usize::try_from(length).map_err(|_| DecodeError::InvalidValue {
             row,
@@ -1299,6 +1330,21 @@ mod tests {
             decode_column(&MonetType::Decimal(38, 128), &[0; 16], 1),
             Err(DecodeError::InvalidValue { .. })
         ));
+        for data_type in [MonetType::Decimal(0, 0), MonetType::Decimal(38, 39)] {
+            assert!(matches!(
+                data_type_for_monet_type(&data_type),
+                Err(DecodeError::InvalidValue { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_values_outside_decimal128_precision() {
+        let value = 10i128.pow(38).to_le_bytes();
+        assert!(matches!(
+            decode_column(&MonetType::HugeInt, &value, 1),
+            Err(DecodeError::InvalidValue { row: 0, .. })
+        ));
     }
 
     #[test]
@@ -1441,6 +1487,11 @@ mod tests {
         let array = decode_blob(&blobs, 2).unwrap();
         assert_eq!(array.value(0), b"abc");
         assert!(array.is_null(1));
+
+        assert!(matches!(
+            decode_blob(&(-2i64).to_le_bytes(), 1),
+            Err(DecodeError::InvalidValue { row: 0, .. })
+        ));
 
         let mut uuids = vec![1; 16];
         uuids.extend_from_slice(&[0; 16]);

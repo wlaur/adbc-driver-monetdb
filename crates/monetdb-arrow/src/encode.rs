@@ -174,8 +174,8 @@ pub fn encode_column(field: &Field, array: &dyn Array) -> Result<Vec<u8>, Encode
         DataType::UInt16 => unsigned!(UInt16Array, i32, DataType::UInt16),
         DataType::UInt32 => unsigned!(UInt32Array, i64, DataType::UInt32),
         DataType::UInt64 => unsigned!(UInt64Array, i128, DataType::UInt64),
-        DataType::Float32 => encode_f32(downcast(array, DataType::Float32)?, &mut out),
-        DataType::Float64 => encode_f64(downcast(array, DataType::Float64)?, &mut out),
+        DataType::Float32 => encode_f32(downcast(array, DataType::Float32)?, &mut out)?,
+        DataType::Float64 => encode_f64(downcast(array, DataType::Float64)?, &mut out)?,
         DataType::Decimal128(precision, _) => encode_decimal(
             downcast(array, array.data_type().clone())?,
             *precision,
@@ -273,26 +273,42 @@ fn encode_bool(array: &BooleanArray, out: &mut Vec<u8>) {
     }));
 }
 
-fn encode_f32(array: &Float32Array, out: &mut Vec<u8>) {
+fn encode_f32(array: &Float32Array, out: &mut Vec<u8>) -> Result<(), EncodeError> {
     for row in 0..array.len() {
         let value = if array.is_null(row) {
             f32::NAN
         } else {
-            array.value(row)
+            let value = array.value(row);
+            if value.is_nan() {
+                return Err(EncodeError::InvalidValue {
+                    row,
+                    message: "NaN is MonetDB's floating-point NULL sentinel",
+                });
+            }
+            value
         };
         out.extend_from_slice(&value.to_le_bytes());
     }
+    Ok(())
 }
 
-fn encode_f64(array: &Float64Array, out: &mut Vec<u8>) {
+fn encode_f64(array: &Float64Array, out: &mut Vec<u8>) -> Result<(), EncodeError> {
     for row in 0..array.len() {
         let value = if array.is_null(row) {
             f64::NAN
         } else {
-            array.value(row)
+            let value = array.value(row);
+            if value.is_nan() {
+                return Err(EncodeError::InvalidValue {
+                    row,
+                    message: "NaN is MonetDB's floating-point NULL sentinel",
+                });
+            }
+            value
         };
         out.extend_from_slice(&value.to_le_bytes());
     }
+    Ok(())
 }
 
 fn encode_decimal(
@@ -496,6 +512,14 @@ fn encode_date64(array: &Date64Array, out: &mut Vec<u8>) -> Result<(), EncodeErr
 
 fn append_date(days: i64, row: usize, out: &mut Vec<u8>) -> Result<(), EncodeError> {
     let date = date_from_days(days, row)?;
+    // MonetDB's `gdk_time.c` defines YEAR_MIN as -4712; its binary importer
+    // silently converts earlier dates to nil.
+    if date.year() < -4712 {
+        return Err(EncodeError::InvalidValue {
+            row,
+            message: "date is earlier than MonetDB's minimum year -4712",
+        });
+    }
     let year = i16::try_from(date.year()).map_err(|_| EncodeError::InvalidValue {
         row,
         message: "date year is outside MonetDB's range",
@@ -852,6 +876,23 @@ mod tests {
     }
 
     #[test]
+    fn rejects_non_null_nan_values() {
+        let f32_field = Field::new("f32", DataType::Float32, true);
+        let f32_values = Float32Array::from(vec![f32::NAN]);
+        assert!(matches!(
+            encode_column(&f32_field, &f32_values),
+            Err(EncodeError::InvalidValue { row: 0, .. })
+        ));
+
+        let f64_field = Field::new("f64", DataType::Float64, true);
+        let f64_values = Float64Array::from(vec![f64::NAN]);
+        assert!(matches!(
+            encode_column(&f64_field, &f64_values),
+            Err(EncodeError::InvalidValue { row: 0, .. })
+        ));
+    }
+
+    #[test]
     fn rejects_nul_inside_strings() {
         let field = Field::new("s", DataType::Utf8, true);
         let array = StringArray::from(vec!["not\0representable"]);
@@ -897,7 +938,7 @@ mod tests {
     #[test]
     fn chrono_date_conversion_round_trips_bce_and_boundary_years() {
         let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-        let dates = [-32_768, -1, 0, 1, 1582, 1900, 2000, 32_767]
+        let dates = [-4712, -1, 0, 1, 1582, 1900, 2000, 32_767]
             .map(|year| NaiveDate::from_ymd_opt(year, 3, 1).unwrap());
         let days =
             dates.map(|date| i32::try_from(date.signed_duration_since(epoch).num_days()).unwrap());
@@ -907,6 +948,14 @@ mod tests {
         let decoded = crate::decode::decode_column(&MonetType::Date, &bytes, dates.len()).unwrap();
         let decoded = decoded.as_any().downcast_ref::<Date32Array>().unwrap();
         assert_eq!(decoded.values(), array.values());
+
+        let too_early = NaiveDate::from_ymd_opt(-4713, 12, 31).unwrap();
+        let days = i32::try_from(too_early.signed_duration_since(epoch).num_days()).unwrap();
+        let array = Date32Array::from(vec![days]);
+        assert!(matches!(
+            encode_column(&field, &array),
+            Err(EncodeError::InvalidValue { row: 0, .. })
+        ));
     }
 
     #[test]

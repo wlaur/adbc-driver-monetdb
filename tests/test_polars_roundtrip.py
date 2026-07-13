@@ -589,23 +589,18 @@ def test_dtype_matrix_roundtrip(monetdb_uri: str) -> None:
 
 
 @pytest.mark.integration
-def test_float_nan_maps_to_monetdb_null(monetdb_uri: str) -> None:
+def test_float_nan_is_rejected_on_write(monetdb_uri: str) -> None:
     frame = pl.DataFrame(
         {
             "f32": pl.Series([float("nan"), None, 1.5], dtype=pl.Float32),
             "f64": pl.Series([float("nan"), None, 2.5], dtype=pl.Float64),
         }
     )
-    with dbapi.connect(monetdb_uri) as conn:
-        try:
-            assert frame.write_database("nan_semantics", conn, if_table_exists="replace", engine="adbc") == 3  # pyright: ignore[reportUnknownMemberType]
-            back = pl.read_database("SELECT * FROM nan_semantics", conn)  # pyright: ignore[reportUnknownMemberType]
-            assert back.to_dict(as_series=False) == {
-                "f32": [None, None, 1.5],
-                "f64": [None, None, 2.5],
-            }
-        finally:
-            conn.cursor().execute("DROP TABLE IF EXISTS nan_semantics")  # pyright: ignore[reportUnknownMemberType]
+    with (
+        dbapi.connect(monetdb_uri) as conn,
+        pytest.raises(adbc_driver_manager.DataError, match="NaN is MonetDB"),
+    ):
+        frame.write_database("nan_semantics", conn, if_table_exists="replace", engine="adbc")  # pyright: ignore[reportUnknownMemberType]
 
 
 @pytest.mark.integration

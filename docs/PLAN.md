@@ -185,7 +185,8 @@ as upstream-shaped MPL-2.0 changes so they can be offered back to
 
 Write direction extras: unsigned ints widen (`u8→SMALLINT`, `u16→INT`, `u32→BIGINT`,
 `u64→HUGEINT`); `Categorical`/`Enum` → VARCHAR with backref encoding; tz-aware datetimes
-convert to UTC → TIMESTAMPTZ; float NaN and null both map to NULL (MonetDB semantics);
+convert to UTC → TIMESTAMPTZ; Arrow null maps to MonetDB's NaN sentinel while a non-null
+NaN is rejected to prevent silent data loss;
 `Struct`/`List` are unsupported — JSON-encode first (matches MonetDB's type system).
 
 ## Protocol notes (the sharp edges)
@@ -202,7 +203,8 @@ convert to UTC → TIMESTAMPTZ; float NaN and null both map to NULL (MonetDB sem
   prepared-statement metadata is text-only. `EXECUTE` results are ordinary `Q_TABLE`s.
 - String backrefs are ingest-oriented; current servers do not emit them on export, but the
   decoder handles them anyway.
-- MonetDB stores no real float NaNs (NaN is the NULL sentinel) — the mapping is lossless.
+- MonetDB stores no real float NaNs (NaN is the NULL sentinel). Reads therefore map NaN to
+  Arrow null, and writes reject non-null Arrow NaNs rather than silently changing them to null.
 - An all-zero UUID is indistinguishable from NULL by design (server semantics).
 
 ## Testing
