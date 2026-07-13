@@ -1493,6 +1493,9 @@ fn query_reader(
     }
     let result = cursor.binary_result().map_err(map_cursor_error)?;
     let total_rows = result.total_rows;
+    if total_rows >= 16_384 && result.columns.len() > 1 {
+        monetdb_arrow::initialize_parallel_decoder();
+    }
     if total_rows == 1 && !result.is_server_resident() {
         let batch = monetdb_arrow::decode_inline_row(&mut cursor, &result.columns)
             .map_err(|value| map_display(value, Status::InvalidData))?;
@@ -1507,6 +1510,7 @@ fn query_reader(
         next_row: 0,
         total_rows,
         batch_rows,
+        response: Vec::new(),
         finished: false,
     }))
 }
@@ -1625,6 +1629,7 @@ struct BinaryReader {
     next_row: u64,
     total_rows: u64,
     batch_rows: usize,
+    response: Vec<u8>,
     finished: bool,
 }
 
@@ -1656,11 +1661,16 @@ impl BinaryReader {
             .min(usize::try_from(remaining).unwrap_or(usize::MAX));
         let result = self
             .cursor
-            .fetch_binary(self.next_row, count)
+            .fetch_binary_into(self.next_row, count, &mut self.response)
             .map_err(|value| ArrowError::ExternalError(Box::new(value)))
-            .and_then(|frame| {
-                monetdb_arrow::decode_frame(&frame, &self.columns, self.result_id, self.next_row)
-                    .map_err(|value| ArrowError::ExternalError(Box::new(value)))
+            .and_then(|()| {
+                monetdb_arrow::decode_frame(
+                    &self.response,
+                    &self.columns,
+                    self.result_id,
+                    self.next_row,
+                )
+                .map_err(|value| ArrowError::ExternalError(Box::new(value)))
             });
         match &result {
             Ok(batch) if batch.num_rows() > 0 => {

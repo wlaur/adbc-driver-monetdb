@@ -22,6 +22,7 @@ use monetdb::{
         raw_temporal::{RawDate, RawTime, RawTimeTz, RawTimestamp, RawTimestampTz},
     },
 };
+use rayon::prelude::*;
 
 use crate::exportbin::{FrameError, parse_frame};
 
@@ -156,11 +157,23 @@ pub fn decode_frame(
         .iter()
         .map(field_for_column)
         .collect::<Result<Vec<_>, _>>()?;
-    let arrays = columns
+    let frame_bytes = frame
+        .columns
         .iter()
-        .zip(frame.columns)
-        .map(|(column, bytes)| decode_column(column.sql_type(), bytes, row_count))
-        .collect::<Result<Vec<_>, _>>()?;
+        .fold(0usize, |total, column| total.saturating_add(column.len()));
+    let arrays = if columns.len() > 1 && frame_bytes >= 1024 * 1024 {
+        columns
+            .par_iter()
+            .zip(frame.columns.par_iter())
+            .map(|(column, bytes)| decode_column(column.sql_type(), bytes, row_count))
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        columns
+            .iter()
+            .zip(frame.columns)
+            .map(|(column, bytes)| decode_column(column.sql_type(), bytes, row_count))
+            .collect::<Result<Vec<_>, _>>()?
+    };
     Ok(RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)?)
 }
 
@@ -765,8 +778,72 @@ pub(crate) fn decode_strings(bytes: &[u8], rows: usize) -> Result<StringArray, D
             message: "UTF-8 column exceeds Arrow's 32-bit offset limit; lower adbc.monetdb.batch_rows",
         });
     }
+    if let Some(array) = decode_strings_without_backrefs(bytes, rows)? {
+        return Ok(array);
+    }
+    decode_strings_with_backrefs(bytes, rows)
+}
+
+fn decode_strings_without_backrefs(
+    bytes: &[u8],
+    rows: usize,
+) -> Result<Option<StringArray>, DecodeError> {
     let mut builder = StringBuilder::with_capacity(rows, bytes.len());
-    let mut history: Vec<Option<&str>> = Vec::new();
+    let mut pos = 0;
+    let mut value_bytes = 0usize;
+    for row in 0..rows {
+        let Some(&first) = bytes.get(pos) else {
+            return Err(DecodeError::Length {
+                expected: pos + 1,
+                actual: bytes.len(),
+            });
+        };
+        if first == 0x80 {
+            let (distance, consumed) = long_backref(&bytes[pos + 1..], row)?;
+            if distance != 0 {
+                return Ok(None);
+            }
+            pos += consumed + 1;
+            builder.append_null();
+            continue;
+        }
+        if (0x81..=0xbf).contains(&first) {
+            return Ok(None);
+        }
+        let tail = &bytes[pos..];
+        let end = memchr::memchr(0, tail).ok_or(DecodeError::Length {
+            expected: bytes.len() + 1,
+            actual: bytes.len(),
+        })?;
+        let value =
+            std::str::from_utf8(&tail[..end]).map_err(|_| DecodeError::InvalidUtf8 { row })?;
+        value_bytes = value_bytes
+            .checked_add(value.len())
+            .ok_or(DecodeError::InvalidValue {
+                row,
+                message: "UTF-8 column length overflows",
+            })?;
+        if value_bytes > i32::MAX as usize {
+            return Err(DecodeError::InvalidValue {
+                row,
+                message: "UTF-8 column exceeds Arrow's 32-bit offset limit; lower adbc.monetdb.batch_rows",
+            });
+        }
+        builder.append_value(value);
+        pos += end + 1;
+    }
+    if pos != bytes.len() {
+        return Err(DecodeError::Length {
+            expected: pos,
+            actual: bytes.len(),
+        });
+    }
+    Ok(Some(builder.finish()))
+}
+
+fn decode_strings_with_backrefs(bytes: &[u8], rows: usize) -> Result<StringArray, DecodeError> {
+    let mut builder = StringBuilder::with_capacity(rows, bytes.len());
+    let mut history: Vec<Option<&str>> = Vec::with_capacity(rows);
     let mut pos = 0;
     let mut value_bytes = 0usize;
     for row in 0..rows {
@@ -802,13 +879,10 @@ pub(crate) fn decode_strings(bytes: &[u8], rows: usize) -> Result<StringArray, D
                 .ok_or(DecodeError::InvalidBackref { row })?
         } else {
             let tail = &bytes[pos..];
-            let end = tail
-                .iter()
-                .position(|&byte| byte == 0)
-                .ok_or(DecodeError::Length {
-                    expected: bytes.len() + 1,
-                    actual: bytes.len(),
-                })?;
+            let end = memchr::memchr(0, tail).ok_or(DecodeError::Length {
+                expected: bytes.len() + 1,
+                actual: bytes.len(),
+            })?;
             let string =
                 std::str::from_utf8(&tail[..end]).map_err(|_| DecodeError::InvalidUtf8 { row })?;
             pos += end + 1;

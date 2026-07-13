@@ -138,6 +138,20 @@ pub fn sql_type_for_field(field: &Field) -> Result<String, EncodeError> {
 
 pub fn encode_column(field: &Field, array: &dyn Array) -> Result<Vec<u8>, EncodeError> {
     let mut out = Vec::new();
+    if let Some(width) = fixed_wire_width(field, array.data_type())? {
+        let bytes = array
+            .len()
+            .checked_mul(width)
+            .ok_or(EncodeError::InvalidValue {
+                row: 0,
+                message: "encoded column length overflows",
+            })?;
+        out.try_reserve_exact(bytes)
+            .map_err(|_| EncodeError::InvalidValue {
+                row: 0,
+                message: "encoded column is too large",
+            })?;
+    }
     macro_rules! signed {
         ($array:ty, $type:ty, $variant:expr) => {{
             let values = downcast::<$array>(array, $variant)?;
@@ -230,6 +244,42 @@ pub fn encode_column(field: &Field, array: &dyn Array) -> Result<Vec<u8>, Encode
         data_type => return Err(EncodeError::Unsupported(data_type.clone())),
     }
     Ok(out)
+}
+
+fn fixed_wire_width(field: &Field, data_type: &DataType) -> Result<Option<usize>, EncodeError> {
+    if *data_type == DataType::Null {
+        return Ok(Some(2));
+    }
+    Ok(match monet_type_for_field(field)? {
+        MonetType::Bool | MonetType::TinyInt => Some(1),
+        MonetType::SmallInt => Some(2),
+        MonetType::Int | MonetType::Real | MonetType::MonthInterval | MonetType::Date => Some(4),
+        MonetType::BigInt
+        | MonetType::Oid
+        | MonetType::Double
+        | MonetType::DayInterval
+        | MonetType::SecInterval
+        | MonetType::Time
+        | MonetType::TimeTz => Some(8),
+        MonetType::HugeInt | MonetType::Uuid => Some(16),
+        MonetType::Decimal(precision, _) => match precision {
+            1..=2 => Some(1),
+            3..=4 => Some(2),
+            5..=9 => Some(4),
+            10..=18 => Some(8),
+            19..=38 => Some(16),
+            _ => None,
+        },
+        MonetType::Timestamp | MonetType::TimestampTz => Some(12),
+        MonetType::Varchar(_)
+        | MonetType::Blob
+        | MonetType::Url
+        | MonetType::Inet
+        | MonetType::Json
+        | MonetType::Geometry
+        | MonetType::GeometryA
+        | MonetType::Xml => None,
+    })
 }
 
 fn downcast<T: 'static>(array: &dyn Array, expected: DataType) -> Result<&T, EncodeError> {

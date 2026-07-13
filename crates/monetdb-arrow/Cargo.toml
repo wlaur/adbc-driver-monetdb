@@ -11,7 +11,9 @@ repository.workspace = true
 arrow-array.workspace = true
 arrow-schema.workspace = true
 chrono.workspace = true
+memchr.workspace = true
 monetdb.workspace = true
+rayon.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
