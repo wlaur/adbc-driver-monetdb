@@ -1501,6 +1501,7 @@ fn query_reader(
     let schema = schema_for_columns(&result.columns)?;
     Ok(Box::new(BinaryReader {
         cursor,
+        result_id: result.result_id,
         columns: result.columns,
         schema,
         next_row: 0,
@@ -1618,6 +1619,7 @@ fn schema_for_columns(columns: &[ResultColumn]) -> Result<SchemaRef> {
 
 struct BinaryReader {
     cursor: monetdb::Cursor,
+    result_id: u64,
     columns: Vec<ResultColumn>,
     schema: SchemaRef,
     next_row: u64,
@@ -1657,7 +1659,7 @@ impl BinaryReader {
             .fetch_binary(self.next_row, count)
             .map_err(|value| ArrowError::ExternalError(Box::new(value)))
             .and_then(|frame| {
-                monetdb_arrow::decode_frame(&frame, &self.columns)
+                monetdb_arrow::decode_frame(&frame, &self.columns, self.result_id, self.next_row)
                     .map_err(|value| ArrowError::ExternalError(Box::new(value)))
             });
         match &result {

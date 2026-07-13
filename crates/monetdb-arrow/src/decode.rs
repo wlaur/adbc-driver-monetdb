@@ -28,6 +28,8 @@ use crate::exportbin::{FrameError, parse_frame};
 #[derive(Debug)]
 pub enum DecodeError {
     Frame(FrameError),
+    ResultId { expected: u64, actual: i64 },
+    StartRow { expected: u64, actual: u64 },
     ColumnCount { expected: usize, actual: usize },
     Length { expected: usize, actual: usize },
     InvalidValue { row: usize, message: &'static str },
@@ -42,6 +44,12 @@ impl fmt::Display for DecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Frame(error) => error.fmt(f),
+            Self::ResultId { expected, actual } => {
+                write!(f, "frame has result id {actual}; expected {expected}")
+            }
+            Self::StartRow { expected, actual } => {
+                write!(f, "frame starts at row {actual}; expected {expected}")
+            }
             Self::ColumnCount { expected, actual } => {
                 write!(
                     f,
@@ -115,8 +123,25 @@ fn decimal_data_type(precision: u8, scale: u8) -> Result<DataType, DecodeError> 
     Ok(DataType::Decimal128(precision, decimal_scale(scale)?))
 }
 
-pub fn decode_frame(frame: &[u8], columns: &[ResultColumn]) -> Result<RecordBatch, DecodeError> {
+pub fn decode_frame(
+    frame: &[u8],
+    columns: &[ResultColumn],
+    expected_result_id: u64,
+    expected_start_row: u64,
+) -> Result<RecordBatch, DecodeError> {
     let frame = parse_frame(frame)?;
+    if u64::try_from(frame.result_id) != Ok(expected_result_id) {
+        return Err(DecodeError::ResultId {
+            expected: expected_result_id,
+            actual: frame.result_id,
+        });
+    }
+    if frame.start_row != expected_start_row {
+        return Err(DecodeError::StartRow {
+            expected: expected_start_row,
+            actual: frame.start_row,
+        });
+    }
     if columns.len() != frame.columns.len() {
         return Err(DecodeError::ColumnCount {
             expected: columns.len(),
@@ -1263,6 +1288,20 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn validates_frame_identity_and_offset() {
+        let mut frame = b"&6 7 0 0 5\n".to_vec();
+        frame.extend_from_slice(&(frame.len() as i64).to_le_bytes());
+        assert!(matches!(
+            decode_frame(&frame, &[], 8, 5),
+            Err(DecodeError::ResultId { .. })
+        ));
+        assert!(matches!(
+            decode_frame(&frame, &[], 7, 4),
+            Err(DecodeError::StartRow { .. })
+        ));
     }
 
     #[test]
