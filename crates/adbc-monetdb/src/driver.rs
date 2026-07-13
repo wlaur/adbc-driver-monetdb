@@ -901,18 +901,17 @@ impl MonetdbStatement {
             }
         );
 
-        let originally_autocommit = lock_connection(&self.connection)?
+        let connection = lock_connection(&self.connection)?;
+        let originally_autocommit = connection
             .server_info()
             .map_err(map_cursor_error)?
             .autocommit;
         if originally_autocommit {
-            lock_connection(&self.connection)?
-                .set_autocommit(false)
-                .map_err(map_cursor_error)?;
+            connection.set_autocommit(false).map_err(map_cursor_error)?;
         }
 
+        let mut cursor = connection.cursor();
         let result = (|| {
-            let mut cursor = lock_connection(&self.connection)?.cursor();
             match mode {
                 "adbc.ingest.mode.create" => cursor.execute(&create).map_err(map_cursor_error)?,
                 "adbc.ingest.mode.append" => {}
@@ -985,21 +984,14 @@ impl MonetdbStatement {
             if originally_autocommit {
                 cursor.execute("COMMIT").map_err(map_cursor_error)?;
             }
-            cursor.close().map_err(map_cursor_error)?;
             Ok(rows)
         })();
 
-        if result.is_err()
-            && originally_autocommit
-            && let Ok(connection) = lock_connection(&self.connection)
-        {
-            let mut cursor = connection.cursor();
+        if result.is_err() && originally_autocommit {
             let _ = cursor.execute("ROLLBACK");
-            let _ = cursor.close();
         }
         let restore_result = if originally_autocommit {
-            lock_connection(&self.connection)
-                .and_then(|connection| connection.set_autocommit(true).map_err(map_cursor_error))
+            connection.set_autocommit(true).map_err(map_cursor_error)
         } else {
             Ok(())
         };
