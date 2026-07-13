@@ -5,7 +5,8 @@
 Arrow-native reads and writes for MonetDB: polars, pandas, and every other ADBC consumer get
 columnar result sets (MonetDB's binary result-set protocol decoded directly into Arrow record
 batches) and bulk ingestion (`COPY BINARY ... ON CLIENT` streamed from Arrow buffers) through one
-standard interface. The implementation plan lives in [docs/PLAN.md](docs/PLAN.md).
+standard interface. The implementation plan lives in the
+[project plan](https://github.com/wlaur/adbc-driver-monetdb/blob/main/docs/PLAN.md).
 
 ## Usage
 
@@ -97,5 +98,7 @@ Lint/typecheck: `uv run ruff check .`, `uv run ruff format --check .`, `uv run p
 
 ## License
 
-MIT. The `monetdb` protocol crate (`monetdb-rust`, our fork of MonetDB/monetdb-rust) is MPL-2.0;
-its license and corresponding-source notice are included in wheels and source distributions.
+The driver is MIT and the included `monetdb` protocol crate (`monetdb-rust`, our fork of
+MonetDB/monetdb-rust) is MPL-2.0. The distribution's license expression is therefore
+`MIT AND MPL-2.0`; both license texts and the corresponding-source notice are included in wheels
+and source distributions.

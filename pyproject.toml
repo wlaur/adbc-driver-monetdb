@@ -5,7 +5,7 @@ description = "ADBC driver for MonetDB: Arrow-native reads and writes for polars
 authors = [{ name = "William Laurén", email = "lauren.william.a@gmail.com" }]
 requires-python = ">=3.13"
 readme = "README.md"
-license = "MIT"
+license = "MIT AND MPL-2.0"
 license-files = ["LICENSE", "NOTICE", "monetdb-rust/LICENSE"]
 keywords = ["monetdb", "adbc", "arrow", "polars", "database", "driver", "olap"]
 classifiers = [
@@ -56,6 +56,7 @@ manifest-path = "crates/adbc-monetdb/Cargo.toml"
 python-source = "."
 module-name = "adbc_driver_monetdb._native"
 features = ["python"]
+include = [{ path = "rust-toolchain.toml", format = "sdist" }]
 
 [tool.cibuildwheel]
 # abi3 (cp313) -> one wheel per platform covers CPython >= 3.13.
