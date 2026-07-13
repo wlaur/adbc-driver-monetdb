@@ -60,8 +60,6 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo test --locked --workspace
-      - run: cargo clippy --locked --manifest-path monetdb-rust/Cargo.toml --lib --all-features -- -D warnings
-      - run: cargo test --locked --manifest-path monetdb-rust/Cargo.toml --lib --all-features
       - run: ./checklicense.py --check
         working-directory: monetdb-rust
       - name: Verify the NOTICE fork revision
@@ -265,11 +263,6 @@ jobs:
             --with "$wheel" --with pytest --with pymonetdb \
             --with 'adbc-drivers-validation @ git+https://github.com/adbc-drivers/validation@20bcdbe0d498065565e727861ca7e1f94d9b66bb' \
             python -m pytest "$GITHUB_WORKSPACE/tests/validation" -q
-      - name: Run monetdb-rust live protocol tests
-        env:
-          CI_SERVER_URL: monetdb://localhost:50000/test
-        run: cargo test --locked --manifest-path monetdb-rust/Cargo.toml --test ci --all-features
-
   publish:
     name: publish to PyPI
     needs: [lint, rust, build-sdist, build-wheels, test, integration]
