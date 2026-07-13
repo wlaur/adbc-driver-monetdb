@@ -23,6 +23,10 @@ df = pl.read_database_uri("SELECT 1", "monetdb://localhost:50000/db", engine="ad
 
 The DB-API connection starts with autocommit disabled, as required by PEP 249. Call
 `conn.commit()`, use the connection context manager, or pass `autocommit=True` explicitly.
+Consume or close a query's result stream before executing another statement or changing
+transaction state on the same connection. Use independent connections for parallel queries;
+ADBC permits drivers to block or reject concurrent statements on one connection, and MonetDB's
+single MAPI channel shares transaction state between every statement on that connection.
 
 The same connection works directly with pandas 3:
 
@@ -51,7 +55,7 @@ with dbapi.connect("monetdb://user:password@localhost:50000/db") as conn:
 | Transactions and autocommit | Supported |
 | TLS (`monetdbs://`) | System roots, certificate file, SHA-256 certificate hash, and client certificates |
 | `GetInfo`, `GetObjects`, `GetTableSchema`, `GetTableTypes`, `ExecuteSchema` | Supported |
-| Query cancellation | Not supported by the current Rust MAPI transport |
+| Query cancellation | Not supported: MAPI has one sequential channel and the Rust transport exposes no safe out-of-band interrupt |
 | Partitioned results | Not supported; MAPI exposes one sequential result channel |
 | Substrait plans | Not supported by MonetDB |
 | `GetStatistics` | Not implemented |

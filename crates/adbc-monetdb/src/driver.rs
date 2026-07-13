@@ -374,7 +374,7 @@ impl Optionable for MonetdbConnection {
                 };
                 execute_update(
                     &self.inner,
-                    &format!("SET SCHEMA {}", quote_identifier(schema)),
+                    &format!("SET SCHEMA {}", quote_identifier(schema)?),
                 )?;
             }
             OptionConnection::ReadOnly => {
@@ -895,7 +895,7 @@ impl MonetdbStatement {
                 Status::InvalidArguments,
             ));
         }
-        let target = qualified_name(schema_name, table);
+        let target = qualified_name(schema_name, table)?;
         let schema = reader.schema();
         if schema.fields().is_empty() {
             return Err(error(
@@ -912,7 +912,7 @@ impl MonetdbStatement {
                     .map_err(|value| map_display(value, Status::NotImplemented))?;
                 Ok(format!(
                     "{} {}{}",
-                    quote_identifier(field.name()),
+                    quote_identifier(field.name())?,
                     sql_type,
                     if field.is_nullable() { "" } else { " NOT NULL" }
                 ))
@@ -1527,6 +1527,7 @@ fn parameter_query_reader(
         current: Some(current),
         schema,
         batch_rows,
+        finished: false,
     }))
 }
 
@@ -1629,6 +1630,20 @@ impl Iterator for BinaryReader {
     type Item = std::result::Result<RecordBatch, ArrowError>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.next_inner())) {
+            Ok(result) => result,
+            Err(_) => {
+                self.finished = true;
+                Some(Err(ArrowError::ParseError(
+                    "MonetDB result decoding panicked".into(),
+                )))
+            }
+        }
+    }
+}
+
+impl BinaryReader {
+    fn next_inner(&mut self) -> Option<std::result::Result<RecordBatch, ArrowError>> {
         if self.finished || self.next_row >= self.total_rows {
             self.finished = true;
             return None;
@@ -1673,12 +1688,30 @@ struct ParameterQueryReader {
     current: Option<Box<dyn RecordBatchReader + Send + 'static>>,
     schema: SchemaRef,
     batch_rows: usize,
+    finished: bool,
 }
 
 impl Iterator for ParameterQueryReader {
     type Item = std::result::Result<RecordBatch, ArrowError>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.next_inner())) {
+            Ok(result) => result,
+            Err(_) => {
+                self.finished = true;
+                Some(Err(ArrowError::ParseError(
+                    "MonetDB parameter result decoding panicked".into(),
+                )))
+            }
+        }
+    }
+}
+
+impl ParameterQueryReader {
+    fn next_inner(&mut self) -> Option<std::result::Result<RecordBatch, ArrowError>> {
+        if self.finished {
+            return None;
+        }
         loop {
             if let Some(reader) = &mut self.current
                 && let Some(batch) = reader.next()
@@ -1761,13 +1794,23 @@ impl RecordBatchReader for EmptyReader {
     }
 }
 
-fn quote_identifier(identifier: &str) -> String {
-    format!("\"{}\"", identifier.replace('"', "\"\""))
+fn quote_identifier(identifier: &str) -> Result<String> {
+    if identifier.contains('\0') {
+        return Err(error(
+            "SQL identifier contains a NUL byte",
+            Status::InvalidArguments,
+        ));
+    }
+    Ok(format!("\"{}\"", identifier.replace('"', "\"\"")))
 }
 
-fn qualified_name(schema: Option<&str>, table: &str) -> String {
+fn qualified_name(schema: Option<&str>, table: &str) -> Result<String> {
     match schema {
-        Some(schema) => format!("{}.{}", quote_identifier(schema), quote_identifier(table)),
+        Some(schema) => Ok(format!(
+            "{}.{}",
+            quote_identifier(schema)?,
+            quote_identifier(table)?
+        )),
         None => quote_identifier(table),
     }
 }
@@ -1800,7 +1843,8 @@ mod tests {
 
     #[test]
     fn quotes_identifiers() {
-        assert_eq!(quote_identifier("a\"b"), "\"a\"\"b\"");
+        assert_eq!(quote_identifier("a\"b").unwrap(), "\"a\"\"b\"");
+        assert!(quote_identifier("a\0b").is_err());
     }
 
     #[test]
