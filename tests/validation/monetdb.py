@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from adbc_drivers_validation import model  # pyright: ignore[reportMissingTypeStubs]
+from server_version import MONETDB_SERVER_VERSION
 
 
 class MonetdbQuirks(model.DriverQuirks):
@@ -8,7 +9,7 @@ class MonetdbQuirks(model.DriverQuirks):
     driver = "adbc_driver_monetdb"
     driver_name = "adbc-driver-monetdb"
     vendor_name = "MonetDB"
-    vendor_version = "11.55.7"
+    vendor_version = MONETDB_SERVER_VERSION
     short_version = "11.55"
     features = model.DriverFeatures(
         connection_get_table_schema=True,

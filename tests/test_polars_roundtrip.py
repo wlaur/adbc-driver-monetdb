@@ -1,18 +1,75 @@
 import gc
 import os
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import cast
+from threading import Event, Thread
+from typing import Protocol, cast
 from uuid import UUID
 
 import adbc_driver_manager
 import pandas as pd
 import polars as pl
+import pyarrow as pa  # pyright: ignore[reportMissingTypeStubs]
 import pytest
+from server_version import MONETDB_SERVER_VERSION
 
 from adbc_driver_monetdb import dbapi
+
+
+class _ArrowField(Protocol):
+    @property
+    def metadata(self) -> dict[bytes, bytes] | None: ...
+
+
+class _ArrowSchema(Protocol):
+    def field(self, name: str) -> _ArrowField: ...
+
+
+class _ArrowBatch(Protocol):
+    def __arrow_c_array__(self) -> tuple[object, object]: ...
+
+
+class _ArrowTable(Protocol):
+    @property
+    def schema(self) -> _ArrowSchema: ...
+
+
+class _PyArrow(Protocol):
+    def schema(self, fields: Sequence[object]) -> _ArrowSchema: ...
+
+    def field(
+        self,
+        name: str,
+        data_type: object,
+        *,
+        metadata: dict[bytes, bytes],
+    ) -> object: ...
+
+    def binary(self, width: int) -> object: ...
+
+    def int32(self) -> object: ...
+
+    def duration(self, unit: str) -> object: ...
+
+    def uint64(self) -> object: ...
+
+    def array(self, values: Sequence[object], *, type: object) -> object: ...
+
+    def record_batch(self, arrays: Sequence[object], *, schema: _ArrowSchema) -> _ArrowBatch: ...
+
+
+class _AdbcStatement(Protocol):
+    def set_sql_query(self, query: str) -> None: ...
+
+    def bind(self, data: object, schema: object) -> None: ...
+
+    def execute_update(self) -> int: ...
+
+
+arrow = cast(_PyArrow, pa)
 
 
 @pytest.mark.integration
@@ -39,6 +96,9 @@ def test_polars_uri_resolution_and_streaming_batches(monetdb_uri: str) -> None:
             )
         )
     assert [batch.height for batch in batches] == [131_072, 131_072, 37_856]
+
+    with dbapi.connect(monetdb_uri, db_kwargs={"uri": "not-the-positional-uri"}) as conn:
+        assert conn.execute("SELECT 1").fetchone() == (1,)  # pyright: ignore[reportUnknownMemberType]
 
 
 @pytest.mark.integration
@@ -194,7 +254,7 @@ def test_metadata_and_schema_apis(monetdb_uri: str) -> None:
     with dbapi.connect(monetdb_uri) as conn:
         info = conn.adbc_get_info()
         assert info["vendor_name"] == "MonetDB"
-        assert info["vendor_version"] == "11.55.7"
+        assert info["vendor_version"] == MONETDB_SERVER_VERSION
         assert info["driver_name"] == "adbc-driver-monetdb"
         assert info["driver_adbc_version"] == 1_001_000
         assert "TABLE" in conn.adbc_get_table_types()
@@ -207,6 +267,8 @@ def test_metadata_and_schema_apis(monetdb_uri: str) -> None:
         )
         assert str(table_schema) == ("table_type_id: int16 not null\ntable_type_name: string not null")
         with conn.cursor() as cursor:
+            cursor.execute("SELECT current_timezone")  # pyright: ignore[reportUnknownMemberType]
+            assert cursor.fetchone() == (timedelta(0),)  # pyright: ignore[reportUnknownMemberType]
             query_schema = cast(
                 object,
                 cursor.adbc_execute_schema(  # pyright: ignore[reportUnknownMemberType]
@@ -214,6 +276,32 @@ def test_metadata_and_schema_apis(monetdb_uri: str) -> None:
                 ),
             )
             assert str(query_schema) == "value: int32"
+            with pytest.raises(adbc_driver_manager.ProgrammingError, match="escape"):
+                conn.adbc_get_objects(db_schema_filter="invalid\\")  # pyright: ignore[reportUnknownMemberType]
+
+
+@pytest.mark.integration
+def test_clob_and_char_catalog_types_map_to_arrow_strings(monetdb_uri: str) -> None:
+    with dbapi.connect(monetdb_uri) as conn, conn.cursor() as cursor:
+        try:
+            cursor.execute("CREATE TABLE catalog_strings(c CLOB, fixed CHAR(8))")  # pyright: ignore[reportUnknownMemberType]
+            schema = cast(
+                object,
+                conn.adbc_get_table_schema("catalog_strings"),  # pyright: ignore[reportUnknownMemberType]
+            )
+            assert str(schema) == "c: string\nfixed: string"
+        finally:
+            cursor.execute("DROP TABLE IF EXISTS catalog_strings")  # pyright: ignore[reportUnknownMemberType]
+
+
+@pytest.mark.integration
+def test_user_prepare_statement_has_an_actionable_error(monetdb_uri: str) -> None:
+    with (
+        dbapi.connect(monetdb_uri) as conn,
+        conn.cursor() as cursor,
+        pytest.raises(adbc_driver_manager.ProgrammingError, match=r"Statement::prepare"),
+    ):
+        cursor.execute("PREPARE SELECT 1")  # pyright: ignore[reportUnknownMemberType]
 
 
 @pytest.mark.integration
@@ -276,6 +364,13 @@ def test_untyped_parameter_fallback_is_eager_and_metadata_only(
                 ),
             )
             assert str(schema) == "value: null"
+            mixed_schema = cast(
+                object,
+                cursor.adbc_execute_schema(  # pyright: ignore[reportUnknownMemberType]
+                    "SELECT ? AS unknown, CAST(1 AS INT) AS known", [42]
+                ),
+            )
+            assert str(mixed_schema) == "unknown: null\nknown: int32"
             cursor.execute("SELECT ? AS value")  # pyright: ignore[reportUnknownMemberType]
             assert cursor.fetchone() == (42,)  # pyright: ignore[reportUnknownMemberType]
 
@@ -341,7 +436,10 @@ def test_prepared_parameters_and_executemany(monetdb_uri: str) -> None:
                 object,
                 cursor.adbc_prepare("SELECT ? + ?"),  # pyright: ignore[reportUnknownMemberType]
             )
-            assert str(parameter_schema) == "0: decimal128(38, 0)\n1: decimal128(38, 0)"
+            rendered_parameter_schema = str(parameter_schema)
+            assert "0: decimal128(38, 0)" in rendered_parameter_schema
+            assert "1: decimal128(38, 0)" in rendered_parameter_schema
+            assert rendered_parameter_schema.count("monetdb.hugeint") == 2
             cursor.execute(  # pyright: ignore[reportUnknownMemberType]
                 "SELECT ? AS i, '?' AS literal_qmark, ? AS s, ? AS b, "
                 "CAST(? AS DECIMAL(9, 2)) AS d, ? AS dt, ? AS tm, ? AS ts, ? AS tstz, ? AS iv",
@@ -392,7 +490,8 @@ def test_native_prepared_statement_lifecycle(monetdb_uri: str) -> None:
                 object,
                 prepared.adbc_prepare("SELECT 1 + ? AS value"),  # pyright: ignore[reportUnknownMemberType]
             )
-            assert str(schema) == "0: decimal128(38, 0)"
+            assert "0: decimal128(38, 0)" in str(schema)
+            assert "monetdb.hugeint" in str(schema)
             with conn.cursor() as audit:
                 audit.execute("SELECT COUNT(*) FROM sys.prepared_statements")  # pyright: ignore[reportUnknownMemberType]
                 row = cast(
@@ -416,6 +515,17 @@ def test_native_prepared_statement_lifecycle(monetdb_uri: str) -> None:
             )
             assert row is not None
             assert row[0] == 0
+
+
+@pytest.mark.integration
+def test_failed_prepare_recovers_user_transaction(monetdb_uri: str) -> None:
+    with dbapi.connect(monetdb_uri, autocommit=False) as conn, conn.cursor() as cursor:
+        cursor.adbc_statement.set_sql_query("SELECT ? +")  # pyright: ignore[reportUnknownMemberType]
+        with pytest.raises(adbc_driver_manager.Error):
+            cursor.adbc_statement.prepare()  # pyright: ignore[reportUnknownMemberType]
+        cursor.execute("SELECT 42")  # pyright: ignore[reportUnknownMemberType]
+        assert cursor.fetchone() == (42,)  # pyright: ignore[reportUnknownMemberType]
+        conn.rollback()
 
 
 @pytest.mark.integration
@@ -521,6 +631,66 @@ def test_executemany_is_atomic_in_autocommit_mode(monetdb_uri: str) -> None:
 
 
 @pytest.mark.integration
+def test_empty_parameter_streams_are_successful_noops(monetdb_uri: str) -> None:
+    with dbapi.connect(monetdb_uri) as conn, conn.cursor() as cursor:
+        try:
+            cursor.execute("CREATE TABLE empty_parameters(value INT)")  # pyright: ignore[reportUnknownMemberType]
+            cursor.executemany(  # pyright: ignore[reportUnknownMemberType]
+                "INSERT INTO empty_parameters VALUES (?)", []
+            )
+            cursor.execute(  # pyright: ignore[reportUnknownMemberType]
+                "SELECT ? AS value", pl.DataFrame({"value": pl.Series([], dtype=pl.Int32)})
+            )
+            assert cursor.fetchall() == []  # pyright: ignore[reportUnknownMemberType]
+            cursor.execute("SELECT COUNT(*) FROM empty_parameters")  # pyright: ignore[reportUnknownMemberType]
+            assert cursor.fetchone() == (0,)  # pyright: ignore[reportUnknownMemberType]
+        finally:
+            cursor.execute("DROP TABLE IF EXISTS empty_parameters")  # pyright: ignore[reportUnknownMemberType]
+
+
+@pytest.mark.integration
+def test_enabling_autocommit_commits_the_open_transaction(monetdb_uri: str) -> None:
+    with dbapi.connect(monetdb_uri, autocommit=True) as setup, setup.cursor() as cursor:
+        cursor.execute("CREATE TABLE autocommit_transition(value INT)")  # pyright: ignore[reportUnknownMemberType]
+    try:
+        with dbapi.connect(monetdb_uri) as conn, conn.cursor() as cursor:
+            cursor.execute("INSERT INTO autocommit_transition VALUES (1)")  # pyright: ignore[reportUnknownMemberType]
+            conn.adbc_connection.set_autocommit(True)
+            with dbapi.connect(monetdb_uri, autocommit=True) as audit, audit.cursor() as audit_cursor:
+                audit_cursor.execute("SELECT COUNT(*) FROM autocommit_transition")  # pyright: ignore[reportUnknownMemberType]
+                assert audit_cursor.fetchone() == (1,)  # pyright: ignore[reportUnknownMemberType]
+    finally:
+        with dbapi.connect(monetdb_uri, autocommit=True) as cleanup, cleanup.cursor() as cursor:
+            cursor.execute("DROP TABLE IF EXISTS autocommit_transition")  # pyright: ignore[reportUnknownMemberType]
+
+
+@pytest.mark.integration
+def test_failed_ingest_uses_a_savepoint_inside_user_transaction(monetdb_uri: str) -> None:
+    with dbapi.connect(monetdb_uri, autocommit=True) as setup, setup.cursor() as cursor:
+        cursor.execute("CREATE TABLE savepoint_prior(value INT)")  # pyright: ignore[reportUnknownMemberType]
+    try:
+        with dbapi.connect(monetdb_uri) as conn, conn.cursor() as cursor:
+            cursor.execute("INSERT INTO savepoint_prior VALUES (7)")  # pyright: ignore[reportUnknownMemberType]
+            poisoned = pl.DataFrame({"value": pl.Series([float("inf")], dtype=pl.Float64)})
+            with pytest.raises(adbc_driver_manager.DataError, match="non-finite"):
+                cursor.adbc_ingest("savepoint_target", poisoned, mode="replace")  # pyright: ignore[reportUnknownMemberType]
+            cursor.execute("SELECT value FROM savepoint_prior")  # pyright: ignore[reportUnknownMemberType]
+            assert cursor.fetchone() == (7,)  # pyright: ignore[reportUnknownMemberType]
+            conn.commit()
+        with dbapi.connect(monetdb_uri, autocommit=True) as audit, audit.cursor() as cursor:
+            cursor.execute("SELECT COUNT(*) FROM savepoint_prior")  # pyright: ignore[reportUnknownMemberType]
+            assert cursor.fetchone() == (1,)  # pyright: ignore[reportUnknownMemberType]
+            cursor.execute(  # pyright: ignore[reportUnknownMemberType]
+                "SELECT COUNT(*) FROM sys.tables WHERE name = 'savepoint_target'"
+            )
+            assert cursor.fetchone() == (0,)  # pyright: ignore[reportUnknownMemberType]
+    finally:
+        with dbapi.connect(monetdb_uri, autocommit=True) as cleanup, cleanup.cursor() as cursor:
+            cursor.execute("DROP TABLE IF EXISTS savepoint_target")  # pyright: ignore[reportUnknownMemberType]
+            cursor.execute("DROP TABLE IF EXISTS savepoint_prior")  # pyright: ignore[reportUnknownMemberType]
+
+
+@pytest.mark.integration
 def test_dbapi_default_transaction_rolls_back(monetdb_uri: str) -> None:
     with dbapi.connect(monetdb_uri, autocommit=True) as setup, setup.cursor() as cursor:
         cursor.execute("CREATE TABLE rollback_probe(value INT)")  # pyright: ignore[reportUnknownMemberType]
@@ -589,7 +759,7 @@ def test_dtype_matrix_roundtrip(monetdb_uri: str) -> None:
 
 
 @pytest.mark.integration
-def test_float_nan_is_rejected_on_write(monetdb_uri: str) -> None:
+def test_non_finite_floats_are_rejected_on_write_and_bind(monetdb_uri: str) -> None:
     frame = pl.DataFrame(
         {
             "f32": pl.Series([float("nan"), None, 1.5], dtype=pl.Float32),
@@ -598,9 +768,115 @@ def test_float_nan_is_rejected_on_write(monetdb_uri: str) -> None:
     )
     with (
         dbapi.connect(monetdb_uri) as conn,
-        pytest.raises(adbc_driver_manager.DataError, match="NaN is MonetDB"),
+        pytest.raises(adbc_driver_manager.DataError, match="non-finite"),
     ):
         frame.write_database("nan_semantics", conn, if_table_exists="replace", engine="adbc")  # pyright: ignore[reportUnknownMemberType]
+    with dbapi.connect(monetdb_uri) as conn, conn.cursor() as cursor:
+        for value in [float("nan"), float("inf"), float("-inf")]:
+            with pytest.raises(adbc_driver_manager.DataError, match="non-finite"):
+                cursor.execute("SELECT ?", [value])  # pyright: ignore[reportUnknownMemberType]
+
+
+@pytest.mark.integration
+def test_extension_parameters_and_hugeint_timetz_append_back(monetdb_uri: str) -> None:
+    extension = b"ARROW:extension:name"
+    schema = arrow.schema(
+        [
+            arrow.field("u", arrow.binary(16), metadata={extension: b"arrow.uuid"}),
+            arrow.field("m", arrow.int32(), metadata={extension: b"monetdb.interval_month"}),
+            arrow.field("d", arrow.duration("ms"), metadata={extension: b"monetdb.interval_day"}),
+            arrow.field("o", arrow.uint64(), metadata={extension: b"monetdb.oid"}),
+        ]
+    )
+    batch = arrow.record_batch(
+        [
+            arrow.array([UUID("444fcb84-9a7d-4fe1-adfa-7eae290328c3").bytes], type=arrow.binary(16)),
+            arrow.array([18], type=arrow.int32()),
+            arrow.array([86_401_500], type=arrow.duration("ms")),
+            arrow.array([42], type=arrow.uint64()),
+        ],
+        schema=schema,
+    )
+    ingest_schema = arrow.schema(
+        [
+            arrow.field("u", arrow.binary(16), metadata={extension: b"arrow.uuid"}),
+            arrow.field("m", arrow.int32(), metadata={extension: b"monetdb.interval_month"}),
+            arrow.field("d", arrow.duration("ms"), metadata={extension: b"monetdb.interval_day"}),
+        ]
+    )
+    ingest_batch = arrow.record_batch(
+        [
+            arrow.array([UUID("444fcb84-9a7d-4fe1-adfa-7eae290328c3").bytes], type=arrow.binary(16)),
+            arrow.array([18], type=arrow.int32()),
+            arrow.array([86_401_500], type=arrow.duration("ms")),
+        ],
+        schema=ingest_schema,
+    )
+    with dbapi.connect(monetdb_uri) as conn, conn.cursor() as cursor:
+        try:
+            cursor.execute(  # pyright: ignore[reportUnknownMemberType]
+                "CREATE TABLE extension_bind(u UUID, m INTERVAL MONTH, d INTERVAL DAY, o OID)"
+            )
+            cursor.execute(  # pyright: ignore[reportUnknownMemberType]
+                "CREATE TABLE extension_ingest(u UUID, m INTERVAL MONTH, d INTERVAL DAY)"
+            )
+            cursor.execute(  # pyright: ignore[reportUnknownMemberType]
+                "CREATE TABLE extension_oid_ingest(u UUID, m INTERVAL MONTH, d INTERVAL DAY, o OID)"
+            )
+            statement = cast(_AdbcStatement, cursor.adbc_statement)
+            statement.set_sql_query("INSERT INTO extension_bind VALUES (?, ?, ?, ?)")
+            schema_capsule, array_capsule = batch.__arrow_c_array__()
+            statement.bind(array_capsule, schema_capsule)
+            assert statement.execute_update() == 1
+            cursor.execute("SELECT u, m, d, o FROM extension_bind")  # pyright: ignore[reportUnknownMemberType]
+            assert cursor.fetchone() == (  # pyright: ignore[reportUnknownMemberType]
+                UUID("444fcb84-9a7d-4fe1-adfa-7eae290328c3"),
+                18,
+                timedelta(days=1, milliseconds=1_500),
+                42,
+            )
+            cursor.execute("SELECT o FROM extension_bind")  # pyright: ignore[reportUnknownMemberType]
+            oid_table = cast(
+                _ArrowTable,
+                cursor.fetch_arrow_table(),  # pyright: ignore[reportUnknownMemberType]
+            )
+            assert oid_table.schema.field("o").metadata == {extension: b"monetdb.oid"}
+            assert cursor.adbc_ingest("extension_ingest", ingest_batch, mode="append") == 1  # pyright: ignore[reportUnknownMemberType]
+            cursor.execute("SELECT u, m, d FROM extension_ingest")  # pyright: ignore[reportUnknownMemberType]
+            assert cursor.fetchone() == (  # pyright: ignore[reportUnknownMemberType]
+                UUID("444fcb84-9a7d-4fe1-adfa-7eae290328c3"),
+                18,
+                timedelta(days=1, milliseconds=1_500),
+            )
+            with pytest.raises(adbc_driver_manager.NotSupportedError, match="OID"):
+                cursor.adbc_ingest("extension_oid_ingest", batch, mode="append")  # pyright: ignore[reportUnknownMemberType]
+
+            cursor.execute("CREATE TABLE extension_source(h HUGEINT, t TIME WITH TIME ZONE)")  # pyright: ignore[reportUnknownMemberType]
+            cursor.execute("CREATE TABLE extension_dest(h HUGEINT, t TIME WITH TIME ZONE)")  # pyright: ignore[reportUnknownMemberType]
+            cursor.execute(  # pyright: ignore[reportUnknownMemberType]
+                "INSERT INTO extension_source VALUES "
+                "(123456789012345678901234567890, TIMETZ '12:34:56.123456+00:00'), "
+                "(-7, TIMETZ '01:02:03+00:00')"
+            )
+            cursor.execute("SELECT h, t FROM extension_source ORDER BY h")  # pyright: ignore[reportUnknownMemberType]
+            table = cast(
+                _ArrowTable,
+                cursor.fetch_arrow_table(),  # pyright: ignore[reportUnknownMemberType]
+            )
+            assert table.schema.field("h").metadata == {extension: b"monetdb.hugeint"}
+            assert table.schema.field("t").metadata == {extension: b"monetdb.timetz"}
+            assert cursor.adbc_ingest("extension_dest", table, mode="append") == 2  # pyright: ignore[reportUnknownMemberType]
+            cursor.execute("SELECT CAST(h AS STRING) FROM extension_dest ORDER BY h")  # pyright: ignore[reportUnknownMemberType]
+            assert cursor.fetchall() == [  # pyright: ignore[reportUnknownMemberType]
+                ("-7",),
+                ("123456789012345678901234567890",),
+            ]
+        finally:
+            cursor.execute("DROP TABLE IF EXISTS extension_dest")  # pyright: ignore[reportUnknownMemberType]
+            cursor.execute("DROP TABLE IF EXISTS extension_source")  # pyright: ignore[reportUnknownMemberType]
+            cursor.execute("DROP TABLE IF EXISTS extension_ingest")  # pyright: ignore[reportUnknownMemberType]
+            cursor.execute("DROP TABLE IF EXISTS extension_oid_ingest")  # pyright: ignore[reportUnknownMemberType]
+            cursor.execute("DROP TABLE IF EXISTS extension_bind")  # pyright: ignore[reportUnknownMemberType]
 
 
 @pytest.mark.integration
@@ -672,6 +948,42 @@ def test_parallel_connections_and_interleaved_cursors(monetdb_uri: str) -> None:
 
         with ThreadPoolExecutor(max_workers=4) as pool:
             assert list(pool.map(shared_connection, range(8))) == [500_500 + value for value in range(8)]
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not Path("/proc/self/statm").exists(), reason="RSS assertion uses Linux procfs")
+def test_wide_numeric_read_avoids_double_residency(monetdb_uri: str) -> None:
+    def rss_bytes() -> int:
+        pages = int(Path("/proc/self/statm").read_text().split()[1])
+        return pages * os.sysconf("SC_PAGE_SIZE")
+
+    columns = ", ".join(f"CAST(value + {index} AS REAL) AS v{index}" for index in range(256))
+    with dbapi.connect(monetdb_uri) as conn:
+        pl.read_database("SELECT 1", conn)  # pyright: ignore[reportUnknownMemberType]
+        gc.collect()
+        baseline = rss_bytes()
+        peak = baseline
+        stop = Event()
+
+        def sample() -> None:
+            nonlocal peak
+            while not stop.wait(0.001):
+                peak = max(peak, rss_bytes())
+
+        sampler = Thread(target=sample, daemon=True)
+        sampler.start()
+        try:
+            frame = pl.read_database(  # pyright: ignore[reportUnknownMemberType]
+                f"SELECT {columns} FROM sys.generate_series(0, 40000)",
+                conn,
+            )
+        finally:
+            stop.set()
+            sampler.join(timeout=5)
+        assert not sampler.is_alive()
+        assert frame.shape == (40_000, 256)
+        materialized = frame.estimated_size()
+        assert peak - baseline < materialized * 3 // 2 + 16 * 1024 * 1024
 
 
 @pytest.mark.integration

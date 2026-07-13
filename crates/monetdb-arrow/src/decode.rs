@@ -9,10 +9,15 @@ use std::{fmt, net::IpAddr, sync::Arc};
 use arrow_array::{
     ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, DurationMillisecondArray,
     FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
-    Int64Array, RecordBatch, StringArray, Time64MicrosecondArray, TimestampMicrosecondArray,
-    UInt64Array,
+    Int64Array, RecordBatch, RecordBatchOptions, StringArray, Time64MicrosecondArray,
+    TimestampMicrosecondArray, UInt64Array,
     builder::{BinaryBuilder, BooleanBuilder, FixedSizeBinaryBuilder, StringBuilder},
+    types::{
+        ArrowPrimitiveType, DurationMillisecondType, Float32Type, Float64Type, Int8Type, Int16Type,
+        Int32Type, Int64Type, UInt64Type,
+    },
 };
+use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use chrono::{Datelike, FixedOffset, NaiveDate, NaiveTime, TimeZone, Timelike};
 use monetdb::{
@@ -24,13 +29,14 @@ use monetdb::{
 };
 use rayon::prelude::*;
 
-use crate::exportbin::{FrameError, parse_frame};
+use crate::exportbin::{ExportbinFrame, FrameError, parse_frame};
 
 #[derive(Debug)]
 pub enum DecodeError {
     Frame(FrameError),
     ResultId { expected: u64, actual: i64 },
     StartRow { expected: u64, actual: u64 },
+    RowCount { requested: usize, actual: usize },
     ColumnCount { expected: usize, actual: usize },
     Length { expected: usize, actual: usize },
     InvalidValue { row: usize, message: &'static str },
@@ -50,6 +56,12 @@ impl fmt::Display for DecodeError {
             }
             Self::StartRow { expected, actual } => {
                 write!(f, "frame starts at row {actual}; expected {expected}")
+            }
+            Self::RowCount { requested, actual } => {
+                write!(
+                    f,
+                    "frame contains {actual} rows; at most {requested} were requested"
+                )
             }
             Self::ColumnCount { expected, actual } => {
                 write!(
@@ -129,8 +141,210 @@ pub fn decode_frame(
     columns: &[ResultColumn],
     expected_result_id: u64,
     expected_start_row: u64,
+    requested_rows: usize,
 ) -> Result<RecordBatch, DecodeError> {
     let frame = parse_frame(frame)?;
+    let row_count = validate_frame(
+        &frame,
+        columns,
+        expected_result_id,
+        expected_start_row,
+        requested_rows,
+    )?;
+    let fields = columns
+        .iter()
+        .map(field_for_column)
+        .collect::<Result<Vec<_>, _>>()?;
+    let frame_bytes = frame
+        .columns
+        .iter()
+        .fold(0usize, |total, column| total.saturating_add(column.len()));
+    let arrays = if columns.len() > 1 && frame_bytes >= 1024 * 1024 {
+        columns
+            .par_iter()
+            .zip(frame.columns.par_iter())
+            .map(|(column, bytes)| decode_column(column.sql_type(), bytes, row_count))
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        columns
+            .iter()
+            .zip(frame.columns)
+            .map(|(column, bytes)| decode_column(column.sql_type(), bytes, row_count))
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    record_batch(fields, arrays, row_count)
+}
+
+/// Return whether the result's fixed-width layout is dominated by columns
+/// that can share an owned wire frame. Variable-width columns use the reusable
+/// copy path so multi-window reads do not retain or repeatedly allocate frames.
+pub fn prefers_owned_frame(columns: &[ResultColumn]) -> bool {
+    prefers_owned_types(columns.iter().map(|column| *column.sql_type()))
+}
+
+fn prefers_owned_types(types: impl IntoIterator<Item = MonetType>) -> bool {
+    let mut adoptable_bytes = 0usize;
+    let mut frame_bytes = 0usize;
+    for data_type in types {
+        let (width, adoptable) = match data_type {
+            MonetType::Bool | MonetType::TinyInt => (1, data_type == MonetType::TinyInt),
+            MonetType::SmallInt => (2, true),
+            MonetType::Int | MonetType::Real | MonetType::MonthInterval => (4, true),
+            MonetType::BigInt
+            | MonetType::Oid
+            | MonetType::Double
+            | MonetType::DayInterval
+            | MonetType::SecInterval => (8, true),
+            MonetType::HugeInt | MonetType::Uuid => (16, false),
+            MonetType::Decimal(precision, _) => match precision {
+                1..=2 => (1, false),
+                3..=4 => (2, false),
+                5..=9 => (4, false),
+                10..=18 => (8, false),
+                19..=38 => (16, false),
+                _ => return false,
+            },
+            MonetType::Time | MonetType::TimeTz => (8, false),
+            MonetType::Date => (4, false),
+            MonetType::Timestamp | MonetType::TimestampTz => (12, false),
+            MonetType::Varchar(_)
+            | MonetType::Blob
+            | MonetType::Url
+            | MonetType::Inet
+            | MonetType::Json
+            | MonetType::Geometry
+            | MonetType::GeometryA
+            | MonetType::Xml => return false,
+        };
+        frame_bytes = frame_bytes.saturating_add(width);
+        if adoptable {
+            adoptable_bytes = adoptable_bytes.saturating_add(width);
+        }
+    }
+    adoption_is_worthwhile(adoptable_bytes, frame_bytes)
+}
+
+/// Decode a frame while allowing fixed-width Arrow arrays to share its owned
+/// allocation. Columns that are not layout-compatible or aligned use the copy
+/// decoder.
+pub fn decode_frame_owned(
+    frame: Vec<u8>,
+    columns: &[ResultColumn],
+    expected_result_id: u64,
+    expected_start_row: u64,
+    requested_rows: usize,
+) -> Result<RecordBatch, DecodeError> {
+    let base = frame.as_ptr() as usize;
+    let (row_count, ranges, frame_bytes) = {
+        let parsed = parse_frame(&frame)?;
+        let row_count = validate_frame(
+            &parsed,
+            columns,
+            expected_result_id,
+            expected_start_row,
+            requested_rows,
+        )?;
+        let mut frame_bytes = 0usize;
+        let ranges = parsed
+            .columns
+            .iter()
+            .map(|bytes| {
+                frame_bytes = frame_bytes.saturating_add(bytes.len());
+                let start = (bytes.as_ptr() as usize).checked_sub(base).ok_or(
+                    DecodeError::InvalidValue {
+                        row: 0,
+                        message: "column pointer precedes its frame allocation",
+                    },
+                )?;
+                let end = start
+                    .checked_add(bytes.len())
+                    .filter(|end| *end <= frame.len())
+                    .ok_or(DecodeError::InvalidValue {
+                        row: 0,
+                        message: "column range exceeds its frame allocation",
+                    })?;
+                Ok(start..end)
+            })
+            .collect::<Result<Vec<_>, DecodeError>>()?;
+        (row_count, ranges, frame_bytes)
+    };
+    if !should_adopt_frame(&frame, columns, &ranges, frame_bytes) {
+        return decode_frame(
+            &frame,
+            columns,
+            expected_result_id,
+            expected_start_row,
+            requested_rows,
+        );
+    }
+    let fields = columns
+        .iter()
+        .map(field_for_column)
+        .collect::<Result<Vec<_>, _>>()?;
+    let buffer = Buffer::from_vec(frame);
+    let decode = |(column, range): (&ResultColumn, &std::ops::Range<usize>)| {
+        decode_owned_column(&buffer, range, column.sql_type(), row_count)
+    };
+    let arrays = if columns.len() > 1 && frame_bytes >= 1024 * 1024 {
+        columns
+            .par_iter()
+            .zip(ranges.par_iter())
+            .map(decode)
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        columns
+            .iter()
+            .zip(ranges.iter())
+            .map(decode)
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    record_batch(fields, arrays, row_count)
+}
+
+fn should_adopt_frame(
+    frame: &[u8],
+    columns: &[ResultColumn],
+    ranges: &[std::ops::Range<usize>],
+    frame_bytes: usize,
+) -> bool {
+    if cfg!(target_endian = "big") || frame_bytes == 0 {
+        return false;
+    }
+    let adoptable_bytes = columns
+        .iter()
+        .zip(ranges)
+        .filter_map(|(column, range)| {
+            let alignment = match column.sql_type() {
+                MonetType::TinyInt => std::mem::align_of::<i8>(),
+                MonetType::SmallInt => std::mem::align_of::<i16>(),
+                MonetType::Int | MonetType::Real | MonetType::MonthInterval => {
+                    std::mem::align_of::<i32>()
+                }
+                MonetType::BigInt
+                | MonetType::Oid
+                | MonetType::Double
+                | MonetType::DayInterval
+                | MonetType::SecInterval => std::mem::align_of::<i64>(),
+                _ => return None,
+            };
+            let pointer = frame.as_ptr().wrapping_add(range.start) as usize;
+            pointer.is_multiple_of(alignment).then_some(range.len())
+        })
+        .fold(0usize, usize::saturating_add);
+    adoption_is_worthwhile(adoptable_bytes, frame_bytes)
+}
+
+fn adoption_is_worthwhile(adoptable_bytes: usize, frame_bytes: usize) -> bool {
+    frame_bytes > 0 && adoptable_bytes >= frame_bytes - frame_bytes / 4
+}
+
+fn validate_frame(
+    frame: &ExportbinFrame<'_>,
+    columns: &[ResultColumn],
+    expected_result_id: u64,
+    expected_start_row: u64,
+    requested_rows: usize,
+) -> Result<usize, DecodeError> {
     if u64::try_from(frame.result_id) != Ok(expected_result_id) {
         return Err(DecodeError::ResultId {
             expected: expected_result_id,
@@ -153,28 +367,99 @@ pub fn decode_frame(
         row: 0,
         message: "row count does not fit in memory",
     })?;
-    let fields = columns
-        .iter()
-        .map(field_for_column)
-        .collect::<Result<Vec<_>, _>>()?;
-    let frame_bytes = frame
-        .columns
-        .iter()
-        .fold(0usize, |total, column| total.saturating_add(column.len()));
-    let arrays = if columns.len() > 1 && frame_bytes >= 1024 * 1024 {
-        columns
-            .par_iter()
-            .zip(frame.columns.par_iter())
-            .map(|(column, bytes)| decode_column(column.sql_type(), bytes, row_count))
-            .collect::<Result<Vec<_>, _>>()?
-    } else {
-        columns
-            .iter()
-            .zip(frame.columns)
-            .map(|(column, bytes)| decode_column(column.sql_type(), bytes, row_count))
-            .collect::<Result<Vec<_>, _>>()?
+    if row_count > requested_rows {
+        return Err(DecodeError::RowCount {
+            requested: requested_rows,
+            actual: row_count,
+        });
+    }
+    Ok(row_count)
+}
+
+fn record_batch(
+    fields: Vec<Field>,
+    arrays: Vec<ArrayRef>,
+    row_count: usize,
+) -> Result<RecordBatch, DecodeError> {
+    let options = RecordBatchOptions::new().with_row_count(Some(row_count));
+    Ok(RecordBatch::try_new_with_options(
+        Arc::new(Schema::new(fields)),
+        arrays,
+        &options,
+    )?)
+}
+
+fn decode_owned_column(
+    buffer: &Buffer,
+    range: &std::ops::Range<usize>,
+    data_type: &MonetType,
+    rows: usize,
+) -> Result<ArrayRef, DecodeError> {
+    let adopted = match data_type {
+        MonetType::TinyInt => {
+            adopt_primitive::<Int8Type, _>(buffer, range, rows, |value| value == i8::MIN)?
+        }
+        MonetType::SmallInt => {
+            adopt_primitive::<Int16Type, _>(buffer, range, rows, |value| value == i16::MIN)?
+        }
+        MonetType::Int => {
+            adopt_primitive::<Int32Type, _>(buffer, range, rows, |value| value == i32::MIN)?
+        }
+        MonetType::BigInt => {
+            adopt_primitive::<Int64Type, _>(buffer, range, rows, |value| value == i64::MIN)?
+        }
+        MonetType::Oid => {
+            adopt_primitive::<UInt64Type, _>(buffer, range, rows, |value| value == 1 << 63)?
+        }
+        MonetType::Real => adopt_primitive::<Float32Type, _>(buffer, range, rows, f32::is_nan)?,
+        MonetType::Double => adopt_primitive::<Float64Type, _>(buffer, range, rows, f64::is_nan)?,
+        MonetType::MonthInterval => {
+            adopt_primitive::<Int32Type, _>(buffer, range, rows, |value| value == i32::MIN)?
+        }
+        MonetType::DayInterval | MonetType::SecInterval => {
+            adopt_primitive::<DurationMillisecondType, _>(buffer, range, rows, |value| {
+                value == i64::MIN
+            })?
+        }
+        _ => None,
     };
-    Ok(RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)?)
+    match adopted {
+        Some(array) => Ok(array),
+        None => decode_column(data_type, &buffer.as_slice()[range.clone()], rows),
+    }
+}
+
+fn adopt_primitive<T, F>(
+    buffer: &Buffer,
+    range: &std::ops::Range<usize>,
+    rows: usize,
+    is_null: F,
+) -> Result<Option<ArrayRef>, DecodeError>
+where
+    T: ArrowPrimitiveType,
+    T::Native: Copy,
+    F: Fn(T::Native) -> bool + Copy,
+{
+    let bytes = &buffer.as_slice()[range.clone()];
+    expect_fixed(bytes, rows, std::mem::size_of::<T::Native>())?;
+    if cfg!(target_endian = "big")
+        || bytes
+            .as_ptr()
+            .align_offset(std::mem::align_of::<T::Native>())
+            != 0
+    {
+        return Ok(None);
+    }
+    let values =
+        ScalarBuffer::<T::Native>::new(buffer.slice_with_length(range.start, range.len()), 0, rows);
+    let has_nulls = values.iter().copied().any(is_null);
+    let nulls = has_nulls.then(|| {
+        NullBuffer::new(BooleanBuffer::collect_bool(rows, |row| {
+            !is_null(values[row])
+        }))
+    });
+    let array = arrow_array::PrimitiveArray::<T>::try_new(values, nulls)?;
+    Ok(Some(Arc::new(array)))
 }
 
 /// Decode the current inline text row of a MAPI result through the same
@@ -334,7 +619,7 @@ fn null_wire_value(data_type: &MonetType) -> Result<Vec<u8>, DecodeError> {
         MonetType::HugeInt => i128::MIN.to_le_bytes().to_vec(),
         MonetType::Oid => (1u64 << 63).to_le_bytes().to_vec(),
         MonetType::Decimal(precision, _) => match precision {
-            0..=2 => i8::MIN.to_le_bytes().to_vec(),
+            1..=2 => i8::MIN.to_le_bytes().to_vec(),
             3..=4 => i16::MIN.to_le_bytes().to_vec(),
             5..=9 => i32::MIN.to_le_bytes().to_vec(),
             10..=18 => i64::MIN.to_le_bytes().to_vec(),
@@ -374,7 +659,7 @@ fn decimal_wire_value(value: i128, precision: u8) -> Result<Vec<u8>, DecodeError
         };
     }
     Ok(match precision {
-        0..=2 => narrow!(i8),
+        1..=2 => narrow!(i8),
         3..=4 => narrow!(i16),
         5..=9 => narrow!(i32),
         10..=18 => narrow!(i64),
@@ -508,10 +793,12 @@ pub fn field_for_monet_type(
     let extension = match data_type {
         MonetType::Json => Some("arrow.json"),
         MonetType::Uuid => Some("arrow.uuid"),
+        MonetType::HugeInt => Some("monetdb.hugeint"),
         MonetType::Oid => Some("monetdb.oid"),
         MonetType::Url => Some("monetdb.url"),
         MonetType::MonthInterval => Some("monetdb.interval_month"),
         MonetType::DayInterval => Some("monetdb.interval_day"),
+        MonetType::TimeTz => Some("monetdb.timetz"),
         _ => None,
     };
     if let Some(name) = extension {
@@ -582,11 +869,12 @@ pub fn decode_column(
             i64::MIN,
             i64::from_le_bytes,
         )?)),
-        MonetType::HugeInt => Arc::new(decimal_array(
-            decode_signed::<16, i128>(bytes, row_count, i128::MIN, i128::from_le_bytes)?,
-            38,
-            0,
-        )?),
+        MonetType::HugeInt => Arc::new(hugeint_array(decode_signed::<16, i128>(
+            bytes,
+            row_count,
+            i128::MIN,
+            i128::from_le_bytes,
+        )?)?),
         MonetType::Oid => Arc::new(UInt64Array::from(decode_signed::<8, u64>(
             bytes,
             row_count,
@@ -713,7 +1001,7 @@ fn decode_decimal(
     scale: i8,
 ) -> Result<Decimal128Array, DecodeError> {
     let values = match precision {
-        0..=2 => decode_signed::<1, i8>(bytes, rows, i8::MIN, i8::from_le_bytes)?
+        1..=2 => decode_signed::<1, i8>(bytes, rows, i8::MIN, i8::from_le_bytes)?
             .into_iter()
             .map(|value| value.map(i128::from))
             .collect(),
@@ -765,11 +1053,26 @@ fn decimal_array(
     Ok(Decimal128Array::from(values).with_precision_and_scale(precision, scale)?)
 }
 
+fn hugeint_array(values: Vec<Option<i128>>) -> Result<Decimal128Array, DecodeError> {
+    let limit = 10i128.pow(38);
+    if let Some((row, _)) = values
+        .iter()
+        .enumerate()
+        .find(|(_, value)| value.is_some_and(|value| value <= -limit || value >= limit))
+    {
+        return Err(DecodeError::InvalidValue {
+            row,
+            message: "HUGEINT exceeds Arrow Decimal128's supported 38-digit range",
+        });
+    }
+    Ok(Decimal128Array::from(values).with_precision_and_scale(38, 0)?)
+}
+
 pub(crate) fn decode_strings(bytes: &[u8], rows: usize) -> Result<StringArray, DecodeError> {
     if rows > bytes.len() {
-        return Err(DecodeError::Length {
-            expected: rows,
-            actual: bytes.len(),
+        return Err(DecodeError::InvalidValue {
+            row: 0,
+            message: "string column contains fewer encoded bytes than declared rows",
         });
     }
     if bytes.len() > i32::MAX as usize {
@@ -789,7 +1092,7 @@ fn decode_strings_without_backrefs(
     rows: usize,
 ) -> Result<Option<StringArray>, DecodeError> {
     let mut builder = StringBuilder::with_capacity(rows, bytes.len());
-    let mut pos = 0;
+    let mut pos = 0usize;
     let mut value_bytes = 0usize;
     for row in 0..rows {
         let Some(&first) = bytes.get(pos) else {
@@ -846,6 +1149,7 @@ fn decode_strings_with_backrefs(bytes: &[u8], rows: usize) -> Result<StringArray
     let mut history: Vec<Option<&str>> = Vec::with_capacity(rows);
     let mut pos = 0;
     let mut value_bytes = 0usize;
+    let expansion_limit = bytes.len().saturating_mul(16).max(1024 * 1024);
     for row in 0..rows {
         let Some(&first) = bytes.get(pos) else {
             return Err(DecodeError::Length {
@@ -897,10 +1201,10 @@ fn decode_strings_with_backrefs(bytes: &[u8], rows: usize) -> Result<StringArray
                             row,
                             message: "UTF-8 column length overflows",
                         })?;
-                if value_bytes > i32::MAX as usize {
+                if value_bytes > i32::MAX as usize || value_bytes > expansion_limit {
                     return Err(DecodeError::InvalidValue {
                         row,
-                        message: "UTF-8 column exceeds Arrow's 32-bit offset limit; lower adbc.monetdb.batch_rows",
+                        message: "UTF-8 back-references expand beyond the allowed wire-size multiple",
                     });
                 }
                 builder.append_value(value);
@@ -919,6 +1223,8 @@ fn decode_strings_with_backrefs(bytes: &[u8], rows: usize) -> Result<StringArray
 }
 
 fn long_backref(bytes: &[u8], row: usize) -> Result<(usize, usize), DecodeError> {
+    // The server loader rejects non-canonical overlong encodings. Accepting one
+    // here is harmless because this decoder does not re-emit the representation.
     let mut distance = 0usize;
     let mut shift = 0u32;
     for (index, byte) in bytes.iter().copied().enumerate() {
@@ -959,11 +1265,15 @@ fn decode_blob(bytes: &[u8], rows: usize) -> Result<BinaryArray, DecodeError> {
         });
     }
     let mut builder = BinaryBuilder::with_capacity(rows, bytes.len());
-    let mut pos = 0;
+    let mut pos = 0usize;
     let mut value_bytes = 0usize;
     for row in 0..rows {
-        let header = bytes.get(pos..pos + 8).ok_or(DecodeError::Length {
-            expected: pos + 8,
+        let header_end = pos.checked_add(8).ok_or(DecodeError::InvalidValue {
+            row,
+            message: "BLOB header offset overflows",
+        })?;
+        let header = bytes.get(pos..header_end).ok_or(DecodeError::Length {
+            expected: header_end,
             actual: bytes.len(),
         })?;
         let length = i64::from_le_bytes(header.try_into().expect("blob header is 8 bytes"));
@@ -982,8 +1292,12 @@ fn decode_blob(bytes: &[u8], rows: usize) -> Result<BinaryArray, DecodeError> {
             row,
             message: "blob length does not fit in memory",
         })?;
-        let value = bytes.get(pos..pos + length).ok_or(DecodeError::Length {
-            expected: pos + length,
+        let value_end = pos.checked_add(length).ok_or(DecodeError::InvalidValue {
+            row,
+            message: "BLOB value offset overflows",
+        })?;
+        let value = bytes.get(pos..value_end).ok_or(DecodeError::Length {
+            expected: value_end,
             actual: bytes.len(),
         })?;
         value_bytes = value_bytes
@@ -1011,6 +1325,7 @@ fn decode_blob(bytes: &[u8], rows: usize) -> Result<BinaryArray, DecodeError> {
 }
 
 fn decode_uuid(bytes: &[u8], rows: usize) -> Result<FixedSizeBinaryArray, DecodeError> {
+    // `gdk_atoms.h:is_uuid_nil` defines UUID nil as all-zero bytes.
     expect_fixed(bytes, rows, 16)?;
     let mut builder = FixedSizeBinaryBuilder::with_capacity(rows, 16);
     for value in bytes.chunks_exact(16) {
@@ -1116,6 +1431,8 @@ fn decode_timestamp(
 }
 
 fn decode_inet(bytes: &[u8], rows: usize) -> Result<StringArray, DecodeError> {
+    // `gdk_atoms.h:is_inet4_nil` defines the nil address; the 4/16-byte
+    // layouts are the widths selected in `sql_bincopyconvert.c`.
     let width = if bytes.len() == rows.saturating_mul(4) {
         4
     } else if bytes.len() == rows.saturating_mul(16) {
@@ -1388,13 +1705,68 @@ mod tests {
         let mut frame = b"&6 7 0 0 5\n".to_vec();
         frame.extend_from_slice(&(frame.len() as i64).to_le_bytes());
         assert!(matches!(
-            decode_frame(&frame, &[], 8, 5),
+            decode_frame(&frame, &[], 8, 5, 3),
             Err(DecodeError::ResultId { .. })
         ));
         assert!(matches!(
-            decode_frame(&frame, &[], 7, 4),
+            decode_frame(&frame, &[], 7, 4, 3),
             Err(DecodeError::StartRow { .. })
         ));
+
+        let mut frame = b"&6 7 0 2 0\n".to_vec();
+        frame.extend_from_slice(&(frame.len() as i64).to_le_bytes());
+        assert!(matches!(
+            decode_frame(&frame, &[], 7, 0, 1),
+            Err(DecodeError::RowCount {
+                requested: 1,
+                actual: 2
+            })
+        ));
+        assert_eq!(decode_frame(&frame, &[], 7, 0, 2).unwrap().num_rows(), 2);
+    }
+
+    #[test]
+    fn adopts_aligned_fixed_width_buffers_and_copies_misaligned_ones() {
+        let mut bytes = vec![0u8; 32];
+        bytes.extend_from_slice(&7i32.to_le_bytes());
+        bytes.extend_from_slice(&i32::MIN.to_le_bytes());
+        let expected_ptr = bytes.as_ptr().wrapping_add(32) as usize;
+        let buffer = Buffer::from_vec(bytes);
+        let array = decode_owned_column(&buffer, &(32..40), &MonetType::Int, 2).unwrap();
+        let array = array.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(array.values().as_ptr() as usize, expected_ptr);
+        assert_eq!(array.iter().collect::<Vec<_>>(), vec![Some(7), None]);
+
+        let mut bytes = vec![0];
+        bytes.extend_from_slice(&7i32.to_le_bytes());
+        bytes.extend_from_slice(&8i32.to_le_bytes());
+        let buffer = Buffer::from_vec(bytes);
+        assert!(
+            adopt_primitive::<Int32Type, _>(&buffer, &(1..9), 2, |value| value == i32::MIN)
+                .unwrap()
+                .is_none()
+        );
+        let array = decode_owned_column(&buffer, &(1..9), &MonetType::Int, 2).unwrap();
+        let array = array.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(array.values(), &[7, 8]);
+    }
+
+    #[test]
+    fn adopts_frames_only_when_fixed_width_columns_dominate() {
+        assert!(adoption_is_worthwhile(75, 100));
+        assert!(!adoption_is_worthwhile(74, 100));
+        assert!(!adoption_is_worthwhile(0, 0));
+        assert!(prefers_owned_types([MonetType::BigInt, MonetType::Real]));
+        assert!(prefers_owned_types(
+            std::iter::repeat_n(MonetType::Real, 9).chain([MonetType::Timestamp])
+        ));
+        assert!(!prefers_owned_types([
+            MonetType::BigInt,
+            MonetType::Double,
+            MonetType::Varchar(0),
+            MonetType::Timestamp,
+        ]));
+        assert!(!prefers_owned_types([MonetType::Timestamp]));
     }
 
     #[test]
@@ -1417,6 +1789,11 @@ mod tests {
         let array = array.as_any().downcast_ref::<Float64Array>().unwrap();
         assert_eq!(array.value(0), 1.5);
         assert!(array.is_null(1));
+
+        let infinities = [f64::INFINITY.to_le_bytes(), f64::NEG_INFINITY.to_le_bytes()].concat();
+        let array = decode_column(&MonetType::Double, &infinities, 2).unwrap();
+        let array = array.as_any().downcast_ref::<Float64Array>().unwrap();
+        assert_eq!(array.values(), &[f64::INFINITY, f64::NEG_INFINITY]);
     }
 
     #[test]
@@ -1444,11 +1821,23 @@ mod tests {
     fn rejects_hostile_variable_width_metadata_without_allocating() {
         assert!(matches!(
             decode_strings(b"\0", usize::MAX),
-            Err(DecodeError::Length { .. })
+            Err(DecodeError::InvalidValue { .. })
         ));
         assert!(matches!(
             decode_blob(&[0; 8], usize::MAX),
             Err(DecodeError::InvalidValue { .. })
+        ));
+    }
+
+    #[test]
+    fn limits_string_backref_expansion_relative_to_wire_size() {
+        let mut encoded = vec![b'x'; 65_536];
+        encoded.push(0);
+        encoded.extend(std::iter::repeat_n(0x81, 17));
+        assert!(matches!(
+            decode_strings(&encoded, 18),
+            Err(DecodeError::InvalidValue { row: 16, .. })
+                | Err(DecodeError::InvalidValue { row: 17, .. })
         ));
     }
 
@@ -1473,10 +1862,9 @@ mod tests {
     #[test]
     fn rejects_values_outside_decimal128_precision() {
         let value = 10i128.pow(38).to_le_bytes();
-        assert!(matches!(
-            decode_column(&MonetType::HugeInt, &value, 1),
-            Err(DecodeError::InvalidValue { row: 0, .. })
-        ));
+        let error = decode_column(&MonetType::HugeInt, &value, 1).unwrap_err();
+        assert!(error.to_string().contains("HUGEINT"));
+        assert!(error.to_string().contains("38-digit"));
     }
 
     #[test]
@@ -1513,6 +1901,19 @@ mod tests {
                 .map(String::as_str),
             Some("monetdb.url")
         );
+        for (data_type, extension) in [
+            (MonetType::HugeInt, "monetdb.hugeint"),
+            (MonetType::TimeTz, "monetdb.timetz"),
+        ] {
+            let field = field_for_monet_type("value", &data_type).unwrap();
+            assert_eq!(
+                field
+                    .metadata()
+                    .get("ARROW:extension:name")
+                    .map(String::as_str),
+                Some(extension)
+            );
+        }
     }
 
     #[test]
@@ -1528,6 +1929,10 @@ mod tests {
         assert!(matches!(
             decode_strings(&[0xff, 0], 1),
             Err(DecodeError::InvalidUtf8 { .. })
+        ));
+        assert!(matches!(
+            decode_strings(b"value\0trailing", 1),
+            Err(DecodeError::Length { .. })
         ));
     }
 
@@ -1647,6 +2052,22 @@ mod tests {
         let array = decode_uuid(&uuids, 2).unwrap();
         assert_eq!(array.value(0), &[1; 16]);
         assert!(array.is_null(1));
+    }
+
+    #[test]
+    fn rejects_mismatched_timestamp_sentinels_and_invalid_inet_widths() {
+        let mut timestamp = vec![0xff; 8];
+        timestamp.extend_from_slice(&[1, 1, 178, 7]);
+        assert!(matches!(
+            decode_timestamp(&timestamp, 1, false),
+            Err(DecodeError::InvalidValue { row: 0, .. })
+        ));
+        assert!(matches!(
+            decode_inet(&[1, 2, 3, 4, 5], 1),
+            Err(DecodeError::InvalidValue { row: 0, .. })
+        ));
+        let ipv6_nil = decode_inet(&[0; 16], 1).unwrap();
+        assert!(ipv6_nil.is_null(0));
     }
 
     #[test]

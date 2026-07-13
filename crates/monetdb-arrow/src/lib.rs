@@ -19,8 +19,8 @@ mod encode;
 pub mod exportbin;
 
 pub use decode::{
-    DecodeError, data_type_for_monet_type, decode_column, decode_frame, decode_inline_row,
-    field_for_column, field_for_monet_type,
+    DecodeError, data_type_for_monet_type, decode_column, decode_frame, decode_frame_owned,
+    decode_inline_row, field_for_column, field_for_monet_type, prefers_owned_frame,
 };
 pub use encode::{EncodeError, encode_column, monet_type_for_field, sql_type_for_field};
 

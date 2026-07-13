@@ -14,7 +14,9 @@
 //! ```
 //!
 //! The TOC integers and the trailing `toc_pos` are written in the byte order
-//! the client requested at login; this driver always requests little-endian.
+//! the client requested at login (`mnstr_writeLng` in the implementation),
+//! despite `binary-resultset.rst` describing them as server-endian. This driver
+//! always requests little-endian.
 //! Column *data* is written in the server's native byte order; only
 //! little-endian servers are supported, so the whole frame is parsed as LE.
 
@@ -122,7 +124,7 @@ fn parse_header(frame: &[u8]) -> Result<(Header, usize), FrameError> {
         .position(|&b| b == b'\n')
         .ok_or(FrameError::Malformed("unterminated block header"))?;
     let line = str::from_utf8(&frame[HEADER_PREFIX.len()..line_end])
-        .map_err(|_| FrameError::Malformed("block header is not ASCII"))?;
+        .map_err(|_| FrameError::Malformed("block header is not UTF-8"))?;
 
     let mut fields = line.split_ascii_whitespace();
     let mut next = || {
