@@ -5,7 +5,8 @@
 Arrow-native reads and writes for MonetDB: polars, pandas, and every other ADBC consumer get
 columnar result sets (MonetDB's binary result-set protocol decoded directly into Arrow record
 batches) and bulk ingestion (`COPY BINARY ... ON CLIENT` streamed from Arrow buffers) through one
-standard interface. The implementation plan lives in [docs/PLAN.md](docs/PLAN.md).
+standard interface. The implementation plan lives in the
+[project plan](https://github.com/wlaur/adbc-driver-monetdb/blob/main/docs/PLAN.md).
 
 ## Usage
 
@@ -23,6 +24,10 @@ df = pl.read_database_uri("SELECT 1", "monetdb://localhost:50000/db", engine="ad
 
 The DB-API connection starts with autocommit disabled, as required by PEP 249. Call
 `conn.commit()`, use the connection context manager, or pass `autocommit=True` explicitly.
+Consume or close a query's result stream before executing another statement or changing
+transaction state on the same connection. Use independent connections for parallel queries;
+ADBC permits drivers to block or reject concurrent statements on one connection, and MonetDB's
+single MAPI channel shares transaction state between every statement on that connection.
 
 The same connection works directly with pandas 3:
 
@@ -51,7 +56,7 @@ with dbapi.connect("monetdb://user:password@localhost:50000/db") as conn:
 | Transactions and autocommit | Supported |
 | TLS (`monetdbs://`) | System roots, certificate file, SHA-256 certificate hash, and client certificates |
 | `GetInfo`, `GetObjects`, `GetTableSchema`, `GetTableTypes`, `ExecuteSchema` | Supported |
-| Query cancellation | Not supported by the current Rust MAPI transport |
+| Query cancellation | Not supported: MAPI has one sequential channel and the Rust transport exposes no safe out-of-band interrupt |
 | Partitioned results | Not supported; MAPI exposes one sequential result channel |
 | Substrait plans | Not supported by MonetDB |
 | `GetStatistics` | Not implemented |
@@ -93,5 +98,7 @@ Lint/typecheck: `uv run ruff check .`, `uv run ruff format --check .`, `uv run p
 
 ## License
 
-MIT. The `monetdb` protocol crate (`monetdb-rust`, our fork of MonetDB/monetdb-rust) is MPL-2.0;
-its license and corresponding-source notice are included in wheels and source distributions.
+The driver is MIT and the included `monetdb` protocol crate (`monetdb-rust`, our fork of
+MonetDB/monetdb-rust) is MPL-2.0. The distribution's license expression is therefore
+`MIT AND MPL-2.0`; both license texts and the corresponding-source notice are included in wheels
+and source distributions.

@@ -68,6 +68,7 @@ pub fn monet_type_for_field(field: &Field) -> Result<MonetType, EncodeError> {
         DataType::UInt8 => MonetType::SmallInt,
         DataType::UInt16 => MonetType::Int,
         DataType::UInt32 => MonetType::BigInt,
+        DataType::UInt64 if extension == Some("monetdb.oid") => MonetType::Oid,
         DataType::UInt64 => MonetType::HugeInt,
         DataType::Float32 => MonetType::Real,
         DataType::Float64 => MonetType::Double,
@@ -76,6 +77,7 @@ pub fn monet_type_for_field(field: &Field) -> Result<MonetType, EncodeError> {
         }
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => match extension {
             Some("arrow.json") => MonetType::Json,
+            Some("monetdb.url") => MonetType::Url,
             _ => MonetType::Varchar(0),
         },
         DataType::Dictionary(_, value)
@@ -136,6 +138,20 @@ pub fn sql_type_for_field(field: &Field) -> Result<String, EncodeError> {
 
 pub fn encode_column(field: &Field, array: &dyn Array) -> Result<Vec<u8>, EncodeError> {
     let mut out = Vec::new();
+    if let Some(width) = fixed_wire_width(field, array.data_type())? {
+        let bytes = array
+            .len()
+            .checked_mul(width)
+            .ok_or(EncodeError::InvalidValue {
+                row: 0,
+                message: "encoded column length overflows",
+            })?;
+        out.try_reserve_exact(bytes)
+            .map_err(|_| EncodeError::InvalidValue {
+                row: 0,
+                message: "encoded column is too large",
+            })?;
+    }
     macro_rules! signed {
         ($array:ty, $type:ty, $variant:expr) => {{
             let values = downcast::<$array>(array, $variant)?;
@@ -173,9 +189,12 @@ pub fn encode_column(field: &Field, array: &dyn Array) -> Result<Vec<u8>, Encode
         DataType::UInt8 => unsigned!(UInt8Array, i16, DataType::UInt8),
         DataType::UInt16 => unsigned!(UInt16Array, i32, DataType::UInt16),
         DataType::UInt32 => unsigned!(UInt32Array, i64, DataType::UInt32),
+        DataType::UInt64 if monet_type_for_field(field)? == MonetType::Oid => {
+            encode_oid(downcast(array, DataType::UInt64)?, &mut out)?
+        }
         DataType::UInt64 => unsigned!(UInt64Array, i128, DataType::UInt64),
-        DataType::Float32 => encode_f32(downcast(array, DataType::Float32)?, &mut out),
-        DataType::Float64 => encode_f64(downcast(array, DataType::Float64)?, &mut out),
+        DataType::Float32 => encode_f32(downcast(array, DataType::Float32)?, &mut out)?,
+        DataType::Float64 => encode_f64(downcast(array, DataType::Float64)?, &mut out)?,
         DataType::Decimal128(precision, _) => encode_decimal(
             downcast(array, array.data_type().clone())?,
             *precision,
@@ -227,6 +246,42 @@ pub fn encode_column(field: &Field, array: &dyn Array) -> Result<Vec<u8>, Encode
     Ok(out)
 }
 
+fn fixed_wire_width(field: &Field, data_type: &DataType) -> Result<Option<usize>, EncodeError> {
+    if *data_type == DataType::Null {
+        return Ok(Some(2));
+    }
+    Ok(match monet_type_for_field(field)? {
+        MonetType::Bool | MonetType::TinyInt => Some(1),
+        MonetType::SmallInt => Some(2),
+        MonetType::Int | MonetType::Real | MonetType::MonthInterval | MonetType::Date => Some(4),
+        MonetType::BigInt
+        | MonetType::Oid
+        | MonetType::Double
+        | MonetType::DayInterval
+        | MonetType::SecInterval
+        | MonetType::Time
+        | MonetType::TimeTz => Some(8),
+        MonetType::HugeInt | MonetType::Uuid => Some(16),
+        MonetType::Decimal(precision, _) => match precision {
+            1..=2 => Some(1),
+            3..=4 => Some(2),
+            5..=9 => Some(4),
+            10..=18 => Some(8),
+            19..=38 => Some(16),
+            _ => None,
+        },
+        MonetType::Timestamp | MonetType::TimestampTz => Some(12),
+        MonetType::Varchar(_)
+        | MonetType::Blob
+        | MonetType::Url
+        | MonetType::Inet
+        | MonetType::Json
+        | MonetType::Geometry
+        | MonetType::GeometryA
+        | MonetType::Xml => None,
+    })
+}
+
 fn downcast<T: 'static>(array: &dyn Array, expected: DataType) -> Result<&T, EncodeError> {
     array
         .as_any()
@@ -273,26 +328,62 @@ fn encode_bool(array: &BooleanArray, out: &mut Vec<u8>) {
     }));
 }
 
-fn encode_f32(array: &Float32Array, out: &mut Vec<u8>) {
+fn encode_oid(array: &UInt64Array, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+    const NULL: u64 = 1 << 63;
+    for row in 0..array.len() {
+        let value = if array.is_null(row) {
+            NULL
+        } else {
+            let value = array.value(row);
+            if value >= NULL {
+                return Err(EncodeError::InvalidValue {
+                    row,
+                    message: "OID is outside MonetDB's non-NULL range",
+                });
+            }
+            value
+        };
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    Ok(())
+}
+
+fn encode_f32(array: &Float32Array, out: &mut Vec<u8>) -> Result<(), EncodeError> {
     for row in 0..array.len() {
         let value = if array.is_null(row) {
             f32::NAN
         } else {
-            array.value(row)
+            let value = array.value(row);
+            if value.is_nan() {
+                return Err(EncodeError::InvalidValue {
+                    row,
+                    message: "NaN is MonetDB's floating-point NULL sentinel",
+                });
+            }
+            value
         };
         out.extend_from_slice(&value.to_le_bytes());
     }
+    Ok(())
 }
 
-fn encode_f64(array: &Float64Array, out: &mut Vec<u8>) {
+fn encode_f64(array: &Float64Array, out: &mut Vec<u8>) -> Result<(), EncodeError> {
     for row in 0..array.len() {
         let value = if array.is_null(row) {
             f64::NAN
         } else {
-            array.value(row)
+            let value = array.value(row);
+            if value.is_nan() {
+                return Err(EncodeError::InvalidValue {
+                    row,
+                    message: "NaN is MonetDB's floating-point NULL sentinel",
+                });
+            }
+            value
         };
         out.extend_from_slice(&value.to_le_bytes());
     }
+    Ok(())
 }
 
 fn encode_decimal(
@@ -496,6 +587,14 @@ fn encode_date64(array: &Date64Array, out: &mut Vec<u8>) -> Result<(), EncodeErr
 
 fn append_date(days: i64, row: usize, out: &mut Vec<u8>) -> Result<(), EncodeError> {
     let date = date_from_days(days, row)?;
+    // MonetDB's `gdk_time.c` defines YEAR_MIN as -4712; its binary importer
+    // silently converts earlier dates to nil.
+    if date.year() < -4712 {
+        return Err(EncodeError::InvalidValue {
+            row,
+            message: "date is earlier than MonetDB's minimum year -4712",
+        });
+    }
     let year = i16::try_from(date.year()).map_err(|_| EncodeError::InvalidValue {
         row,
         message: "date year is outside MonetDB's range",
@@ -842,11 +941,44 @@ mod tests {
     }
 
     #[test]
+    fn preserves_oid_and_url_extensions_on_write() {
+        let oid = Field::new("oid", DataType::UInt64, true)
+            .with_metadata([("ARROW:extension:name".to_owned(), "monetdb.oid".to_owned())].into());
+        assert_eq!(monet_type_for_field(&oid).unwrap(), MonetType::Oid);
+        let values = UInt64Array::from(vec![Some(7), None]);
+        assert_eq!(
+            encode_column(&oid, &values).unwrap(),
+            [7u64.to_le_bytes(), (1u64 << 63).to_le_bytes()].concat()
+        );
+
+        let url = Field::new("url", DataType::Utf8, true)
+            .with_metadata([("ARROW:extension:name".to_owned(), "monetdb.url".to_owned())].into());
+        assert_eq!(monet_type_for_field(&url).unwrap(), MonetType::Url);
+    }
+
+    #[test]
     fn rejects_duration_null_sentinel_collision() {
         let field = Field::new("duration", DataType::Duration(TimeUnit::Millisecond), true);
         let values = DurationMillisecondArray::from(vec![Some(i64::MIN)]);
         assert!(matches!(
             encode_column(&field, &values),
+            Err(EncodeError::InvalidValue { row: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_non_null_nan_values() {
+        let f32_field = Field::new("f32", DataType::Float32, true);
+        let f32_values = Float32Array::from(vec![f32::NAN]);
+        assert!(matches!(
+            encode_column(&f32_field, &f32_values),
+            Err(EncodeError::InvalidValue { row: 0, .. })
+        ));
+
+        let f64_field = Field::new("f64", DataType::Float64, true);
+        let f64_values = Float64Array::from(vec![f64::NAN]);
+        assert!(matches!(
+            encode_column(&f64_field, &f64_values),
             Err(EncodeError::InvalidValue { row: 0, .. })
         ));
     }
@@ -897,7 +1029,7 @@ mod tests {
     #[test]
     fn chrono_date_conversion_round_trips_bce_and_boundary_years() {
         let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-        let dates = [-32_768, -1, 0, 1, 1582, 1900, 2000, 32_767]
+        let dates = [-4712, -1, 0, 1, 1582, 1900, 2000, 32_767]
             .map(|year| NaiveDate::from_ymd_opt(year, 3, 1).unwrap());
         let days =
             dates.map(|date| i32::try_from(date.signed_duration_since(epoch).num_days()).unwrap());
@@ -907,6 +1039,14 @@ mod tests {
         let decoded = crate::decode::decode_column(&MonetType::Date, &bytes, dates.len()).unwrap();
         let decoded = decoded.as_any().downcast_ref::<Date32Array>().unwrap();
         assert_eq!(decoded.values(), array.values());
+
+        let too_early = NaiveDate::from_ymd_opt(-4713, 12, 31).unwrap();
+        let days = i32::try_from(too_early.signed_duration_since(epoch).num_days()).unwrap();
+        let array = Date32Array::from(vec![days]);
+        assert!(matches!(
+            encode_column(&field, &array),
+            Err(EncodeError::InvalidValue { row: 0, .. })
+        ));
     }
 
     #[test]

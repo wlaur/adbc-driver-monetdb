@@ -9,10 +9,11 @@ repository.workspace = true
 
 [dependencies]
 arrow-array.workspace = true
-arrow-buffer.workspace = true
 arrow-schema.workspace = true
 chrono.workspace = true
+memchr.workspace = true
 monetdb.workspace = true
+rayon.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

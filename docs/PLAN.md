@@ -168,10 +168,11 @@ as upstream-shaped MPL-2.0 changes so they can be offered back to
 | BOOLEAN | 1 B | `0x80` | `bool` | `Boolean` |
 | TINYINT/SMALLINT/INT/BIGINT | i8/i16/i32/i64 | `INT_MIN` of width | `int8..int64` | `Int8..Int64` |
 | HUGEINT | i128 | `1<<127` | `decimal128(38,0)` | `Decimal(38,0)` |
+| OID | u64 | `1<<63` | `uint64` + `monetdb.oid` metadata | `UInt64` |
 | REAL / DOUBLE | f32 / f64 | NaN | `float32/64` | `Float32/64` |
 | DECIMAL(p,s) | scaled int (width by p) | width's `INT_MIN` | `decimal128(p,s)` | `Decimal(p,s)` |
 | VARCHAR/CHAR/CLOB | NUL-terminated (+backrefs) | `80 00` | `utf8` | `String` |
-| JSON / URL | as string | `80 00` | `utf8` (+ `arrow.json` metadata) | `String` |
+| JSON / URL | as string | `80 00` | `utf8` (+ `arrow.json` / `monetdb.url` metadata) | `String` |
 | BLOB | i64 len + bytes | len = `~0` | `binary` | `Binary` |
 | DATE | `{u8 day,u8 month,i16 year}` | month `0xFF` | `date32` | `Date` |
 | TIME | `{u32 µs,u8 s,u8 m,u8 h,pad}` | all `0xFF` | `time64[us]` | `Time` |
@@ -183,9 +184,14 @@ as upstream-shaped MPL-2.0 changes so they can be offered back to
 | INET4/INET6 | 4/16 B | zero | `utf8` (rendered) | `String` |
 | GEOMETRY / XML | not in the binary format | — | error (cast to text in SQL) | — |
 
+`INTERVAL MONTH` intentionally uses `Int32` plus extension metadata instead of Arrow's interval
+type so it remains consumable by the supported current-stable polars release while preserving
+enough information to write the column back as `INTERVAL MONTH`.
+
 Write direction extras: unsigned ints widen (`u8→SMALLINT`, `u16→INT`, `u32→BIGINT`,
 `u64→HUGEINT`); `Categorical`/`Enum` → VARCHAR with backref encoding; tz-aware datetimes
-convert to UTC → TIMESTAMPTZ; float NaN and null both map to NULL (MonetDB semantics);
+convert to UTC → TIMESTAMPTZ; Arrow null maps to MonetDB's NaN sentinel while a non-null
+NaN is rejected to prevent silent data loss;
 `Struct`/`List` are unsupported — JSON-encode first (matches MonetDB's type system).
 
 ## Protocol notes (the sharp edges)
@@ -202,7 +208,8 @@ convert to UTC → TIMESTAMPTZ; float NaN and null both map to NULL (MonetDB sem
   prepared-statement metadata is text-only. `EXECUTE` results are ordinary `Q_TABLE`s.
 - String backrefs are ingest-oriented; current servers do not emit them on export, but the
   decoder handles them anyway.
-- MonetDB stores no real float NaNs (NaN is the NULL sentinel) — the mapping is lossless.
+- MonetDB stores no real float NaNs (NaN is the NULL sentinel). Reads therefore map NaN to
+  Arrow null, and writes reject non-null Arrow NaNs rather than silently changing them to null.
 - An all-zero UUID is indistinguishable from NULL by design (server semantics).
 
 ## Testing

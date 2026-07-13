@@ -465,7 +465,7 @@ pub(super) fn objects_batch(
         catalog_names.append_value(catalog);
         let schema_list = list_builder(&mut schema_lists)?;
         if depth == ObjectDepth::Catalogs {
-            schema_list.append_null();
+            schema_list.append(true);
         } else {
             for schema in schemas {
                 append_object_schema(schema_list, schema, catalog, depth)?;
@@ -734,6 +734,8 @@ fn struct_values(builder: &mut ListBuilder<Box<dyn ArrayBuilder>>) -> Result<&mu
 
 #[cfg(test)]
 mod tests {
+    use arrow_array::ListArray;
+
     use super::*;
 
     #[test]
@@ -745,5 +747,17 @@ mod tests {
         let adversarial = format!("{}x", "%".repeat(100_000));
         assert!(!like_pattern_matches(&adversarial, &"a".repeat(100_000)));
         assert_eq!(raw_string_literal("a'b\\c").unwrap(), "R'a''b\\c'");
+    }
+
+    #[test]
+    fn catalogs_depth_has_an_empty_schema_list() {
+        let batch = objects_batch("test", true, ObjectDepth::Catalogs, &[]).unwrap();
+        let schemas = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert!(!schemas.is_null(0));
+        assert_eq!(schemas.value_length(0), 0);
     }
 }

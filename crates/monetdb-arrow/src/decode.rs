@@ -22,12 +22,15 @@ use monetdb::{
         raw_temporal::{RawDate, RawTime, RawTimeTz, RawTimestamp, RawTimestampTz},
     },
 };
+use rayon::prelude::*;
 
 use crate::exportbin::{FrameError, parse_frame};
 
 #[derive(Debug)]
 pub enum DecodeError {
     Frame(FrameError),
+    ResultId { expected: u64, actual: i64 },
+    StartRow { expected: u64, actual: u64 },
     ColumnCount { expected: usize, actual: usize },
     Length { expected: usize, actual: usize },
     InvalidValue { row: usize, message: &'static str },
@@ -42,6 +45,12 @@ impl fmt::Display for DecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Frame(error) => error.fmt(f),
+            Self::ResultId { expected, actual } => {
+                write!(f, "frame has result id {actual}; expected {expected}")
+            }
+            Self::StartRow { expected, actual } => {
+                write!(f, "frame starts at row {actual}; expected {expected}")
+            }
             Self::ColumnCount { expected, actual } => {
                 write!(
                     f,
@@ -105,8 +114,35 @@ fn decimal_scale(scale: u8) -> Result<i8, DecodeError> {
     })
 }
 
-pub fn decode_frame(frame: &[u8], columns: &[ResultColumn]) -> Result<RecordBatch, DecodeError> {
+fn decimal_data_type(precision: u8, scale: u8) -> Result<DataType, DecodeError> {
+    if !(1..=38).contains(&precision) || scale > precision {
+        return Err(DecodeError::InvalidValue {
+            row: 0,
+            message: "decimal precision/scale must satisfy 1 <= precision <= 38 and scale <= precision",
+        });
+    }
+    Ok(DataType::Decimal128(precision, decimal_scale(scale)?))
+}
+
+pub fn decode_frame(
+    frame: &[u8],
+    columns: &[ResultColumn],
+    expected_result_id: u64,
+    expected_start_row: u64,
+) -> Result<RecordBatch, DecodeError> {
     let frame = parse_frame(frame)?;
+    if u64::try_from(frame.result_id) != Ok(expected_result_id) {
+        return Err(DecodeError::ResultId {
+            expected: expected_result_id,
+            actual: frame.result_id,
+        });
+    }
+    if frame.start_row != expected_start_row {
+        return Err(DecodeError::StartRow {
+            expected: expected_start_row,
+            actual: frame.start_row,
+        });
+    }
     if columns.len() != frame.columns.len() {
         return Err(DecodeError::ColumnCount {
             expected: columns.len(),
@@ -121,11 +157,23 @@ pub fn decode_frame(frame: &[u8], columns: &[ResultColumn]) -> Result<RecordBatc
         .iter()
         .map(field_for_column)
         .collect::<Result<Vec<_>, _>>()?;
-    let arrays = columns
+    let frame_bytes = frame
+        .columns
         .iter()
-        .zip(frame.columns)
-        .map(|(column, bytes)| decode_column(column.sql_type(), bytes, row_count))
-        .collect::<Result<Vec<_>, _>>()?;
+        .fold(0usize, |total, column| total.saturating_add(column.len()));
+    let arrays = if columns.len() > 1 && frame_bytes >= 1024 * 1024 {
+        columns
+            .par_iter()
+            .zip(frame.columns.par_iter())
+            .map(|(column, bytes)| decode_column(column.sql_type(), bytes, row_count))
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        columns
+            .iter()
+            .zip(frame.columns)
+            .map(|(column, bytes)| decode_column(column.sql_type(), bytes, row_count))
+            .collect::<Result<Vec<_>, _>>()?
+    };
     Ok(RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)?)
 }
 
@@ -177,7 +225,10 @@ fn inline_wire_value(
         MonetType::Int => required(cursor.get_i32(index)?)?.to_le_bytes().to_vec(),
         MonetType::BigInt => required(cursor.get_i64(index)?)?.to_le_bytes().to_vec(),
         MonetType::HugeInt => required(cursor.get_i128(index)?)?.to_le_bytes().to_vec(),
-        MonetType::Oid => required(cursor.get_u64(index)?)?.to_le_bytes().to_vec(),
+        MonetType::Oid => {
+            let rendered = required(cursor.get_str(index)?)?;
+            parse_inline_oid(rendered)?.to_le_bytes().to_vec()
+        }
         MonetType::Decimal(precision, scale) => {
             let decimal = required(cursor.get::<RawDecimal<i128>>(index)?)?;
             let value = decimal.at_scale(scale).ok_or(DecodeError::InvalidValue {
@@ -258,6 +309,17 @@ fn required<T>(value: Option<T>) -> Result<T, DecodeError> {
         row: 0,
         message: "non-NULL inline value decoded as NULL",
     })
+}
+
+fn parse_inline_oid(rendered: &str) -> Result<u64, DecodeError> {
+    rendered
+        .strip_suffix("@0")
+        .unwrap_or(rendered)
+        .parse::<u64>()
+        .map_err(|_| DecodeError::InvalidValue {
+            row: 0,
+            message: "invalid inline OID",
+        })
 }
 
 fn null_wire_value(data_type: &MonetType) -> Result<Vec<u8>, DecodeError> {
@@ -446,6 +508,8 @@ pub fn field_for_monet_type(
     let extension = match data_type {
         MonetType::Json => Some("arrow.json"),
         MonetType::Uuid => Some("arrow.uuid"),
+        MonetType::Oid => Some("monetdb.oid"),
+        MonetType::Url => Some("monetdb.url"),
         MonetType::MonthInterval => Some("monetdb.interval_month"),
         MonetType::DayInterval => Some("monetdb.interval_day"),
         _ => None,
@@ -465,9 +529,7 @@ pub fn data_type_for_monet_type(data_type: &MonetType) -> Result<DataType, Decod
         MonetType::BigInt => DataType::Int64,
         MonetType::HugeInt => DataType::Decimal128(38, 0),
         MonetType::Oid => DataType::UInt64,
-        MonetType::Decimal(precision, scale) => {
-            DataType::Decimal128(precision, decimal_scale(scale)?)
-        }
+        MonetType::Decimal(precision, scale) => decimal_data_type(precision, scale)?,
         MonetType::Varchar(_) | MonetType::Url | MonetType::Json | MonetType::Inet => {
             DataType::Utf8
         }
@@ -683,6 +745,23 @@ fn decimal_array(
     precision: u8,
     scale: i8,
 ) -> Result<Decimal128Array, DecodeError> {
+    if !(1..=38).contains(&precision) || scale < 0 || scale > precision as i8 {
+        return Err(DecodeError::InvalidValue {
+            row: 0,
+            message: "decimal precision/scale must satisfy 1 <= precision <= 38 and 0 <= scale <= precision",
+        });
+    }
+    let limit = 10i128.pow(u32::from(precision));
+    if let Some((row, _)) = values
+        .iter()
+        .enumerate()
+        .find(|(_, value)| value.is_some_and(|value| value <= -limit || value >= limit))
+    {
+        return Err(DecodeError::InvalidValue {
+            row,
+            message: "decimal value exceeds its declared precision",
+        });
+    }
     Ok(Decimal128Array::from(values).with_precision_and_scale(precision, scale)?)
 }
 
@@ -696,11 +775,75 @@ pub(crate) fn decode_strings(bytes: &[u8], rows: usize) -> Result<StringArray, D
     if bytes.len() > i32::MAX as usize {
         return Err(DecodeError::InvalidValue {
             row: 0,
-            message: "UTF-8 column exceeds Arrow's 32-bit offset limit",
+            message: "UTF-8 column exceeds Arrow's 32-bit offset limit; lower adbc.monetdb.batch_rows",
         });
     }
+    if let Some(array) = decode_strings_without_backrefs(bytes, rows)? {
+        return Ok(array);
+    }
+    decode_strings_with_backrefs(bytes, rows)
+}
+
+fn decode_strings_without_backrefs(
+    bytes: &[u8],
+    rows: usize,
+) -> Result<Option<StringArray>, DecodeError> {
     let mut builder = StringBuilder::with_capacity(rows, bytes.len());
-    let mut history: Vec<Option<&str>> = Vec::new();
+    let mut pos = 0;
+    let mut value_bytes = 0usize;
+    for row in 0..rows {
+        let Some(&first) = bytes.get(pos) else {
+            return Err(DecodeError::Length {
+                expected: pos + 1,
+                actual: bytes.len(),
+            });
+        };
+        if first == 0x80 {
+            let (distance, consumed) = long_backref(&bytes[pos + 1..], row)?;
+            if distance != 0 {
+                return Ok(None);
+            }
+            pos += consumed + 1;
+            builder.append_null();
+            continue;
+        }
+        if (0x81..=0xbf).contains(&first) {
+            return Ok(None);
+        }
+        let tail = &bytes[pos..];
+        let end = memchr::memchr(0, tail).ok_or(DecodeError::Length {
+            expected: bytes.len() + 1,
+            actual: bytes.len(),
+        })?;
+        let value =
+            std::str::from_utf8(&tail[..end]).map_err(|_| DecodeError::InvalidUtf8 { row })?;
+        value_bytes = value_bytes
+            .checked_add(value.len())
+            .ok_or(DecodeError::InvalidValue {
+                row,
+                message: "UTF-8 column length overflows",
+            })?;
+        if value_bytes > i32::MAX as usize {
+            return Err(DecodeError::InvalidValue {
+                row,
+                message: "UTF-8 column exceeds Arrow's 32-bit offset limit; lower adbc.monetdb.batch_rows",
+            });
+        }
+        builder.append_value(value);
+        pos += end + 1;
+    }
+    if pos != bytes.len() {
+        return Err(DecodeError::Length {
+            expected: pos,
+            actual: bytes.len(),
+        });
+    }
+    Ok(Some(builder.finish()))
+}
+
+fn decode_strings_with_backrefs(bytes: &[u8], rows: usize) -> Result<StringArray, DecodeError> {
+    let mut builder = StringBuilder::with_capacity(rows, bytes.len());
+    let mut history: Vec<Option<&str>> = Vec::with_capacity(rows);
     let mut pos = 0;
     let mut value_bytes = 0usize;
     for row in 0..rows {
@@ -736,13 +879,10 @@ pub(crate) fn decode_strings(bytes: &[u8], rows: usize) -> Result<StringArray, D
                 .ok_or(DecodeError::InvalidBackref { row })?
         } else {
             let tail = &bytes[pos..];
-            let end = tail
-                .iter()
-                .position(|&byte| byte == 0)
-                .ok_or(DecodeError::Length {
-                    expected: bytes.len() + 1,
-                    actual: bytes.len(),
-                })?;
+            let end = memchr::memchr(0, tail).ok_or(DecodeError::Length {
+                expected: bytes.len() + 1,
+                actual: bytes.len(),
+            })?;
             let string =
                 std::str::from_utf8(&tail[..end]).map_err(|_| DecodeError::InvalidUtf8 { row })?;
             pos += end + 1;
@@ -760,7 +900,7 @@ pub(crate) fn decode_strings(bytes: &[u8], rows: usize) -> Result<StringArray, D
                 if value_bytes > i32::MAX as usize {
                     return Err(DecodeError::InvalidValue {
                         row,
-                        message: "UTF-8 column exceeds Arrow's 32-bit offset limit",
+                        message: "UTF-8 column exceeds Arrow's 32-bit offset limit; lower adbc.monetdb.batch_rows",
                     });
                 }
                 builder.append_value(value);
@@ -828,9 +968,15 @@ fn decode_blob(bytes: &[u8], rows: usize) -> Result<BinaryArray, DecodeError> {
         })?;
         let length = i64::from_le_bytes(header.try_into().expect("blob header is 8 bytes"));
         pos += 8;
-        if length < 0 {
+        if length == -1 {
             builder.append_null();
             continue;
+        }
+        if length < -1 {
+            return Err(DecodeError::InvalidValue {
+                row,
+                message: "BLOB length is negative but is not the -1 NULL sentinel",
+            });
         }
         let length = usize::try_from(length).map_err(|_| DecodeError::InvalidValue {
             row,
@@ -975,7 +1121,10 @@ fn decode_inet(bytes: &[u8], rows: usize) -> Result<StringArray, DecodeError> {
     } else if bytes.len() == rows.saturating_mul(16) {
         16
     } else {
-        return Err(DecodeError::Unsupported(MonetType::Inet));
+        return Err(DecodeError::InvalidValue {
+            row: 0,
+            message: "INET column length is neither 4 nor 16 bytes per row",
+        });
     };
     let mut builder = StringBuilder::with_capacity(rows, rows.saturating_mul(39));
     for value in bytes.chunks_exact(width) {
@@ -1235,6 +1384,20 @@ mod tests {
     }
 
     #[test]
+    fn validates_frame_identity_and_offset() {
+        let mut frame = b"&6 7 0 0 5\n".to_vec();
+        frame.extend_from_slice(&(frame.len() as i64).to_le_bytes());
+        assert!(matches!(
+            decode_frame(&frame, &[], 8, 5),
+            Err(DecodeError::ResultId { .. })
+        ));
+        assert!(matches!(
+            decode_frame(&frame, &[], 7, 4),
+            Err(DecodeError::StartRow { .. })
+        ));
+    }
+
+    #[test]
     fn decodes_fixed_width_sentinels() {
         let ints = [
             1i32.to_le_bytes(),
@@ -1299,6 +1462,21 @@ mod tests {
             decode_column(&MonetType::Decimal(38, 128), &[0; 16], 1),
             Err(DecodeError::InvalidValue { .. })
         ));
+        for data_type in [MonetType::Decimal(0, 0), MonetType::Decimal(38, 39)] {
+            assert!(matches!(
+                data_type_for_monet_type(&data_type),
+                Err(DecodeError::InvalidValue { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_values_outside_decimal128_precision() {
+        let value = 10i128.pow(38).to_le_bytes();
+        assert!(matches!(
+            decode_column(&MonetType::HugeInt, &value, 1),
+            Err(DecodeError::InvalidValue { row: 0, .. })
+        ));
     }
 
     #[test]
@@ -1318,6 +1496,23 @@ mod tests {
         let array = decode_column(&MonetType::Oid, &(1u64 << 63).to_le_bytes(), 1).unwrap();
         let array = array.as_any().downcast_ref::<UInt64Array>().unwrap();
         assert!(array.is_null(0));
+        assert_eq!(parse_inline_oid("42@0").unwrap(), 42);
+        let field = field_for_monet_type("oid", &MonetType::Oid).unwrap();
+        assert_eq!(
+            field
+                .metadata()
+                .get("ARROW:extension:name")
+                .map(String::as_str),
+            Some("monetdb.oid")
+        );
+        let field = field_for_monet_type("url", &MonetType::Url).unwrap();
+        assert_eq!(
+            field
+                .metadata()
+                .get("ARROW:extension:name")
+                .map(String::as_str),
+            Some("monetdb.url")
+        );
     }
 
     #[test]
@@ -1441,6 +1636,11 @@ mod tests {
         let array = decode_blob(&blobs, 2).unwrap();
         assert_eq!(array.value(0), b"abc");
         assert!(array.is_null(1));
+
+        assert!(matches!(
+            decode_blob(&(-2i64).to_le_bytes(), 1),
+            Err(DecodeError::InvalidValue { row: 0, .. })
+        ));
 
         let mut uuids = vec![1; 16];
         uuids.extend_from_slice(&[0; 16]);
