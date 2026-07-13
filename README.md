@@ -5,8 +5,7 @@
 Arrow-native reads and writes for MonetDB: polars, pandas, and every other ADBC consumer get
 columnar result sets (MonetDB's binary result-set protocol decoded directly into Arrow record
 batches) and bulk ingestion (`COPY BINARY ... ON CLIENT` streamed from Arrow buffers) through one
-standard interface. The implementation plan lives in the
-[project plan](https://github.com/wlaur/adbc-driver-monetdb/blob/main/docs/PLAN.md).
+standard interface.
 
 ## Usage
 

@@ -1,4 +1,5 @@
 import hashlib
+import re
 import socket
 import ssl
 import subprocess
@@ -96,6 +97,19 @@ def _openssl(directory: Path, *arguments: str) -> None:
 
 
 def _certificates(directory: Path) -> tuple[Path, Path, Path, Path, str]:
+    try:
+        version = subprocess.run(
+            ["openssl", "version"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        pytest.skip("OpenSSL 3 CLI is required for TLS certificate tests")
+    match = re.match(r"OpenSSL\s+(\d+)", version)
+    if match is None or int(match.group(1)) < 3:
+        pytest.skip("OpenSSL 3 CLI is required for -copy_extensions")
+
     ca = directory / "ca.crt"
     server = directory / "server.crt"
     client = directory / "client.crt"

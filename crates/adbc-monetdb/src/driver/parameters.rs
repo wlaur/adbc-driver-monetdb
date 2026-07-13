@@ -13,7 +13,7 @@ use arrow_array::{
         UInt32Type, UInt64Type,
     },
 };
-use arrow_schema::{DataType, TimeUnit};
+use arrow_schema::{DataType, Field, TimeUnit};
 use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
 
 use super::error;
@@ -53,7 +53,8 @@ pub(super) fn render_arguments(batch: &RecordBatch, row: usize) -> Result<Vec<St
     batch
         .columns()
         .iter()
-        .map(|array| literal(array.as_ref(), row))
+        .zip(batch.schema().fields())
+        .map(|(array, field)| literal(field, array.as_ref(), row))
         .collect()
 }
 
@@ -248,10 +249,14 @@ fn copy_char(query: &str, index: usize, output: &mut String) -> usize {
     index + character.len_utf8()
 }
 
-fn literal(array: &dyn Array, row: usize) -> Result<String> {
+fn literal(field: &Field, array: &dyn Array, row: usize) -> Result<String> {
     if array.is_null(row) {
         return Ok("NULL".into());
     }
+    let extension = field
+        .metadata()
+        .get("ARROW:extension:name")
+        .map(String::as_str);
     macro_rules! primitive {
         ($array:ty, $type:expr) => {{ downcast::<$array>(array, $type)?.value(row).to_string() }};
     }
@@ -266,11 +271,25 @@ fn literal(array: &dyn Array, row: usize) -> Result<String> {
         }
         DataType::Int8 => primitive!(Int8Array, DataType::Int8),
         DataType::Int16 => primitive!(Int16Array, DataType::Int16),
+        DataType::Int32 if extension == Some("monetdb.interval_month") => format!(
+            "INTERVAL '{}' MONTH",
+            downcast::<Int32Array>(array, DataType::Int32)?.value(row)
+        ),
         DataType::Int32 => primitive!(Int32Array, DataType::Int32),
         DataType::Int64 => primitive!(Int64Array, DataType::Int64),
         DataType::UInt8 => primitive!(UInt8Array, DataType::UInt8),
         DataType::UInt16 => primitive!(UInt16Array, DataType::UInt16),
         DataType::UInt32 => primitive!(UInt32Array, DataType::UInt32),
+        DataType::UInt64 if extension == Some("monetdb.oid") => {
+            let value = downcast::<UInt64Array>(array, DataType::UInt64)?.value(row);
+            if value >= 1 << 63 {
+                return Err(error(
+                    "OID parameter must be less than 2^63",
+                    Status::InvalidData,
+                ));
+            }
+            value.to_string()
+        }
         DataType::UInt64 => primitive!(UInt64Array, DataType::UInt64),
         DataType::Float16 => float_literal(f64::from(
             downcast::<Float16Array>(array, DataType::Float16)?.value(row),
@@ -301,6 +320,9 @@ fn literal(array: &dyn Array, row: usize) -> Result<String> {
         DataType::BinaryView => {
             blob_literal(downcast::<BinaryViewArray>(array, DataType::BinaryView)?.value(row))
         }
+        DataType::FixedSizeBinary(16) if extension == Some("arrow.uuid") => uuid_literal(
+            downcast::<FixedSizeBinaryArray>(array, DataType::FixedSizeBinary(16))?.value(row),
+        ),
         DataType::FixedSizeBinary(_) => blob_literal(
             downcast::<FixedSizeBinaryArray>(array, array.data_type().clone())?.value(row),
         ),
@@ -318,12 +340,17 @@ fn literal(array: &dyn Array, row: usize) -> Result<String> {
             date_literal(millis / 86_400_000)?
         }
         DataType::Time32(unit) => time32_literal(array, *unit, row)?,
-        DataType::Time64(unit) => time64_literal(array, *unit, row)?,
+        DataType::Time64(unit) => {
+            time64_literal(array, *unit, extension == Some("monetdb.timetz"), row)?
+        }
         DataType::Timestamp(unit, timezone) => {
             timestamp_literal(array, *unit, timezone.is_some(), row)?
         }
+        DataType::Duration(unit) if extension == Some("monetdb.interval_day") => {
+            day_interval_literal(array, *unit, row)?
+        }
         DataType::Duration(unit) => duration_literal(array, *unit, row)?,
-        DataType::Dictionary(key, _) => dictionary_literal(array, key, row)?,
+        DataType::Dictionary(key, _) => dictionary_literal(field, array, key, row)?,
         data_type => {
             return Err(error(
                 format!("Arrow parameter type {data_type} is not supported"),
@@ -346,13 +373,11 @@ fn downcast<T: 'static>(array: &dyn Array, expected: DataType) -> Result<&T> {
 }
 
 fn float_literal(value: f64) -> Result<String> {
-    if value.is_nan() {
-        Ok("NULL".into())
-    } else if value.is_finite() {
+    if value.is_finite() {
         Ok(format!("{value:e}"))
     } else {
         Err(error(
-            "infinite float parameters are not supported by MonetDB",
+            "non-finite float parameters are not supported by MonetDB",
             Status::InvalidData,
         ))
     }
@@ -402,6 +427,21 @@ fn blob_literal(value: &[u8]) -> String {
     output
 }
 
+fn uuid_literal(value: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(43);
+    output.push_str("UUID '");
+    for (index, &byte) in value.iter().enumerate() {
+        if matches!(index, 4 | 6 | 8 | 10) {
+            output.push('-');
+        }
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output.push('\'');
+    output
+}
+
 fn date_literal(days: i64) -> Result<String> {
     Ok(format!("DATE '{}'", date_from_days(days)?))
 }
@@ -426,7 +466,7 @@ fn time32_literal(array: &dyn Array, unit: TimeUnit, row: usize) -> Result<Strin
     format_time(micros).map(|value| format!("TIME '{value}'"))
 }
 
-fn time64_literal(array: &dyn Array, unit: TimeUnit, row: usize) -> Result<String> {
+fn time64_literal(array: &dyn Array, unit: TimeUnit, timezone: bool, row: usize) -> Result<String> {
     let micros = match unit {
         TimeUnit::Microsecond => {
             downcast::<Time64MicrosecondArray>(array, DataType::Time64(unit))?.value(row)
@@ -449,7 +489,13 @@ fn time64_literal(array: &dyn Array, unit: TimeUnit, row: usize) -> Result<Strin
             ));
         }
     };
-    format_time(micros).map(|value| format!("TIME '{value}'"))
+    format_time(micros).map(|value| {
+        if timezone {
+            format!("TIMETZ '{value}+00:00'")
+        } else {
+            format!("TIME '{value}'")
+        }
+    })
 }
 
 fn timestamp_literal(
@@ -494,6 +540,35 @@ fn timestamp_literal(
 }
 
 fn duration_literal(array: &dyn Array, unit: TimeUnit, row: usize) -> Result<String> {
+    let millis = duration_millis(array, unit, row)?;
+    let negative = millis < 0;
+    let absolute = millis.unsigned_abs();
+    let seconds = absolute / 1_000;
+    let fraction = absolute % 1_000;
+    Ok(format!(
+        "INTERVAL '{}{}.{fraction:03}' SECOND",
+        if negative { "-" } else { "" },
+        seconds
+    ))
+}
+
+fn day_interval_literal(array: &dyn Array, unit: TimeUnit, row: usize) -> Result<String> {
+    let millis = duration_millis(array, unit, row)?;
+    let negative = millis < 0;
+    let absolute = millis.unsigned_abs();
+    let total_seconds = absolute / 1_000;
+    let days = total_seconds / 86_400;
+    let hours = total_seconds / 3_600 % 24;
+    let minutes = total_seconds / 60 % 60;
+    let seconds = total_seconds % 60;
+    let fraction = absolute % 1_000;
+    Ok(format!(
+        "INTERVAL '{}{days} {hours:02}:{minutes:02}:{seconds:02}.{fraction:03}' DAY TO SECOND",
+        if negative { "-" } else { "" }
+    ))
+}
+
+fn duration_millis(array: &dyn Array, unit: TimeUnit, row: usize) -> Result<i64> {
     macro_rules! duration {
         ($array:ty) => {{ downcast::<$array>(array, DataType::Duration(unit))?.value(row) }};
     }
@@ -523,15 +598,7 @@ fn duration_literal(array: &dyn Array, unit: TimeUnit, row: usize) -> Result<Str
             value / 1_000_000
         }
     };
-    let negative = millis < 0;
-    let absolute = millis.unsigned_abs();
-    let seconds = absolute / 1_000;
-    let fraction = absolute % 1_000;
-    Ok(format!(
-        "INTERVAL '{}{}.{fraction:03}' SECOND",
-        if negative { "-" } else { "" },
-        seconds
-    ))
+    Ok(millis)
 }
 
 fn format_time(micros: i64) -> Result<String> {
@@ -551,10 +618,16 @@ fn format_time(micros: i64) -> Result<String> {
     ))
 }
 
-fn dictionary_literal(array: &dyn Array, key: &DataType, row: usize) -> Result<String> {
+fn dictionary_literal(
+    field: &Field,
+    array: &dyn Array,
+    key: &DataType,
+    row: usize,
+) -> Result<String> {
     macro_rules! keys {
         ($type:ty) => {{
             dictionary_value(
+                field,
                 downcast::<DictionaryArray<$type>>(array, array.data_type().clone())?,
                 row,
             )
@@ -577,11 +650,16 @@ fn dictionary_literal(array: &dyn Array, key: &DataType, row: usize) -> Result<S
 }
 
 fn dictionary_value<K: ArrowDictionaryKeyType>(
+    field: &Field,
     array: &DictionaryArray<K>,
     row: usize,
 ) -> Result<String> {
     match array.key(row) {
-        Some(key) => literal(array.values().as_ref(), key),
+        Some(key) => {
+            let value_field = Field::new("", array.values().data_type().clone(), true)
+                .with_metadata(field.metadata().clone());
+            literal(&value_field, array.values().as_ref(), key)
+        }
         None => Ok("NULL".into()),
     }
 }
@@ -600,7 +678,11 @@ fn date_from_days(days: i64) -> Result<NaiveDate> {
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{Int32Array, StringArray};
+    use arrow_array::{
+        DictionaryArray, DurationMillisecondArray, Float64Array, Int8Array, Int32Array,
+        StringArray, Time64MicrosecondArray, UInt64Array, builder::FixedSizeBinaryBuilder,
+        types::Int8Type,
+    };
     use arrow_schema::{Field, Schema};
 
     use super::*;
@@ -672,5 +754,59 @@ mod tests {
             assert_eq!(date_literal(days).unwrap(), expected);
         }
         assert_eq!(format_time(3_723_123_456).unwrap(), "01:02:03.123456");
+    }
+
+    #[test]
+    fn renders_extension_parameters_without_losing_their_monetdb_type() {
+        let metadata = |name: &str| [("ARROW:extension:name".to_owned(), name.to_owned())].into();
+        let month = Field::new("m", DataType::Int32, false)
+            .with_metadata(metadata("monetdb.interval_month"));
+        assert_eq!(
+            literal(&month, &Int32Array::from(vec![18]), 0).unwrap(),
+            "INTERVAL '18' MONTH"
+        );
+
+        let day = Field::new("d", DataType::Duration(TimeUnit::Millisecond), false)
+            .with_metadata(metadata("monetdb.interval_day"));
+        assert_eq!(
+            literal(&day, &DurationMillisecondArray::from(vec![86_401_500]), 0).unwrap(),
+            "INTERVAL '1 00:00:01.500' DAY TO SECOND"
+        );
+
+        let mut uuids = FixedSizeBinaryBuilder::with_capacity(1, 16);
+        uuids.append_value([0x12; 16]).unwrap();
+        let uuid = Field::new("u", DataType::FixedSizeBinary(16), false)
+            .with_metadata(metadata("arrow.uuid"));
+        assert_eq!(
+            literal(&uuid, &uuids.finish(), 0).unwrap(),
+            "UUID '12121212-1212-1212-1212-121212121212'"
+        );
+
+        let oid = Field::new("o", DataType::UInt64, false).with_metadata(metadata("monetdb.oid"));
+        assert!(literal(&oid, &UInt64Array::from(vec![1u64 << 63]), 0).is_err());
+
+        let timetz = Field::new("t", DataType::Time64(TimeUnit::Microsecond), false)
+            .with_metadata(metadata("monetdb.timetz"));
+        assert_eq!(
+            literal(
+                &timetz,
+                &Time64MicrosecondArray::from(vec![3_723_000_000]),
+                0
+            )
+            .unwrap(),
+            "TIMETZ '01:02:03.000000+00:00'"
+        );
+    }
+
+    #[test]
+    fn rejects_non_finite_and_supports_non_string_dictionary_parameters() {
+        let float = Field::new("f", DataType::Float64, false);
+        assert!(literal(&float, &Float64Array::from(vec![f64::NAN]), 0).is_err());
+
+        let keys = Int8Array::from(vec![1, 0]);
+        let values = Arc::new(Int32Array::from(vec![10, 20]));
+        let dictionary = DictionaryArray::<Int8Type>::try_new(keys, values).unwrap();
+        let field = Field::new("d", dictionary.data_type().clone(), false);
+        assert_eq!(literal(&field, &dictionary, 0).unwrap(), "20");
     }
 }

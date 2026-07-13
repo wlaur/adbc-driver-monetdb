@@ -3,3 +3,5 @@
 The module exists to be located on disk (``_native.__file__``); it exposes no
 Python API of its own.
 """
+
+__adbc_entrypoint__: str

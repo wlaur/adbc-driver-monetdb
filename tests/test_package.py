@@ -16,6 +16,9 @@ def test_version() -> None:
 
 def test_driver_path_exists() -> None:
     assert Path(adbc_driver_monetdb.driver_path()).exists()
+    from adbc_driver_monetdb import _native
+
+    assert _native.__adbc_entrypoint__ == adbc_driver_monetdb.ENTRYPOINT
 
 
 def test_connect_rejects_invalid_uri() -> None:
@@ -27,8 +30,8 @@ def test_connect_rejects_unreachable_tcp_without_poisoning_driver() -> None:
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
-    with pytest.raises(adbc_driver_manager.OperationalError, match=r"refused|connect|Connection"):
-        dbapi.connect(f"monetdb://127.0.0.1:{port}/test?connect_timeout=1")
+        with pytest.raises(adbc_driver_manager.OperationalError, match=r"refused|connect|Connection"):
+            dbapi.connect(f"monetdb://127.0.0.1:{port}/test?connect_timeout=1")
     with pytest.raises(adbc_driver_manager.ProgrammingError):
         dbapi.connect("still-not-a-uri")
 
@@ -46,9 +49,16 @@ def test_connect_reports_tls_handshake_failure_cleanly() -> None:
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         listener.listen(1)
+        listener.settimeout(10)
         port = listener.getsockname()[1]
-        thread = Thread(target=lambda: listener.accept()[0].close())
+
+        def accept_one() -> None:
+            connection, _ = listener.accept()
+            connection.close()
+
+        thread = Thread(target=accept_one)
         thread.start()
         with pytest.raises(adbc_driver_manager.OperationalError):
             dbapi.connect(f"monetdbs://127.0.0.1:{port}/test?connect_timeout=1")
-        thread.join()
+        thread.join(timeout=10)
+        assert not thread.is_alive()

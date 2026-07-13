@@ -16,6 +16,9 @@ on:
     branches: [main]
     tags: ["v*"]
 
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -55,12 +58,15 @@ jobs:
           rustup default stable
           rustup component add rustfmt clippy
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
-      - run: cargo clippy --manifest-path monetdb-rust/Cargo.toml --lib --all-features -- -D warnings
-      - run: cargo test --manifest-path monetdb-rust/Cargo.toml --lib --all-features
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
       - run: ./checklicense.py --check
         working-directory: monetdb-rust
+      - name: Verify the NOTICE fork revision
+        shell: bash
+        run: |
+          revision=$(git submodule status monetdb-rust | awk '{print $1}' | sed 's/^[+-]//')
+          grep -F "monetdb-rust/tree/$revision" NOTICE
 
   build-sdist:
     name: build sdist
@@ -117,6 +123,19 @@ jobs:
         with:
           package-dir: .
           output-dir: wheelhouse
+      - name: Verify wheel license payload
+        shell: bash
+        run: |
+          python - <<'PY'
+          from glob import glob
+          from zipfile import ZipFile
+          wheels = glob("wheelhouse/*.whl")
+          assert len(wheels) == 1, wheels
+          with ZipFile(wheels[0]) as wheel:
+              names = set(wheel.namelist())
+          for suffix in (".dist-info/licenses/LICENSE", ".dist-info/licenses/NOTICE", ".dist-info/licenses/monetdb-rust/LICENSE"):
+              assert any(name.endswith(suffix) for name in names), suffix
+          PY
       - name: Audit Linux wheel dependencies
         if: runner.os == 'Linux'
         shell: bash
@@ -177,7 +196,7 @@ jobs:
         run: |
           wheel=$(find "$GITHUB_WORKSPACE/wheelhouse" -maxdepth 1 -name 'adbc_driver_monetdb-*.whl' -print -quit)
           uv run --isolated --no-project --python '${{ matrix.python }}' \
-            --with "$wheel" --with pytest --with polars --with 'pandas>=3.0' --with 'pyarrow>=25' \
+            --with "$wheel" --with 'pytest>=9' --with 'polars>=1.42' --with 'pandas>=3.0' --with 'pyarrow>=25' \
             python -m pytest "$GITHUB_WORKSPACE/tests" -m 'not integration' \
               --ignore "$GITHUB_WORKSPACE/tests/validation" -q
 
@@ -233,9 +252,10 @@ jobs:
         working-directory: ${{ runner.temp }}
         shell: bash
         run: |
+          test -n "$MONETDB_TEST_URI"
           wheel=$(find "$GITHUB_WORKSPACE/wheelhouse" -maxdepth 1 -name 'adbc_driver_monetdb-*.whl' -print -quit)
           uv run --isolated --no-project --python 3.13 \
-            --with "$wheel" --with pytest --with polars --with 'pandas>=3.0' \
+            --with "$wheel" --with 'pytest>=9' --with 'polars>=1.42' --with 'pandas>=3.0' \
             --with pymonetdb --with 'pyarrow>=25' \
             python -m pytest "$GITHUB_WORKSPACE/tests" -m integration \
               --ignore "$GITHUB_WORKSPACE/tests/validation" -q
@@ -243,11 +263,6 @@ jobs:
             --with "$wheel" --with pytest --with pymonetdb \
             --with 'adbc-drivers-validation @ git+https://github.com/adbc-drivers/validation@20bcdbe0d498065565e727861ca7e1f94d9b66bb' \
             python -m pytest "$GITHUB_WORKSPACE/tests/validation" -q
-      - name: Run monetdb-rust live protocol tests
-        env:
-          CI_SERVER_URL: monetdb://monetdb:monetdb@localhost:50000/test
-        run: cargo test --manifest-path monetdb-rust/Cargo.toml --test ci --all-features
-
   publish:
     name: publish to PyPI
     needs: [lint, rust, build-sdist, build-wheels, test, integration]

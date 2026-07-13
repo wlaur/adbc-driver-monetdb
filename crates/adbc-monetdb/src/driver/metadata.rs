@@ -122,7 +122,7 @@ pub(super) fn load_objects(
 
         for row in 0..batch.num_rows() {
             let schema_name = schema_names.value(row);
-            if !matches_filter(schema_filter, schema_name) {
+            if !matches_filter(schema_filter, schema_name)? {
                 continue;
             }
             if schemas.last().map(|schema| schema.name.as_str()) != Some(schema_name) {
@@ -136,7 +136,7 @@ pub(super) fn load_objects(
             }
             let table_name = table_names.value(row);
             let table_type = table_type_names.value(row);
-            if !matches_filter(table_filter, table_name)
+            if !matches_filter(table_filter, table_name)?
                 || !table_types
                     .map(|types| types.contains(&table_type))
                     .unwrap_or(true)
@@ -156,7 +156,7 @@ pub(super) fn load_objects(
                 continue;
             }
             let column_name = column_names.value(row);
-            if !matches_filter(column_filter, column_name) {
+            if !matches_filter(column_filter, column_name)? {
                 continue;
             }
             schema
@@ -342,6 +342,8 @@ fn load_constraints(
 }
 
 fn constraint_type_name(value: i32) -> &'static str {
+    // MonetDB `sql/include/sql_catalog.h` defines the key-type codes used by
+    // `sys.keys`: primary=0, unique=1, foreign=2, key=3, and check=4.
     match value {
         0 => "PRIMARY KEY",
         1 | 3 => "UNIQUE",
@@ -360,15 +362,16 @@ fn array_as<T: 'static>(batch: &RecordBatch, index: usize) -> Result<&T> {
     })
 }
 
-fn matches_filter(filter: Option<&str>, value: &str) -> bool {
+fn matches_filter(filter: Option<&str>, value: &str) -> Result<bool> {
     filter
         .map(|pattern| like_pattern_matches(pattern, value))
-        .unwrap_or(true)
+        .unwrap_or(Ok(true))
 }
 
 fn like_predicate(column: &str, pattern: Option<&str>) -> Result<Option<String>> {
     pattern
         .map(|pattern| {
+            validate_like_pattern(pattern)?;
             Ok(format!(
                 "{column} LIKE {} ESCAPE R'\\'",
                 raw_string_literal(pattern)?
@@ -402,7 +405,33 @@ pub(super) fn raw_string_literal(value: &str) -> Result<String> {
     Ok(format!("R'{}'", value.replace('\'', "''")))
 }
 
-pub(super) fn like_pattern_matches(pattern: &str, value: &str) -> bool {
+fn validate_like_pattern(pattern: &str) -> Result<()> {
+    let mut chars = pattern.chars();
+    while let Some(character) = chars.next() {
+        if character != '\\' {
+            continue;
+        }
+        match chars.next() {
+            Some('%' | '_' | '\\') => {}
+            Some(character) => {
+                return Err(error(
+                    format!("metadata LIKE pattern has invalid escape '\\{character}'"),
+                    Status::InvalidArguments,
+                ));
+            }
+            None => {
+                return Err(error(
+                    "metadata LIKE pattern ends with an escape character",
+                    Status::InvalidArguments,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn like_pattern_matches(pattern: &str, value: &str) -> Result<bool> {
+    validate_like_pattern(pattern)?;
     #[derive(Clone, Copy)]
     enum Token {
         Many,
@@ -415,7 +444,9 @@ pub(super) fn like_pattern_matches(pattern: &str, value: &str) -> bool {
         match character {
             '%' => tokens.push(Token::Many),
             '_' => tokens.push(Token::One),
-            '\\' => tokens.push(Token::Literal(chars.next().unwrap_or('\\'))),
+            '\\' => tokens.push(Token::Literal(
+                chars.next().expect("pattern escapes were validated"),
+            )),
             character => tokens.push(Token::Literal(character)),
         }
     }
@@ -443,14 +474,14 @@ pub(super) fn like_pattern_matches(pattern: &str, value: &str) -> bool {
                     retry += 1;
                     character = retry;
                 }
-                None => return false,
+                None => return Ok(false),
             },
         }
     }
     while matches!(tokens.get(token), Some(Token::Many)) {
         token += 1;
     }
-    token == tokens.len()
+    Ok(token == tokens.len())
 }
 
 pub(super) fn objects_batch(
@@ -465,7 +496,7 @@ pub(super) fn objects_batch(
         catalog_names.append_value(catalog);
         let schema_list = list_builder(&mut schema_lists)?;
         if depth == ObjectDepth::Catalogs {
-            schema_list.append(true);
+            schema_list.append_null();
         } else {
             for schema in schemas {
                 append_object_schema(schema_list, schema, catalog, depth)?;
@@ -638,10 +669,10 @@ fn append_object_column(
         .append_option(column.default_value.as_deref());
     item.field_builder::<Int16Builder>(10)
         .expect("canonical SQL data type builder")
-        .append_option(xdbc.data_type);
+        .append_option(xdbc.sql_data_type);
     item.field_builder::<Int16Builder>(11)
         .expect("canonical datetime subtype builder")
-        .append_null();
+        .append_option(xdbc.datetime_sub);
     item.field_builder::<Int32Builder>(12)
         .expect("canonical octet length builder")
         .append_option(xdbc.char_length);
@@ -665,6 +696,8 @@ fn append_object_column(
 
 struct XdbcType {
     data_type: Option<i16>,
+    sql_data_type: Option<i16>,
+    datetime_sub: Option<i16>,
     size: Option<i32>,
     decimal_digits: Option<i16>,
     radix: Option<i16>,
@@ -673,24 +706,33 @@ struct XdbcType {
 
 fn xdbc_type(column: &ObjectColumn) -> XdbcType {
     let name = column.type_name.to_ascii_lowercase();
-    let data_type = match name.as_str() {
-        "boolean" => Some(16),
-        "tinyint" => Some(-6),
-        "smallint" => Some(5),
-        "int" | "integer" => Some(4),
-        "bigint" | "hugeint" => Some(-5),
-        "decimal" => Some(3),
-        "real" => Some(7),
-        "double" => Some(8),
-        "date" => Some(91),
-        "time" | "timetz" => Some(92),
-        "timestamp" | "timestamptz" => Some(93),
-        "blob" => Some(-4),
-        "char" | "varchar" | "clob" | "string" | "json" | "url" | "inet" | "uuid" => Some(12),
-        _ if name.contains("interval") => Some(110),
-        _ => None,
+    let (data_type, sql_data_type, datetime_sub) = match name.as_str() {
+        "boolean" => (Some(16), Some(16), None),
+        "tinyint" => (Some(-6), Some(-6), None),
+        "smallint" => (Some(5), Some(5), None),
+        "int" | "integer" => (Some(4), Some(4), None),
+        "bigint" => (Some(-5), Some(-5), None),
+        "hugeint" | "decimal" => (Some(3), Some(3), None),
+        "real" => (Some(7), Some(7), None),
+        "double" => (Some(8), Some(8), None),
+        "date" => (Some(91), Some(9), Some(1)),
+        "time" | "timetz" => (Some(92), Some(9), Some(2)),
+        "timestamp" | "timestamptz" => (Some(93), Some(9), Some(3)),
+        "blob" => (Some(-4), Some(-4), None),
+        "char" => (Some(1), Some(1), None),
+        "varchar" | "json" | "url" | "inet" => (Some(12), Some(12), None),
+        "uuid" => (Some(-11), Some(-11), None),
+        _ if name.contains("month_interval") || name.contains("month interval") => {
+            (Some(107), Some(10), Some(107))
+        }
+        _ if name.contains("interval") => (Some(110), Some(10), Some(110)),
+        _ => (None, None, None),
     };
-    let size = (column.digits > 0).then_some(column.digits);
+    let size = if name == "hugeint" {
+        Some(38)
+    } else {
+        (column.digits > 0).then_some(column.digits)
+    };
     let decimal_digits = (name == "decimal")
         .then(|| i16::try_from(column.scale).ok())
         .flatten();
@@ -699,14 +741,13 @@ fn xdbc_type(column: &ObjectColumn) -> XdbcType {
         "tinyint" | "smallint" | "int" | "integer" | "bigint" | "hugeint" | "decimal"
     )
     .then_some(10);
-    let char_length = matches!(
-        name.as_str(),
-        "char" | "varchar" | "clob" | "string" | "json" | "url" | "inet"
-    )
-    .then_some(column.digits)
-    .filter(|length| *length > 0);
+    let char_length = matches!(name.as_str(), "char" | "varchar" | "json" | "url" | "inet")
+        .then_some(column.digits)
+        .filter(|length| *length > 0);
     XdbcType {
         data_type,
+        sql_data_type,
+        datetime_sub,
         size,
         decimal_digits,
         radix,
@@ -740,24 +781,52 @@ mod tests {
 
     #[test]
     fn matches_adbc_like_patterns() {
-        assert!(like_pattern_matches("pub%", "public"));
-        assert!(like_pattern_matches("_ublic", "public"));
-        assert!(like_pattern_matches(r"a\%b", "a%b"));
-        assert!(!like_pattern_matches("sys", "public"));
+        assert!(like_pattern_matches("pub%", "public").unwrap());
+        assert!(like_pattern_matches("_ublic", "public").unwrap());
+        assert!(like_pattern_matches(r"a\%b", "a%b").unwrap());
+        assert!(!like_pattern_matches("sys", "public").unwrap());
+        assert!(like_pattern_matches("bad\\", "bad").is_err());
+        assert!(like_pattern_matches(r"bad\x", "badx").is_err());
         let adversarial = format!("{}x", "%".repeat(100_000));
-        assert!(!like_pattern_matches(&adversarial, &"a".repeat(100_000)));
+        assert!(!like_pattern_matches(&adversarial, &"a".repeat(100_000)).unwrap());
         assert_eq!(raw_string_literal("a'b\\c").unwrap(), "R'a''b\\c'");
     }
 
     #[test]
-    fn catalogs_depth_has_an_empty_schema_list() {
+    fn catalogs_depth_has_a_null_schema_list() {
         let batch = objects_batch("test", true, ObjectDepth::Catalogs, &[]).unwrap();
         let schemas = batch
             .column(1)
             .as_any()
             .downcast_ref::<ListArray>()
             .unwrap();
-        assert!(!schemas.is_null(0));
-        assert_eq!(schemas.value_length(0), 0);
+        assert!(schemas.is_null(0));
+    }
+
+    #[test]
+    fn maps_xdbc_types_without_losing_hugeint_or_datetime_subtypes() {
+        let column = |type_name: &str, digits: i32| ObjectColumn {
+            name: "x".into(),
+            ordinal: 1,
+            remarks: None,
+            type_name: type_name.into(),
+            digits,
+            scale: 0,
+            nullable: true,
+            default_value: None,
+        };
+        assert_eq!(xdbc_type(&column("char", 8)).data_type, Some(1));
+        let hugeint = xdbc_type(&column("hugeint", 128));
+        assert_eq!((hugeint.data_type, hugeint.size), (Some(3), Some(38)));
+        let timestamp = xdbc_type(&column("timestamp", 6));
+        assert_eq!(
+            (
+                timestamp.data_type,
+                timestamp.sql_data_type,
+                timestamp.datetime_sub
+            ),
+            (Some(93), Some(9), Some(3))
+        );
+        assert_eq!(xdbc_type(&column("month_interval", 0)).data_type, Some(107));
     }
 }

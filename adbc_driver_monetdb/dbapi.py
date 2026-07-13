@@ -21,7 +21,7 @@ def connect(
     return adbc_driver_manager.dbapi.connect(
         driver=driver_path(),
         entrypoint=ENTRYPOINT,
-        db_kwargs={"uri": uri, **(db_kwargs or {})},
+        db_kwargs={**(db_kwargs or {}), "uri": uri},
         conn_kwargs=conn_kwargs,
         autocommit=autocommit,
     )

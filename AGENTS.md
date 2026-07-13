@@ -3,9 +3,8 @@
 An ADBC driver for MonetDB in Rust: reads decode the binary result-set protocol
 (`Xexportbin`) directly into Arrow record batches, writes stream Arrow columns through
 `COPY BINARY ... ON CLIENT`, and a thin Python shim exposes it all to polars/pandas via
-`adbc-driver-manager`. The [README](README.md) covers usage and layout;
-[docs/PLAN.md](docs/PLAN.md) is the plan of record (milestones, type mapping, protocol
-sharp edges). This file covers the conventions that are easy to get wrong.
+`adbc-driver-manager`. The [README](README.md) covers usage and layout. This file
+covers the conventions that are easy to get wrong.
 
 ## Hard support policy — no compatibility code
 

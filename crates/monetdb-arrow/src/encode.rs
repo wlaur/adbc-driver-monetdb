@@ -8,9 +8,9 @@ use std::{collections::HashMap, fmt};
 use arrow_array::{
     Array, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
     DictionaryArray, DurationMicrosecondArray, DurationMillisecondArray, DurationNanosecondArray,
-    DurationSecondArray, FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array,
-    Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, NullArray, PrimitiveArray,
-    StringArray, StringViewArray, Time32MillisecondArray, Time32SecondArray,
+    DurationSecondArray, FixedSizeBinaryArray, Float16Array, Float32Array, Float64Array, Int8Array,
+    Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, NullArray,
+    PrimitiveArray, StringArray, StringViewArray, Time32MillisecondArray, Time32SecondArray,
     Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
     TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
     UInt16Array, UInt32Array, UInt64Array,
@@ -70,8 +70,9 @@ pub fn monet_type_for_field(field: &Field) -> Result<MonetType, EncodeError> {
         DataType::UInt32 => MonetType::BigInt,
         DataType::UInt64 if extension == Some("monetdb.oid") => MonetType::Oid,
         DataType::UInt64 => MonetType::HugeInt,
-        DataType::Float32 => MonetType::Real,
+        DataType::Float16 | DataType::Float32 => MonetType::Real,
         DataType::Float64 => MonetType::Double,
+        DataType::Decimal128(38, 0) if extension == Some("monetdb.hugeint") => MonetType::HugeInt,
         DataType::Decimal128(precision, scale) if *scale >= 0 => {
             MonetType::Decimal(*precision, *scale as u8)
         }
@@ -92,6 +93,7 @@ pub fn monet_type_for_field(field: &Field) -> Result<MonetType, EncodeError> {
         DataType::FixedSizeBinary(16) if extension == Some("arrow.uuid") => MonetType::Uuid,
         DataType::FixedSizeBinary(_) => MonetType::Blob,
         DataType::Date32 | DataType::Date64 => MonetType::Date,
+        DataType::Time64(_) if extension == Some("monetdb.timetz") => MonetType::TimeTz,
         DataType::Time32(_) | DataType::Time64(_) => MonetType::Time,
         DataType::Timestamp(_, timezone) if timezone.is_some() => MonetType::TimestampTz,
         DataType::Timestamp(_, _) => MonetType::Timestamp,
@@ -136,6 +138,10 @@ pub fn sql_type_for_field(field: &Field) -> Result<String, EncodeError> {
     })
 }
 
+/// Encode an Arrow column for `COPY BINARY`.
+///
+/// `field.data_type()` and `array.data_type()` must describe the same logical
+/// type; extension metadata on `field` selects MonetDB-specific wire types.
 pub fn encode_column(field: &Field, array: &dyn Array) -> Result<Vec<u8>, EncodeError> {
     let mut out = Vec::new();
     if let Some(width) = fixed_wire_width(field, array.data_type())? {
@@ -164,7 +170,8 @@ pub fn encode_column(field: &Field, array: &dyn Array) -> Result<Vec<u8>, Encode
         ($array:ty, $wire:ty, $variant:expr) => {{
             let values = downcast::<$array>(array, $variant)?;
             for row in 0..values.len() {
-                let value: $wire = if values.is_null(row) {
+                let is_null = values.is_null(row);
+                let value: $wire = if is_null {
                     <$wire>::MIN
                 } else {
                     <$wire>::from(values.value(row))
@@ -193,6 +200,7 @@ pub fn encode_column(field: &Field, array: &dyn Array) -> Result<Vec<u8>, Encode
             encode_oid(downcast(array, DataType::UInt64)?, &mut out)?
         }
         DataType::UInt64 => unsigned!(UInt64Array, i128, DataType::UInt64),
+        DataType::Float16 => encode_f16(downcast(array, DataType::Float16)?, &mut out)?,
         DataType::Float32 => encode_f32(downcast(array, DataType::Float32)?, &mut out)?,
         DataType::Float64 => encode_f64(downcast(array, DataType::Float64)?, &mut out)?,
         DataType::Decimal128(precision, _) => encode_decimal(
@@ -302,12 +310,9 @@ where
     T::Native: PartialEq,
 {
     for row in 0..array.len() {
-        let value = if array.is_null(row) {
-            null
-        } else {
-            array.value(row)
-        };
-        if !array.is_null(row) && value == null {
+        let is_null = array.is_null(row);
+        let value = if is_null { null } else { array.value(row) };
+        if !is_null && value == null {
             return Err(EncodeError::InvalidValue {
                 row,
                 message: "value collides with MonetDB's NULL sentinel",
@@ -330,6 +335,8 @@ fn encode_bool(array: &BooleanArray, out: &mut Vec<u8>) {
 
 fn encode_oid(array: &UInt64Array, out: &mut Vec<u8>) -> Result<(), EncodeError> {
     const NULL: u64 = 1 << 63;
+    // `gdk_atoms.h` reserves exactly 2^63 as nil. The driver conservatively
+    // rejects the whole upper half so values cannot cross signed MAPI paths.
     for row in 0..array.len() {
         let value = if array.is_null(row) {
             NULL
@@ -354,10 +361,29 @@ fn encode_f32(array: &Float32Array, out: &mut Vec<u8>) -> Result<(), EncodeError
             f32::NAN
         } else {
             let value = array.value(row);
-            if value.is_nan() {
+            if !value.is_finite() {
                 return Err(EncodeError::InvalidValue {
                     row,
-                    message: "NaN is MonetDB's floating-point NULL sentinel",
+                    message: "non-finite floats are outside MonetDB's supported value domain",
+                });
+            }
+            value
+        };
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    Ok(())
+}
+
+fn encode_f16(array: &Float16Array, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+    for row in 0..array.len() {
+        let value = if array.is_null(row) {
+            f32::NAN
+        } else {
+            let value = f32::from(array.value(row));
+            if !value.is_finite() {
+                return Err(EncodeError::InvalidValue {
+                    row,
+                    message: "non-finite floats are outside MonetDB's supported value domain",
                 });
             }
             value
@@ -373,10 +399,10 @@ fn encode_f64(array: &Float64Array, out: &mut Vec<u8>) -> Result<(), EncodeError
             f64::NAN
         } else {
             let value = array.value(row);
-            if value.is_nan() {
+            if !value.is_finite() {
                 return Err(EncodeError::InvalidValue {
                     row,
-                    message: "NaN is MonetDB's floating-point NULL sentinel",
+                    message: "non-finite floats are outside MonetDB's supported value domain",
                 });
             }
             value
@@ -392,7 +418,11 @@ fn encode_decimal(
     out: &mut Vec<u8>,
 ) -> Result<(), EncodeError> {
     for row in 0..array.len() {
-        let value = (!array.is_null(row)).then(|| array.value(row));
+        let value = if array.is_null(row) {
+            None
+        } else {
+            Some(array.value(row))
+        };
         macro_rules! narrow {
             ($type:ty) => {{
                 let wire = match value {
@@ -451,10 +481,15 @@ fn encode_strings<'a>(
                     out.push(0);
                 }
             },
-            None => match null.replace(row) {
-                Some(previous) => append_backref(row - previous, out),
-                None => out.extend_from_slice(&[0x80, 0]),
-            },
+            None => {
+                match null {
+                    Some(previous) if row - previous < 16_384 => {
+                        append_backref(row - previous, out)
+                    }
+                    _ => out.extend_from_slice(&[0x80, 0]),
+                }
+                null = Some(row);
+            }
         }
     }
     Ok(())
@@ -511,6 +546,14 @@ fn encode_dictionary_strings<K: ArrowDictionaryKeyType>(
                 .as_any()
                 .downcast_ref::<$array>()
                 .ok_or_else(|| EncodeError::Unsupported(array.data_type().clone()))?;
+            for row in 0..array.len() {
+                if array.key(row).is_some_and(|key| key >= values.len()) {
+                    return Err(EncodeError::InvalidValue {
+                        row,
+                        message: "dictionary key is outside the dictionary values",
+                    });
+                }
+            }
             encode_strings(
                 (0..array.len()).map(|row| {
                     array
@@ -833,6 +876,9 @@ fn date_from_days(days: i64, row: usize) -> Result<NaiveDate, EncodeError> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use arrow_array::ArrayRef;
     use proptest::prelude::*;
 
     use crate::decode::decode_strings;
@@ -917,6 +963,27 @@ mod tests {
     }
 
     #[test]
+    fn dictionary_null_values_encode_as_nulls() {
+        let keys = Int8Array::from(vec![0, 1]);
+        let values: ArrayRef = Arc::new(StringArray::from(vec![Some("x"), None]));
+        let dictionary = DictionaryArray::<Int8Type>::try_new(keys, values).unwrap();
+        let field = Field::new("d", dictionary.data_type().clone(), true);
+        assert_eq!(encode_column(&field, &dictionary).unwrap(), b"x\0\x80\0");
+    }
+
+    #[test]
+    fn emits_canonical_nulls_when_a_backref_would_be_longer() {
+        let field = Field::new("s", DataType::Utf8, true);
+        let values = (0..=16_384)
+            .map(|row| (row != 0 && row != 16_384).then_some("x"))
+            .collect::<Vec<_>>();
+        let array = StringArray::from(values);
+        let encoded = encode_column(&field, &array).unwrap();
+        assert_eq!(&encoded[..2], &[0x80, 0]);
+        assert_eq!(&encoded[encoded.len() - 2..], &[0x80, 0]);
+    }
+
+    #[test]
     fn preserves_interval_extensions_on_write() {
         let month = Field::new("m", DataType::Int32, true).with_metadata(
             [(
@@ -957,6 +1024,27 @@ mod tests {
     }
 
     #[test]
+    fn preserves_hugeint_and_timetz_extensions_on_write() {
+        let hugeint = Field::new("h", DataType::Decimal128(38, 0), true).with_metadata(
+            [(
+                "ARROW:extension:name".to_owned(),
+                "monetdb.hugeint".to_owned(),
+            )]
+            .into(),
+        );
+        assert_eq!(monet_type_for_field(&hugeint).unwrap(), MonetType::HugeInt);
+
+        let timetz = Field::new("t", DataType::Time64(TimeUnit::Microsecond), true).with_metadata(
+            [(
+                "ARROW:extension:name".to_owned(),
+                "monetdb.timetz".to_owned(),
+            )]
+            .into(),
+        );
+        assert_eq!(monet_type_for_field(&timetz).unwrap(), MonetType::TimeTz);
+    }
+
+    #[test]
     fn rejects_duration_null_sentinel_collision() {
         let field = Field::new("duration", DataType::Duration(TimeUnit::Millisecond), true);
         let values = DurationMillisecondArray::from(vec![Some(i64::MIN)]);
@@ -967,20 +1055,34 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_null_nan_values() {
+    fn rejects_non_finite_values() {
         let f32_field = Field::new("f32", DataType::Float32, true);
-        let f32_values = Float32Array::from(vec![f32::NAN]);
-        assert!(matches!(
-            encode_column(&f32_field, &f32_values),
-            Err(EncodeError::InvalidValue { row: 0, .. })
-        ));
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let values = Float32Array::from(vec![value]);
+            assert!(matches!(
+                encode_column(&f32_field, &values),
+                Err(EncodeError::InvalidValue { row: 0, .. })
+            ));
+        }
 
         let f64_field = Field::new("f64", DataType::Float64, true);
-        let f64_values = Float64Array::from(vec![f64::NAN]);
-        assert!(matches!(
-            encode_column(&f64_field, &f64_values),
-            Err(EncodeError::InvalidValue { row: 0, .. })
-        ));
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let values = Float64Array::from(vec![value]);
+            assert!(matches!(
+                encode_column(&f64_field, &values),
+                Err(EncodeError::InvalidValue { row: 0, .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn encodes_sliced_arrays_from_their_logical_offset() {
+        let field = Field::new("i", DataType::Int32, false);
+        let array = Int32Array::from(vec![10, 20, 30, 40]).slice(1, 2);
+        assert_eq!(
+            encode_column(&field, &array).unwrap(),
+            [20i32.to_le_bytes(), 30i32.to_le_bytes()].concat()
+        );
     }
 
     #[test]
