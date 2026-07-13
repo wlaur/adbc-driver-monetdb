@@ -212,7 +212,10 @@ fn inline_wire_value(
         MonetType::Int => required(cursor.get_i32(index)?)?.to_le_bytes().to_vec(),
         MonetType::BigInt => required(cursor.get_i64(index)?)?.to_le_bytes().to_vec(),
         MonetType::HugeInt => required(cursor.get_i128(index)?)?.to_le_bytes().to_vec(),
-        MonetType::Oid => required(cursor.get_u64(index)?)?.to_le_bytes().to_vec(),
+        MonetType::Oid => {
+            let rendered = required(cursor.get_str(index)?)?;
+            parse_inline_oid(rendered)?.to_le_bytes().to_vec()
+        }
         MonetType::Decimal(precision, scale) => {
             let decimal = required(cursor.get::<RawDecimal<i128>>(index)?)?;
             let value = decimal.at_scale(scale).ok_or(DecodeError::InvalidValue {
@@ -293,6 +296,17 @@ fn required<T>(value: Option<T>) -> Result<T, DecodeError> {
         row: 0,
         message: "non-NULL inline value decoded as NULL",
     })
+}
+
+fn parse_inline_oid(rendered: &str) -> Result<u64, DecodeError> {
+    rendered
+        .strip_suffix("@0")
+        .unwrap_or(rendered)
+        .parse::<u64>()
+        .map_err(|_| DecodeError::InvalidValue {
+            row: 0,
+            message: "invalid inline OID",
+        })
 }
 
 fn null_wire_value(data_type: &MonetType) -> Result<Vec<u8>, DecodeError> {
@@ -481,6 +495,8 @@ pub fn field_for_monet_type(
     let extension = match data_type {
         MonetType::Json => Some("arrow.json"),
         MonetType::Uuid => Some("arrow.uuid"),
+        MonetType::Oid => Some("monetdb.oid"),
+        MonetType::Url => Some("monetdb.url"),
         MonetType::MonthInterval => Some("monetdb.interval_month"),
         MonetType::DayInterval => Some("monetdb.interval_day"),
         _ => None,
@@ -1031,7 +1047,10 @@ fn decode_inet(bytes: &[u8], rows: usize) -> Result<StringArray, DecodeError> {
     } else if bytes.len() == rows.saturating_mul(16) {
         16
     } else {
-        return Err(DecodeError::Unsupported(MonetType::Inet));
+        return Err(DecodeError::InvalidValue {
+            row: 0,
+            message: "INET column length is neither 4 nor 16 bytes per row",
+        });
     };
     let mut builder = StringBuilder::with_capacity(rows, rows.saturating_mul(39));
     for value in bytes.chunks_exact(width) {
@@ -1403,6 +1422,23 @@ mod tests {
         let array = decode_column(&MonetType::Oid, &(1u64 << 63).to_le_bytes(), 1).unwrap();
         let array = array.as_any().downcast_ref::<UInt64Array>().unwrap();
         assert!(array.is_null(0));
+        assert_eq!(parse_inline_oid("42@0").unwrap(), 42);
+        let field = field_for_monet_type("oid", &MonetType::Oid).unwrap();
+        assert_eq!(
+            field
+                .metadata()
+                .get("ARROW:extension:name")
+                .map(String::as_str),
+            Some("monetdb.oid")
+        );
+        let field = field_for_monet_type("url", &MonetType::Url).unwrap();
+        assert_eq!(
+            field
+                .metadata()
+                .get("ARROW:extension:name")
+                .map(String::as_str),
+            Some("monetdb.url")
+        );
     }
 
     #[test]

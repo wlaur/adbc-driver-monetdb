@@ -68,6 +68,7 @@ pub fn monet_type_for_field(field: &Field) -> Result<MonetType, EncodeError> {
         DataType::UInt8 => MonetType::SmallInt,
         DataType::UInt16 => MonetType::Int,
         DataType::UInt32 => MonetType::BigInt,
+        DataType::UInt64 if extension == Some("monetdb.oid") => MonetType::Oid,
         DataType::UInt64 => MonetType::HugeInt,
         DataType::Float32 => MonetType::Real,
         DataType::Float64 => MonetType::Double,
@@ -76,6 +77,7 @@ pub fn monet_type_for_field(field: &Field) -> Result<MonetType, EncodeError> {
         }
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => match extension {
             Some("arrow.json") => MonetType::Json,
+            Some("monetdb.url") => MonetType::Url,
             _ => MonetType::Varchar(0),
         },
         DataType::Dictionary(_, value)
@@ -173,6 +175,9 @@ pub fn encode_column(field: &Field, array: &dyn Array) -> Result<Vec<u8>, Encode
         DataType::UInt8 => unsigned!(UInt8Array, i16, DataType::UInt8),
         DataType::UInt16 => unsigned!(UInt16Array, i32, DataType::UInt16),
         DataType::UInt32 => unsigned!(UInt32Array, i64, DataType::UInt32),
+        DataType::UInt64 if monet_type_for_field(field)? == MonetType::Oid => {
+            encode_oid(downcast(array, DataType::UInt64)?, &mut out)?
+        }
         DataType::UInt64 => unsigned!(UInt64Array, i128, DataType::UInt64),
         DataType::Float32 => encode_f32(downcast(array, DataType::Float32)?, &mut out)?,
         DataType::Float64 => encode_f64(downcast(array, DataType::Float64)?, &mut out)?,
@@ -271,6 +276,26 @@ fn encode_bool(array: &BooleanArray, out: &mut Vec<u8>) {
             u8::from(array.value(row))
         }
     }));
+}
+
+fn encode_oid(array: &UInt64Array, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+    const NULL: u64 = 1 << 63;
+    for row in 0..array.len() {
+        let value = if array.is_null(row) {
+            NULL
+        } else {
+            let value = array.value(row);
+            if value >= NULL {
+                return Err(EncodeError::InvalidValue {
+                    row,
+                    message: "OID is outside MonetDB's non-NULL range",
+                });
+            }
+            value
+        };
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    Ok(())
 }
 
 fn encode_f32(array: &Float32Array, out: &mut Vec<u8>) -> Result<(), EncodeError> {
@@ -863,6 +888,22 @@ mod tests {
             .into(),
         );
         assert_eq!(monet_type_for_field(&day).unwrap(), MonetType::DayInterval);
+    }
+
+    #[test]
+    fn preserves_oid_and_url_extensions_on_write() {
+        let oid = Field::new("oid", DataType::UInt64, true)
+            .with_metadata([("ARROW:extension:name".to_owned(), "monetdb.oid".to_owned())].into());
+        assert_eq!(monet_type_for_field(&oid).unwrap(), MonetType::Oid);
+        let values = UInt64Array::from(vec![Some(7), None]);
+        assert_eq!(
+            encode_column(&oid, &values).unwrap(),
+            [7u64.to_le_bytes(), (1u64 << 63).to_le_bytes()].concat()
+        );
+
+        let url = Field::new("url", DataType::Utf8, true)
+            .with_metadata([("ARROW:extension:name".to_owned(), "monetdb.url".to_owned())].into());
+        assert_eq!(monet_type_for_field(&url).unwrap(), MonetType::Url);
     }
 
     #[test]
