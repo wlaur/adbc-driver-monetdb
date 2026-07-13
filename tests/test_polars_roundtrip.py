@@ -263,6 +263,32 @@ def test_execute_schema_has_no_side_effect_and_preserves_bind(monetdb_uri: str) 
 
 
 @pytest.mark.integration
+def test_untyped_parameter_fallback_is_eager_and_metadata_only(
+    monetdb_uri: str,
+) -> None:
+    query = "INSERT INTO untyped_parameter_probe SELECT 1 FROM (SELECT ? AS ignored) AS parameter_row"
+    with dbapi.connect(monetdb_uri) as conn, conn.cursor() as cursor:
+        try:
+            schema = cast(
+                object,
+                cursor.adbc_execute_schema(  # pyright: ignore[reportUnknownMemberType]
+                    "SELECT ? AS value", [42]
+                ),
+            )
+            assert str(schema) == "value: null"
+            cursor.execute("SELECT ? AS value")  # pyright: ignore[reportUnknownMemberType]
+            assert cursor.fetchone() == (42,)  # pyright: ignore[reportUnknownMemberType]
+
+            cursor.execute("CREATE TABLE untyped_parameter_probe(value INT)")  # pyright: ignore[reportUnknownMemberType]
+            parameters = pl.DataFrame({"ignored": ["a", "b", "c"]})
+            cursor.execute(query, parameters)  # pyright: ignore[reportUnknownMemberType]
+            cursor.execute("SELECT COUNT(*) FROM untyped_parameter_probe")  # pyright: ignore[reportUnknownMemberType]
+            assert cursor.fetchone() == (3,)  # pyright: ignore[reportUnknownMemberType]
+        finally:
+            cursor.execute("DROP TABLE IF EXISTS untyped_parameter_probe")  # pyright: ignore[reportUnknownMemberType]
+
+
+@pytest.mark.integration
 def test_get_objects_with_columns_constraints_and_filters(monetdb_uri: str) -> None:
     with dbapi.connect(monetdb_uri) as conn, conn.cursor() as cursor:
         try:

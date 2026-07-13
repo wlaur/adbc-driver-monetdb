@@ -22,6 +22,12 @@ pub(super) fn parameter_count(query: &str) -> Result<usize> {
     render_query(query, &[]).map(|(_, count)| count)
 }
 
+pub(super) fn render_null_parameters(query: &str) -> Result<String> {
+    let count = parameter_count(query)?;
+    let values = vec!["NULL".to_owned(); count];
+    render_query(query, &values).map(|(rendered, _)| rendered)
+}
+
 pub(super) fn render_row(query: &str, batch: &RecordBatch, row: usize) -> Result<String> {
     let values = render_arguments(batch, row)?;
     let (rendered, count) = render_query(query, &values)?;
@@ -628,6 +634,10 @@ mod tests {
         assert_eq!(parameter_count("SELECT E'a\\'b?', R'\\?'").unwrap(), 0);
         let batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
         assert!(render_row("SELECT ?", &batch, 0).is_err());
+        assert_eq!(
+            render_null_parameters("SELECT ?, '?' /* ? */").unwrap(),
+            "SELECT NULL, '?' /* ? */"
+        );
     }
 
     #[test]

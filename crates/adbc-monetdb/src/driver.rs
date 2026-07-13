@@ -25,7 +25,7 @@ use percent_encoding::percent_decode_str;
 mod metadata;
 mod parameters;
 use metadata::{like_pattern_matches, load_objects, objects_batch, table_schema};
-use parameters::{parameter_count, render_arguments, render_row};
+use parameters::{parameter_count, render_arguments, render_null_parameters, render_row};
 
 const DEFAULT_BATCH_ROWS: usize = 131_072;
 const BATCH_ROWS_OPTION: &str = "adbc.monetdb.batch_rows";
@@ -650,6 +650,15 @@ impl Statement for MonetdbStatement {
                 execute_updates_atomic(&self.connection, &queries)?;
                 return Ok(Box::new(EmptyReader::default()));
             }
+            if self.prepared_result_schema.is_none() {
+                let schema = self.execute_schema()?;
+                if schema.fields().is_empty() {
+                    execute_updates_atomic(&self.connection, &queries)?;
+                    self.prepared_result_schema = Some(schema);
+                    return Ok(Box::new(EmptyReader::default()));
+                }
+                self.prepared_result_schema = Some(schema);
+            }
             return parameter_query_reader(&self.connection, queries, self.batch_rows);
         }
         let query = self
@@ -697,7 +706,24 @@ impl Statement for MonetdbStatement {
             .query
             .as_deref()
             .ok_or_else(|| error("SQL query is not set", Status::InvalidState))?;
-        let metadata = prepare_query(&self.connection, query, parameter_count(query)?)?;
+        let parameter_count = parameter_count(query)?;
+        let metadata = match prepare_query(&self.connection, query, parameter_count) {
+            Ok(metadata) => metadata,
+            Err(value) if could_not_determine_parameter_type(&value) => {
+                let query = render_null_parameters(query)?;
+                let mut metadata = prepare_query_allowing_any(&self.connection, &query, 0)?;
+                metadata.result = Schema::new(
+                    metadata
+                        .result
+                        .fields()
+                        .iter()
+                        .map(|field| Field::new(field.name(), DataType::Null, true))
+                        .collect::<Vec<_>>(),
+                );
+                metadata
+            }
+            Err(value) => return Err(value),
+        };
         if let Ok(connection) = lock_connection(&self.connection) {
             connection.try_deallocate(metadata.id);
         }
@@ -745,11 +771,7 @@ impl Statement for MonetdbStatement {
                 self.prepared_parameter_schema = Some(metadata.parameters);
                 self.prepared_result_schema = Some(metadata.result);
             }
-            Err(value)
-                if value
-                    .message
-                    .contains("Could not determine type for argument number") =>
-            {
+            Err(value) if could_not_determine_parameter_type(&value) => {
                 self.prepared_parameter_schema = Some(Schema::new(
                     (0..parameter_count)
                         .map(|index| Field::new(index.to_string(), DataType::Null, true))
@@ -775,6 +797,13 @@ impl Statement for MonetdbStatement {
     fn cancel(&mut self) -> Result<()> {
         Err(not_implemented("cancel"))
     }
+}
+
+fn could_not_determine_parameter_type(value: &Error) -> bool {
+    value
+        .message
+        .contains("Could not determine type for argument number")
+        || value.message == "unknown MonetDB prepared type 'any'"
 }
 
 impl MonetdbStatement {
@@ -1190,6 +1219,23 @@ fn prepare_query(
     query: &str,
     parameter_count: usize,
 ) -> Result<PreparedMetadata> {
+    prepare_query_inner(connection, query, parameter_count, false)
+}
+
+fn prepare_query_allowing_any(
+    connection: &Arc<Mutex<monetdb::Connection>>,
+    query: &str,
+    parameter_count: usize,
+) -> Result<PreparedMetadata> {
+    prepare_query_inner(connection, query, parameter_count, true)
+}
+
+fn prepare_query_inner(
+    connection: &Arc<Mutex<monetdb::Connection>>,
+    query: &str,
+    parameter_count: usize,
+    allow_any: bool,
+) -> Result<PreparedMetadata> {
     let query = query.trim().trim_end_matches(';');
     let connection = lock_connection(connection)?;
     let use_savepoint = !connection
@@ -1261,7 +1307,11 @@ fn prepare_query(
                 .filter(|value| !value.is_empty())
                 .map(str::to_owned);
             fields.push(PreparedField {
-                data_type: prepared_monet_type(&code, digits, scale)?,
+                data_type: if allow_any && code == "any" {
+                    MonetType::Varchar(0)
+                } else {
+                    prepared_monet_type(&code, digits, scale)?
+                },
                 name,
                 origin_schema,
                 origin_table,
