@@ -488,8 +488,16 @@ impl Database for MonetdbDatabase {
             .map_err(|value| map_display(value, Status::InvalidArguments))?
             .into_owned();
         let (connect_timeout, timeouts) = configured_timeouts(&parameters)?;
-        let initialization_deadline =
-            connect_timeout.map(|timeout| initialization_started + timeout);
+        let initialization_deadline = connect_timeout
+            .map(|timeout| {
+                initialization_started.checked_add(timeout).ok_or_else(|| {
+                    error(
+                        "connection timeout is too large to represent",
+                        Status::InvalidArguments,
+                    )
+                })
+            })
+            .transpose()?;
 
         let connection_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             monetdb::Connection::new(parameters)
