@@ -29,11 +29,14 @@ use percent_encoding::percent_decode_str;
 mod metadata;
 mod parameters;
 use metadata::{like_pattern_matches, load_objects, objects_batch, table_schema};
-use parameters::{parameter_count, render_arguments, render_null_parameters, render_row};
+use parameters::{
+    ParameterLayout, parameter_layout, render_arguments, render_null_parameters, render_row,
+};
 
 const DEFAULT_BATCH_ROWS: usize = 131_072;
 const METADATA_REPLY_ROWS: usize = 1024;
 const BATCH_ROWS_OPTION: &str = "adbc.monetdb.batch_rows";
+const BIND_BY_NAME_OPTION: &str = "adbc.statement.bind_by_name";
 const CONNECT_TIMEOUT_OPTION: &str = "adbc.monetdb.connect_timeout_seconds";
 const READ_TIMEOUT_OPTION: &str = "adbc.monetdb.read_timeout_seconds";
 const WRITE_TIMEOUT_OPTION: &str = "adbc.monetdb.write_timeout_seconds";
@@ -700,6 +703,7 @@ impl Connection for MonetdbConnection {
             prepared_id: None,
             prepared_parameter_schema: None,
             prepared_result_schema: None,
+            bind_by_name: false,
         })
     }
 
@@ -843,6 +847,7 @@ pub struct MonetdbStatement {
     prepared_id: Option<u64>,
     prepared_parameter_schema: Option<Schema>,
     prepared_result_schema: Option<Schema>,
+    bind_by_name: bool,
 }
 
 impl Optionable for MonetdbStatement {
@@ -866,6 +871,11 @@ impl Optionable for MonetdbStatement {
                 .filter(|rows| *rows > 0)
                 .ok_or_else(|| error("batch_rows must be positive", Status::InvalidArguments))?;
             self.options.set(key, OptionValue::Int(rows));
+            return Ok(());
+        }
+        if key.as_ref() == BIND_BY_NAME_OPTION {
+            self.bind_by_name = option_bool(&value)?;
+            self.options.set(key, value);
             return Ok(());
         }
         match &key {
@@ -916,6 +926,9 @@ impl Optionable for MonetdbStatement {
     }
 
     fn get_option_string(&self, key: Self::Option) -> Result<String> {
+        if key.as_ref() == BIND_BY_NAME_OPTION {
+            return Ok(self.bind_by_name.to_string());
+        }
         self.options.get_string(key)
     }
 
@@ -1031,15 +1044,19 @@ impl Statement for MonetdbStatement {
             .query
             .as_deref()
             .ok_or_else(|| error("SQL query is not set", Status::InvalidState))?;
-        let parameter_count = parameter_count(query)?;
-        let metadata = match prepare_query(&self.connection, query, parameter_count, self.timeouts)
-        {
-            Ok(metadata) => metadata,
-            Err(value) if could_not_determine_parameter_type(&value) => {
-                let query = render_null_parameters(query)?;
-                prepare_query_allowing_any(&self.connection, &query, 0, self.timeouts)?
+        let layout = parameter_layout(query)?;
+        let metadata = if layout.is_named() {
+            let query = render_null_parameters(query)?;
+            prepare_query_allowing_any(&self.connection, &query, 0, self.timeouts)?
+        } else {
+            match prepare_query(&self.connection, query, layout.count(), self.timeouts) {
+                Ok(metadata) => metadata,
+                Err(value) if could_not_determine_parameter_type(&value) => {
+                    let query = render_null_parameters(query)?;
+                    prepare_query_allowing_any(&self.connection, &query, 0, self.timeouts)?
+                }
+                Err(value) => return Err(value),
             }
-            Err(value) => return Err(value),
         };
         if let Ok(connection) = lock_connection(&self.connection) {
             connection.try_deallocate(metadata.id);
@@ -1062,8 +1079,10 @@ impl Statement for MonetdbStatement {
             .query
             .as_deref()
             .ok_or_else(|| error("SQL query is not set", Status::InvalidState))?;
-        let fields = (0..parameter_count(query)?)
-            .map(|index| Field::new(index.to_string(), DataType::Null, true))
+        let fields = parameter_layout(query)?
+            .field_names()
+            .into_iter()
+            .map(|name| Field::new(name, DataType::Null, true))
             .collect::<Vec<_>>();
         Ok(Schema::new(fields))
     }
@@ -1076,9 +1095,21 @@ impl Statement for MonetdbStatement {
             .query
             .as_deref()
             .ok_or_else(|| error("SQL query is not set", Status::InvalidState))?;
-        let parameter_count = parameter_count(query)?;
+        let layout = parameter_layout(query)?;
+        let parameter_count = layout.count();
         if parameter_count == 0 {
             self.prepared_parameter_schema = Some(Schema::empty());
+            self.prepared = true;
+            return Ok(());
+        }
+        if let ParameterLayout::Named(names) = layout {
+            self.prepared_parameter_schema = Some(Schema::new(
+                names
+                    .into_iter()
+                    .map(|name| Field::new(name, DataType::Null, true))
+                    .collect::<Vec<_>>(),
+            ));
+            self.prepared_result_schema = Some(self.execute_schema()?);
             self.prepared = true;
             return Ok(());
         }
@@ -1146,21 +1177,48 @@ impl MonetdbStatement {
             .take()
             .ok_or_else(|| error("no Arrow parameters are bound", Status::InvalidState))?;
         let schema = reader.schema();
-        let expected = parameter_count(&query)?;
-        if schema.fields().len() != expected {
+        let layout = parameter_layout(&query)?;
+        if layout.is_named() != self.bind_by_name {
             return Err(error(
-                format!(
-                    "query has {expected} positional parameters but the bound stream has {} columns",
-                    schema.fields().len()
-                ),
+                if layout.is_named() {
+                    "named parameters require adbc.statement.bind_by_name"
+                } else {
+                    "positional parameters cannot be bound by name"
+                },
                 Status::InvalidArguments,
             ));
+        }
+        match &layout {
+            ParameterLayout::Positional(expected) if schema.fields().len() != *expected => {
+                return Err(error(
+                    format!(
+                        "query has {expected} positional parameters but the bound stream has {} columns",
+                        schema.fields().len()
+                    ),
+                    Status::InvalidArguments,
+                ));
+            }
+            ParameterLayout::Named(names) => {
+                let fields = schema.fields();
+                if fields.len() != names.len()
+                    || names
+                        .iter()
+                        .any(|name| !fields.iter().any(|field| field.name() == name))
+                {
+                    return Err(error(
+                        "bound parameter names do not match the query",
+                        Status::InvalidArguments,
+                    ));
+                }
+            }
+            ParameterLayout::Positional(_) => {}
         }
         Ok(BoundQueryStream {
             reader,
             schema,
             query,
             prepared_id: self.prepared_id,
+            bind_by_name: self.bind_by_name,
             batch: None,
             next_row: 0,
             pending: None,
@@ -1426,6 +1484,7 @@ struct BoundQueryStream {
     schema: SchemaRef,
     query: String,
     prepared_id: Option<u64>,
+    bind_by_name: bool,
     batch: Option<RecordBatch>,
     next_row: usize,
     pending: Option<ExecutableQuery>,
@@ -1463,7 +1522,7 @@ impl Iterator for BoundQueryStream {
                 let sql = match self.prepared_id {
                     Some(id) => render_arguments(batch, row)
                         .map(|values| format!("EXECUTE {id}({})", values.join(", "))),
-                    None => render_row(&self.query, batch, row),
+                    None => render_row(&self.query, batch, row, self.bind_by_name),
                 };
                 return Some(sql.map(|sql| ExecutableQuery { sql }));
             }

@@ -35,6 +35,7 @@ dev = [
     "adbc-drivers-validation",
     "pandas>=3.0",
     "pandas-stubs>=3.0.3.260530",
+    "sqlalchemy>=2.0",
 ]
 
 [project.urls]

@@ -88,8 +88,8 @@ with dbapi.connect(
 `polars.read_database(query, connection)` selects ADBC from the supplied DB-API connection or
 cursor; it has no `engine="adbc"` parameter. Polars calls `connection.cursor()` without
 `adbc_stmt_kwargs`, so use a preconfigured cursor for statement-specific settings. Its
-`execute_options` are forwarded to `Cursor.execute`: positional `?` values work with
-`execute_options={"parameters": (...)}`, while dict/named parameters are unsupported.
+`execute_options` are forwarded to `Cursor.execute`: use a sequence for positional `?` values
+and a dictionary for named `:name` values.
 `adbc_stmt_kwargs` is not an execute option. Polars' `batch_size` does not configure
 `adbc.monetdb.batch_rows`, and `DataFrame.write_database(..., engine_options=...)` supplies
 ingestion arguments rather than connection or timeout options.
@@ -97,6 +97,22 @@ ingestion arguments rather than connection or timeout options.
 The DB-API module reports `threadsafety = 1`: threads may share the module, but each thread
 should use its own connection and cursors. Cross-thread cancellation of an active operation is
 supported explicitly.
+
+The native DB-API parameter style is `qmark` (`?`). Named `:name` parameters are also supported
+when a parameter dictionary is supplied, including SQLAlchemy expressions compiled to a SQL
+string:
+
+```python
+from sqlalchemy import Integer, bindparam, cast, select
+
+value = cast(bindparam("value", value=21), Integer)
+compiled = select((value + value).label("value")).compile()
+frame = pl.read_database(
+    str(compiled),
+    conn,
+    execute_options={"parameters": compiled.params},
+)
+```
 
 ## Support policy
 
@@ -116,7 +132,7 @@ covering the common SQL-driver baseline.
 | Required surface | Status |
 |---|---|
 | SQL query/update execution, Arrow streams, affected-row counts, and execute schema | Supported |
-| Prepared statements, positional binds, parameter schemas, and `executemany` | Supported |
+| Prepared statements, positional/named binds, parameter schemas, and `executemany` | Supported |
 | Bulk ingest: create, append, replace, create-append, target schema, and temporary tables | Supported |
 | Transactions, autocommit, commit, rollback, and current-schema get/set | Supported |
 | `GetInfo`, `GetObjects`, `GetTableSchema`, and `GetTableTypes` | Supported |
@@ -137,7 +153,6 @@ or argument error.
 | Progress and maximum-progress reporting | MAPI does not expose compatible progress metadata |
 | Read-only `true` and isolation-level options | MonetDB does not expose matching per-connection controls through this interface; read-only `false` is accepted |
 | Setting the current catalog and cross-catalog ingest | A MAPI session is attached to one database; the current catalog remains readable |
-| Named parameter binding | MonetDB prepared statements and this DB-API use positional `?` parameters |
 
 The reusable ADBC validation suite currently passes against Dec2025-SP3. Its skips cover
 explicitly waived cross-catalog/statistics behavior and negative-scale decimals that MonetDB

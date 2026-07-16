@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use adbc_core::error::{Result, Status};
 use arrow_array::{
     Array, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
@@ -18,29 +20,112 @@ use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
 
 use super::error;
 
-pub(super) fn parameter_count(query: &str) -> Result<usize> {
-    render_query(query, &[]).map(|(_, count)| count)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ParameterLayout {
+    Positional(usize),
+    Named(Vec<String>),
+}
+
+impl ParameterLayout {
+    pub(super) fn count(&self) -> usize {
+        match self {
+            Self::Positional(count) => *count,
+            Self::Named(names) => names.len(),
+        }
+    }
+
+    pub(super) fn field_names(&self) -> Vec<String> {
+        match self {
+            Self::Positional(count) => (0..*count).map(|index| index.to_string()).collect(),
+            Self::Named(names) => names.clone(),
+        }
+    }
+
+    pub(super) fn is_named(&self) -> bool {
+        matches!(self, Self::Named(_))
+    }
+}
+
+enum RenderValues<'a> {
+    Inspect,
+    Null,
+    Positional(&'a [String]),
+    Named(&'a HashMap<&'a str, String>),
+}
+
+pub(super) fn parameter_layout(query: &str) -> Result<ParameterLayout> {
+    render_query(query, RenderValues::Inspect).map(|(_, layout)| layout)
 }
 
 pub(super) fn render_null_parameters(query: &str) -> Result<String> {
-    let count = parameter_count(query)?;
-    let values = vec!["NULL".to_owned(); count];
-    render_query(query, &values).map(|(rendered, _)| rendered)
+    render_query(query, RenderValues::Null).map(|(rendered, _)| rendered)
 }
 
-pub(super) fn render_row(query: &str, batch: &RecordBatch, row: usize) -> Result<String> {
+pub(super) fn render_row(
+    query: &str,
+    batch: &RecordBatch,
+    row: usize,
+    bind_by_name: bool,
+) -> Result<String> {
     let values = render_arguments(batch, row)?;
-    let (rendered, count) = render_query(query, &values)?;
-    if count != values.len() {
-        return Err(error(
-            format!(
-                "query has {count} positional parameters but {} values were bound",
-                values.len()
-            ),
-            Status::InvalidArguments,
-        ));
+    let layout = parameter_layout(query)?;
+    match &layout {
+        ParameterLayout::Positional(count) => {
+            if bind_by_name {
+                return Err(error(
+                    "positional parameters cannot be bound by name",
+                    Status::InvalidArguments,
+                ));
+            }
+            if *count != values.len() {
+                return Err(error(
+                    format!(
+                        "query has {count} positional parameters but {} values were bound",
+                        values.len()
+                    ),
+                    Status::InvalidArguments,
+                ));
+            }
+            render_query(query, RenderValues::Positional(&values)).map(|(rendered, _)| rendered)
+        }
+        ParameterLayout::Named(names) => {
+            if !bind_by_name {
+                return Err(error(
+                    "named parameters require adbc.statement.bind_by_name",
+                    Status::InvalidArguments,
+                ));
+            }
+            let schema = batch.schema();
+            let mut named_values = HashMap::with_capacity(values.len());
+            for (field, value) in schema.fields().iter().zip(values) {
+                if named_values.insert(field.name().as_str(), value).is_some() {
+                    return Err(error(
+                        format!("bound parameter name '{}' is duplicated", field.name()),
+                        Status::InvalidArguments,
+                    ));
+                }
+            }
+            if let Some(missing) = names
+                .iter()
+                .find(|name| !named_values.contains_key(name.as_str()))
+            {
+                return Err(error(
+                    format!("named parameter '{missing}' was not bound"),
+                    Status::InvalidArguments,
+                ));
+            }
+            if let Some(extra) = named_values
+                .keys()
+                .find(|name| !names.iter().any(|expected| expected == **name))
+            {
+                return Err(error(
+                    format!("bound parameter '{extra}' is not present in the query"),
+                    Status::InvalidArguments,
+                ));
+            }
+            render_query(query, RenderValues::Named(&named_values)).map(|(rendered, _)| rendered)
+        }
     }
-    Ok(rendered)
 }
 
 pub(super) fn render_arguments(batch: &RecordBatch, row: usize) -> Result<Vec<String>> {
@@ -58,7 +143,7 @@ pub(super) fn render_arguments(batch: &RecordBatch, row: usize) -> Result<Vec<St
         .collect()
 }
 
-fn render_query(query: &str, values: &[String]) -> Result<(String, usize)> {
+fn render_query(query: &str, values: RenderValues<'_>) -> Result<(String, ParameterLayout)> {
     #[derive(Clone, Copy)]
     enum State {
         Normal,
@@ -71,11 +156,11 @@ fn render_query(query: &str, values: &[String]) -> Result<(String, usize)> {
     }
 
     let bytes = query.as_bytes();
-    let mut output =
-        String::with_capacity(query.len() + values.iter().map(String::len).sum::<usize>());
+    let mut output = String::with_capacity(query.len());
     let mut state = State::Normal;
     let mut index = 0;
-    let mut parameter = 0;
+    let mut positional_count = 0;
+    let mut named = Vec::new();
     let mut terminated = false;
     while index < bytes.len() {
         let current = bytes[index];
@@ -119,11 +204,72 @@ fn render_query(query: &str, values: &[String]) -> Result<(String, usize)> {
                     ));
                 }
                 (b'?', _, _) => {
-                    if let Some(value) = values.get(parameter) {
-                        output.push_str(value);
+                    if !named.is_empty() {
+                        return Err(error(
+                            "positional and named parameters cannot be mixed",
+                            Status::InvalidArguments,
+                        ));
                     }
-                    parameter += 1;
+                    match values {
+                        RenderValues::Inspect => {}
+                        RenderValues::Null => output.push_str("NULL"),
+                        RenderValues::Positional(values) => {
+                            if let Some(value) = values.get(positional_count) {
+                                output.push_str(value);
+                            }
+                        }
+                        RenderValues::Named(_) => {
+                            return Err(error(
+                                "positional parameters cannot be bound by name",
+                                Status::InvalidArguments,
+                            ));
+                        }
+                    }
+                    positional_count += 1;
                     index += 1;
+                }
+                (b':', Some(next), _)
+                    if is_identifier_start(next)
+                        && index.checked_sub(1).and_then(|index| bytes.get(index))
+                            != Some(&b':') =>
+                {
+                    if positional_count > 0 {
+                        return Err(error(
+                            "positional and named parameters cannot be mixed",
+                            Status::InvalidArguments,
+                        ));
+                    }
+                    let mut end = index + 2;
+                    while bytes
+                        .get(end)
+                        .is_some_and(|byte| is_identifier_continue(*byte))
+                    {
+                        end += 1;
+                    }
+                    let name = &query[index + 1..end];
+                    if !named.iter().any(|existing| existing == name) {
+                        named.push(name.to_owned());
+                    }
+                    match values {
+                        RenderValues::Inspect => {}
+                        RenderValues::Null => output.push_str("NULL"),
+                        RenderValues::Positional(_) => {
+                            return Err(error(
+                                "named parameters require adbc.statement.bind_by_name",
+                                Status::InvalidArguments,
+                            ));
+                        }
+                        RenderValues::Named(values) => {
+                            let value = values.get(name).ok_or_else(|| {
+                                error(
+                                    format!("named parameter '{name}' was not bound"),
+                                    Status::InvalidArguments,
+                                )
+                            })?;
+                            output.push_str(value);
+                        }
+                    }
+                    index = end;
                 }
                 (b'r' | b'R' | b'x' | b'X', Some(b'\''), _) => {
                     output.push(current as char);
@@ -237,7 +383,20 @@ fn render_query(query: &str, values: &[String]) -> Result<(String, usize)> {
             Status::InvalidArguments,
         ));
     }
-    Ok((output, parameter))
+    let layout = if named.is_empty() {
+        ParameterLayout::Positional(positional_count)
+    } else {
+        ParameterLayout::Named(named)
+    };
+    Ok((output, layout))
+}
+
+fn is_identifier_start(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || byte == b'_'
+}
+
+fn is_identifier_continue(byte: u8) -> bool {
+    is_identifier_start(byte) || byte.is_ascii_digit()
 }
 
 fn copy_char(query: &str, index: usize, output: &mut String) -> usize {
@@ -701,21 +860,33 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            render_row("SELECT ?, '?', \"?\", ? -- ?", &batch, 0).unwrap(),
+            render_row("SELECT ?, '?', \"?\", ? -- ?", &batch, 0, false).unwrap(),
             "SELECT 42, '?', \"?\", R'a''b' -- ?"
         );
     }
 
     #[test]
     fn validates_parameter_counts_and_lexing() {
-        assert_eq!(parameter_count("SELECT ? /* ? */").unwrap(), 1);
-        assert_eq!(parameter_count("SELECT R';?' /* ; */;").unwrap(), 0);
-        assert!(parameter_count("SELECT 1; DELETE FROM important").is_err());
-        assert!(parameter_count("SELECT 'unterminated").is_err());
-        assert!(parameter_count("SELECT '\\''").is_err());
-        assert_eq!(parameter_count("SELECT E'a\\'b?', R'\\?'").unwrap(), 0);
+        assert_eq!(parameter_layout("SELECT ? /* ? */").unwrap().count(), 1);
+        assert_eq!(
+            parameter_layout("SELECT R';?' /* ; */;").unwrap().count(),
+            0
+        );
+        assert!(parameter_layout("SELECT 1; DELETE FROM important").is_err());
+        assert!(parameter_layout("SELECT 'unterminated").is_err());
+        assert!(parameter_layout("SELECT '\\''").is_err());
+        assert_eq!(
+            parameter_layout("SELECT E'a\\'b?', R'\\?'")
+                .unwrap()
+                .count(),
+            0
+        );
+        assert_eq!(
+            parameter_layout("SELECT 1::INT").unwrap(),
+            ParameterLayout::Positional(0)
+        );
         let batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
-        assert!(render_row("SELECT ?", &batch, 0).is_err());
+        assert!(render_row("SELECT ?", &batch, 0, false).is_err());
         assert_eq!(
             render_null_parameters("SELECT ?, '?' /* ? */").unwrap(),
             "SELECT NULL, '?' /* ? */"
@@ -723,14 +894,45 @@ mod tests {
     }
 
     #[test]
+    fn renders_named_parameters_by_field_name() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("right", DataType::Int32, false),
+                Field::new("left", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![7])),
+                Arc::new(StringArray::from(vec!["a'b"])),
+            ],
+        )
+        .unwrap();
+        let query = "SELECT :left, :right + :right, ':ignored', TIME '12:34:56' -- :ignored";
+        assert_eq!(
+            parameter_layout(query).unwrap(),
+            ParameterLayout::Named(vec!["left".into(), "right".into()])
+        );
+        assert_eq!(
+            render_row(query, &batch, 0, true).unwrap(),
+            "SELECT R'a''b', 7 + 7, ':ignored', TIME '12:34:56' -- :ignored"
+        );
+        assert_eq!(
+            render_null_parameters(query).unwrap(),
+            "SELECT NULL, NULL + NULL, ':ignored', TIME '12:34:56' -- :ignored"
+        );
+        assert!(render_row(query, &batch, 0, false).is_err());
+        assert!(parameter_layout("SELECT ?, :named").is_err());
+    }
+
+    #[test]
     fn preserves_utf8_in_every_lexer_state() {
         let query = "SELECT ä, 'ö\\界', R'tail\\', X'00ff', U&'\\0061', \"列\", ? -- коммент\n/* 注釈 */ # ?";
-        let (rendered, count) = render_query(query, &["42".into()]).unwrap();
+        let values = ["42".into()];
+        let (rendered, layout) = render_query(query, RenderValues::Positional(&values)).unwrap();
         assert_eq!(
             rendered,
             "SELECT ä, 'ö\\界', R'tail\\', X'00ff', U&'\\0061', \"列\", 42 -- коммент\n/* 注釈 */ # ?"
         );
-        assert_eq!(count, 1);
+        assert_eq!(layout, ParameterLayout::Positional(1));
     }
 
     #[test]

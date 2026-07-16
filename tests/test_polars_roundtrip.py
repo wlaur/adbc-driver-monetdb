@@ -18,6 +18,8 @@ import polars as pl
 import pyarrow as pa  # pyright: ignore[reportMissingTypeStubs]
 import pytest
 from server_version import MONETDB_SERVER_VERSION
+from sqlalchemy import Integer, bindparam, select
+from sqlalchemy import cast as sql_cast
 
 from adbc_driver_monetdb import StatementOptions, dbapi
 
@@ -78,8 +80,7 @@ arrow = cast(_PyArrow, pa)
 @pytest.mark.integration
 def test_read_database(monetdb_uri: str) -> None:
     with dbapi.connect(monetdb_uri) as conn:
-        # polars' connection union references optional deps we don't install -> partially unknown
-        df = pl.read_database("SELECT 42 AS answer, 'monetdb' AS name", conn)  # pyright: ignore[reportUnknownMemberType]
+        df = pl.read_database("SELECT 42 AS answer, 'monetdb' AS name", conn)
     assert df.shape == (1, 2)
     assert df.get_column("answer").item() == 42
     assert df.get_column("name").item() == "monetdb"
@@ -92,7 +93,7 @@ def test_polars_uri_resolution_and_streaming_batches(monetdb_uri: str) -> None:
 
     with dbapi.connect(monetdb_uri) as conn:
         batches = list(
-            pl.read_database(  # pyright: ignore[reportUnknownMemberType]
+            pl.read_database(
                 "SELECT value FROM sys.generate_series(1, 300001)",
                 conn,
                 iter_batches=True,
@@ -109,19 +110,33 @@ def test_polars_preconfigured_cursor_and_execute_options(monetdb_uri: str) -> No
     with dbapi.connect(monetdb_uri) as connection:
         with connection.cursor(adbc_stmt_kwargs={StatementOptions.BATCH_ROWS: 2}) as cursor:
             batches = list(
-                pl.read_database(  # pyright: ignore[reportUnknownMemberType]
+                pl.read_database(
                     "SELECT value FROM sys.generate_series(1, 6)",
                     cursor,
                     iter_batches=True,
                 )
             )
-        parameterized = pl.read_database(  # pyright: ignore[reportUnknownMemberType]
+        parameterized = pl.read_database(
             "SELECT CAST(? AS INT) AS value",
             connection,
             execute_options={"parameters": (42,)},
         )
     assert [batch.height for batch in batches] == [2, 2, 1]
     assert parameterized.get_column("value").to_list() == [42]
+
+
+@pytest.mark.integration
+def test_sqlalchemy_compiled_named_parameters(monetdb_uri: str) -> None:
+    value = sql_cast(bindparam("value", value=21), Integer)
+    compiled = select((value + value).label("value")).compile()
+    assert compiled.params == {"value": 21}
+    with dbapi.connect(monetdb_uri) as connection:
+        frame = pl.read_database(
+            str(compiled),
+            connection,
+            execute_options={"parameters": compiled.params},
+        )
+    assert frame.get_column("value").to_list() == [42]
 
 
 @pytest.mark.integration
@@ -253,7 +268,7 @@ def test_non_binary_type_error_recommends_cast(monetdb_uri: str) -> None:
             match=r"GEOMETRY.*cast the column to VARCHAR",
         ):
             conn.execute("SELECT ST_Point(1, 2) AS geom")  # pyright: ignore[reportUnknownMemberType]
-        casted = pl.read_database(  # pyright: ignore[reportUnknownMemberType]
+        casted = pl.read_database(
             "SELECT CAST(ST_Point(1, 2) AS VARCHAR(100)) AS geom",
             conn,
         )
@@ -263,8 +278,8 @@ def test_non_binary_type_error_recommends_cast(monetdb_uri: str) -> None:
 @pytest.mark.integration
 def test_empty_and_null_results(monetdb_uri: str) -> None:
     with dbapi.connect(monetdb_uri) as conn:
-        empty = pl.read_database("SELECT CAST(NULL AS INT) AS value WHERE FALSE", conn)  # pyright: ignore[reportUnknownMemberType]
-        values = pl.read_database(  # pyright: ignore[reportUnknownMemberType]
+        empty = pl.read_database("SELECT CAST(NULL AS INT) AS value WHERE FALSE", conn)
+        values = pl.read_database(
             "SELECT * FROM (VALUES (1, 'a'), (2, CAST(NULL AS VARCHAR(2))), (3, 'c')) AS t(i, s) ORDER BY i",
             conn,
         )
@@ -464,6 +479,8 @@ def test_prepared_parameters_and_executemany(monetdb_uri: str) -> None:
             assert "0: decimal128(38, 0)" in rendered_parameter_schema
             assert "1: decimal128(38, 0)" in rendered_parameter_schema
             assert rendered_parameter_schema.count("monetdb.hugeint") == 2
+            cursor.execute("SELECT :value + :value", {"value": 21})  # pyright: ignore[reportUnknownMemberType]
+            assert cursor.fetchone() == (42,)  # pyright: ignore[reportUnknownMemberType]
             cursor.execute(  # pyright: ignore[reportUnknownMemberType]
                 "SELECT ? AS i, '?' AS literal_qmark, ? AS s, ? AS b, "
                 "CAST(? AS DECIMAL(9, 2)) AS d, ? AS dt, ? AS tm, ? AS ts, ? AS tstz, ? AS iv",
@@ -496,11 +513,17 @@ def test_prepared_parameters_and_executemany(monetdb_uri: str) -> None:
                 "INSERT INTO parameter_rows VALUES (?, ?)",
                 [(1, malicious), (2, None), (3, "?")],
             )
+            cursor.executemany(  # pyright: ignore[reportUnknownMemberType]
+                "INSERT INTO parameter_rows VALUES (:i, :s)",
+                [{"s": "named", "i": 4}, {"i": 5, "s": None}],
+            )
             cursor.execute("SELECT i, s FROM parameter_rows ORDER BY i")  # pyright: ignore[reportUnknownMemberType]
             assert cursor.fetchall() == [  # pyright: ignore[reportUnknownMemberType]
                 (1, malicious),
                 (2, None),
                 (3, "?"),
+                (4, "named"),
+                (5, None),
             ]
         finally:
             cursor.execute("DROP TABLE IF EXISTS parameter_rows")  # pyright: ignore[reportUnknownMemberType]
@@ -563,10 +586,8 @@ def test_write_database_roundtrip(monetdb_uri: str) -> None:
     )
     with dbapi.connect(monetdb_uri) as conn:
         try:
-            df.write_database("roundtrip_smoke", conn, if_table_exists="replace", engine="adbc")  # pyright: ignore[reportUnknownMemberType]
-            back = pl.read_database(  # pyright: ignore[reportUnknownMemberType]
-                "SELECT id, value, name FROM roundtrip_smoke ORDER BY id", conn
-            )
+            df.write_database("roundtrip_smoke", conn, if_table_exists="replace", engine="adbc")
+            back = pl.read_database("SELECT id, value, name FROM roundtrip_smoke ORDER BY id", conn)
             assert back.equals(df)
         finally:
             conn.cursor().execute("DROP TABLE IF EXISTS roundtrip_smoke")  # pyright: ignore[reportUnknownMemberType]
@@ -578,14 +599,17 @@ def test_pandas_roundtrip(monetdb_uri: str) -> None:
     with dbapi.connect(monetdb_uri) as conn:
         try:
             assert (
-                frame.to_sql(  # pyright: ignore[reportUnknownMemberType]
-                    "pandas_smoke", conn, if_exists="replace", index=False
+                frame.to_sql(
+                    "pandas_smoke",
+                    conn,  # pyright: ignore[reportArgumentType]
+                    if_exists="replace",
+                    index=False,
                 )
                 == 3
             )
-            result = pd.read_sql(  # pyright: ignore[reportUnknownMemberType]
+            result = pd.read_sql(
                 "SELECT id, name FROM pandas_smoke ORDER BY id",
-                conn,
+                conn,  # pyright: ignore[reportArgumentType]
                 dtype_backend="pyarrow",
             )
             assert result.to_dict(orient="list") == {
@@ -614,11 +638,11 @@ def test_ingest_modes_and_temporary_table(monetdb_uri: str) -> None:
                 assert cursor.adbc_ingest("ingest_modes", second, mode="append") == 1  # pyright: ignore[reportUnknownMemberType]
                 assert cursor.adbc_ingest("ingest_modes", second, mode="create_append") == 1  # pyright: ignore[reportUnknownMemberType]
                 assert cursor.adbc_ingest("ingest_temporary", first, mode="create", temporary=True) == 2  # pyright: ignore[reportUnknownMemberType]
-            values = pl.read_database("SELECT value FROM ingest_modes ORDER BY value", conn)  # pyright: ignore[reportUnknownMemberType]
-            temporary = pl.read_database("SELECT value FROM ingest_temporary ORDER BY value", conn)  # pyright: ignore[reportUnknownMemberType]
+            values = pl.read_database("SELECT value FROM ingest_modes ORDER BY value", conn)
+            temporary = pl.read_database("SELECT value FROM ingest_temporary ORDER BY value", conn)
             assert values.get_column("value").to_list() == [1, 2, 3, 3]
             assert temporary.get_column("value").to_list() == [1, 2]
-            assert first.write_database("ingest_modes", conn, if_table_exists="replace", engine="adbc") == 2  # pyright: ignore[reportUnknownMemberType]
+            assert first.write_database("ingest_modes", conn, if_table_exists="replace", engine="adbc") == 2
         finally:
             conn.cursor().execute("DROP TABLE IF EXISTS ingest_modes")  # pyright: ignore[reportUnknownMemberType]
             conn.cursor().execute("DROP TABLE IF EXISTS ingest_temporary")  # pyright: ignore[reportUnknownMemberType]
@@ -775,8 +799,8 @@ def test_dtype_matrix_roundtrip(monetdb_uri: str) -> None:
     )
     with dbapi.connect(monetdb_uri) as conn:
         try:
-            assert frame.write_database("dtype_matrix", conn, if_table_exists="replace", engine="adbc") == 3  # pyright: ignore[reportUnknownMemberType]
-            back = pl.read_database("SELECT * FROM dtype_matrix", conn)  # pyright: ignore[reportUnknownMemberType]
+            assert frame.write_database("dtype_matrix", conn, if_table_exists="replace", engine="adbc") == 3
+            back = pl.read_database("SELECT * FROM dtype_matrix", conn)
             assert back.equals(expected)
         finally:
             conn.cursor().execute("DROP TABLE IF EXISTS dtype_matrix")  # pyright: ignore[reportUnknownMemberType]
@@ -794,7 +818,7 @@ def test_non_finite_floats_are_rejected_on_write_and_bind(monetdb_uri: str) -> N
         dbapi.connect(monetdb_uri) as conn,
         pytest.raises(adbc_driver_manager.DataError, match="non-finite"),
     ):
-        frame.write_database("nan_semantics", conn, if_table_exists="replace", engine="adbc")  # pyright: ignore[reportUnknownMemberType]
+        frame.write_database("nan_semantics", conn, if_table_exists="replace", engine="adbc")
     with dbapi.connect(monetdb_uri) as conn, conn.cursor() as cursor:
         for value in [float("nan"), float("inf"), float("-inf")]:
             with pytest.raises(adbc_driver_manager.DataError, match="non-finite"):
@@ -967,7 +991,7 @@ def test_polars_future_unknown_extension_behavior(monetdb_uri: str) -> None:
 def test_variable_width_types_cross_batch_boundary(monetdb_uri: str) -> None:
     with dbapi.connect(monetdb_uri) as conn:
         batches = list(
-            pl.read_database(  # pyright: ignore[reportUnknownMemberType]
+            pl.read_database(
                 "SELECT CAST(value AS STRING) AS text, "
                 "CAST(value AS DECIMAL(18, 2)) / 100 AS amount "
                 "FROM sys.generate_series(1, 131074)",
@@ -990,8 +1014,8 @@ def test_categorical_and_enum_ingest(monetdb_uri: str) -> None:
     )
     with dbapi.connect(monetdb_uri) as conn:
         try:
-            assert frame.write_database("categoricals", conn, if_table_exists="replace", engine="adbc") == 4  # pyright: ignore[reportUnknownMemberType]
-            back = pl.read_database("SELECT * FROM categoricals", conn)  # pyright: ignore[reportUnknownMemberType]
+            assert frame.write_database("categoricals", conn, if_table_exists="replace", engine="adbc") == 4
+            back = pl.read_database("SELECT * FROM categoricals", conn)
             assert back.to_dict(as_series=False) == {
                 "category": ["a", "b", "a", None],
                 "enum": ["x", "y", "x", None],
@@ -1043,7 +1067,7 @@ def test_wide_numeric_read_avoids_double_residency(monetdb_uri: str) -> None:
 
     columns = ", ".join(f"CAST(value + {index} AS REAL) AS v{index}" for index in range(256))
     with dbapi.connect(monetdb_uri) as conn:
-        pl.read_database("SELECT 1", conn)  # pyright: ignore[reportUnknownMemberType]
+        pl.read_database("SELECT 1", conn)
         gc.collect()
         baseline = rss_bytes()
         peak = baseline
@@ -1057,7 +1081,7 @@ def test_wide_numeric_read_avoids_double_residency(monetdb_uri: str) -> None:
         sampler = Thread(target=sample, daemon=True)
         sampler.start()
         try:
-            frame = pl.read_database(  # pyright: ignore[reportUnknownMemberType]
+            frame = pl.read_database(
                 f"SELECT {columns} FROM sys.generate_series(0, 40000)",
                 conn,
             )
@@ -1079,11 +1103,11 @@ def test_repeated_query_rss_is_bounded(monetdb_uri: str) -> None:
 
     with dbapi.connect(monetdb_uri) as conn:
         for _ in range(10):
-            pl.read_database("SELECT value FROM sys.generate_series(1, 10001)", conn)  # pyright: ignore[reportUnknownMemberType]
+            pl.read_database("SELECT value FROM sys.generate_series(1, 10001)", conn)
         gc.collect()
         baseline = rss_bytes()
         for _ in range(200):
-            frame = pl.read_database(  # pyright: ignore[reportUnknownMemberType]
+            frame = pl.read_database(
                 "SELECT value, CAST(value AS STRING) AS text FROM sys.generate_series(1, 10001)",
                 conn,
             )
