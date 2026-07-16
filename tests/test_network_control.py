@@ -102,6 +102,66 @@ class _BlackHoleServer:
             self.errors.put(error)
 
 
+class _FailureServer:
+    def __init__(self, mode: str) -> None:
+        self._mode = mode
+        self._listener = socket.socket()
+        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._listener.bind(("127.0.0.1", 0))
+        self._listener.listen(1)
+        self._listener.settimeout(5)
+        self._thread = Thread(target=self._serve, daemon=True)
+        self.errors: Queue[BaseException] = Queue()
+
+    @property
+    def uri(self) -> str:
+        return f"monetdb://127.0.0.1:{self._listener.getsockname()[1]}/test"
+
+    def __enter__(self) -> "_FailureServer":
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self._listener.close()
+        self._thread.join(timeout=5)
+        assert not self._thread.is_alive(), "fake MAPI server did not stop"
+        if not self.errors.empty():
+            raise self.errors.get_nowait()
+
+    def _serve(self) -> None:
+        try:
+            with self._listener.accept()[0] as stream:
+                stream.settimeout(5)
+                assert _read_exact(stream, 8) == bytes(8)
+                _write_message(stream, b"salt:mserver:9:SHA512:LIT:SHA512:sql=9:BINARY=1:")
+                _read_message(stream)
+                _write_message(stream, b"=OK")
+                assert b"sys.environment" in _read_message(stream)
+                _write_message(
+                    stream,
+                    _text_result(1, ("name", "value"), ("monet_version", "11.55.3")),
+                )
+                assert b"current_schema" in _read_message(stream)
+                _write_message(stream, _text_result(2, ("__adbc_current_schema",), ("sys",)))
+                assert b"SELECT value" in _read_message(stream)
+                if self._mode == "disconnect":
+                    return
+                _write_message(
+                    stream,
+                    b"&1 42 2 1 1\n"
+                    b"% t # table_name\n"
+                    b"% value # name\n"
+                    b"% int # type\n"
+                    b"% 32 # length\n"
+                    b"% 0 0 # typesizes\n"
+                    b"[ 1\t]\n",
+                )
+                assert _read_message(stream).startswith(b"Xexportbin 42 0 2")
+                _write_message(stream, b"!42000!mid-stream failure\n!second diagnostic")
+        except BaseException as error:
+            self.errors.put(error)
+
+
 @pytest.mark.parametrize("option_channel", ["uri", "kwargs"])
 def test_connect_deadline_covers_silent_login(option_channel: str) -> None:
     with _BlackHoleServer(initialize=False) as server:
@@ -162,3 +222,28 @@ def test_statement_cancel_interrupts_black_holed_query() -> None:
         assert result.status_code == adbc_driver_manager.AdbcStatusCode.CANCELLED
         with pytest.raises(adbc_driver_manager.ProgrammingError):
             cursor.execute("SELECT 2")  # pyright: ignore[reportUnknownMemberType]
+
+
+def test_query_disconnect_is_io_and_closes_connection() -> None:
+    with (
+        _FailureServer("disconnect") as server,
+        dbapi.connect(server.uri, autocommit=True) as connection,
+        connection.cursor() as cursor,
+    ):
+        with pytest.raises(adbc_driver_manager.OperationalError) as disconnected:
+            cursor.execute("SELECT value")  # pyright: ignore[reportUnknownMemberType]
+        assert disconnected.value.status_code == adbc_driver_manager.AdbcStatusCode.IO
+        with pytest.raises(adbc_driver_manager.ProgrammingError):
+            cursor.execute("SELECT value")  # pyright: ignore[reportUnknownMemberType]
+
+
+def test_midstream_error_preserves_sqlstate_and_all_diagnostics() -> None:
+    with (
+        _FailureServer("stream_error") as server,
+        dbapi.connect(server.uri, autocommit=True) as connection,
+        connection.cursor() as cursor,
+    ):
+        cursor.execute("SELECT value")  # pyright: ignore[reportUnknownMemberType]
+        with pytest.raises(ValueError, match="42000!mid-stream failure") as failed:
+            cursor.fetchall()  # pyright: ignore[reportUnknownMemberType]
+        assert "second diagnostic" in str(failed.value)

@@ -217,8 +217,9 @@ def test_parameterless_reads_do_not_create_prepared_statements(monetdb_uri: str)
 @pytest.mark.integration
 def test_failed_authentication_does_not_poison_driver(monetdb_uri: str) -> None:
     wrong_password = monetdb_uri.replace(":monetdb@", ":definitely-wrong@")
-    with pytest.raises(adbc_driver_manager.ProgrammingError, match="login rejected"):
+    with pytest.raises(adbc_driver_manager.ProgrammingError, match="login rejected") as rejected:
         dbapi.connect(wrong_password)
+    assert rejected.value.status_code == adbc_driver_manager.AdbcStatusCode.UNAUTHENTICATED
     with dbapi.connect(monetdb_uri) as conn, conn.cursor() as cursor:
         cursor.execute("SELECT 1")  # pyright: ignore[reportUnknownMemberType]
         assert cursor.fetchone() == (1,)  # pyright: ignore[reportUnknownMemberType]
