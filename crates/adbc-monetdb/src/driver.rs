@@ -228,6 +228,13 @@ fn sqlstate_status(message: &str) -> Status {
     if message.as_bytes().get(5) != Some(&b'!') {
         return Status::Unknown;
     }
+    if sqlstate == b"42000"
+        && message
+            .get(6..)
+            .is_some_and(|diagnostic| diagnostic.contains("access denied"))
+    {
+        return Status::Unauthorized;
+    }
     match sqlstate {
         b"42S02" | b"42S22" | b"3F000" | b"42703" => Status::NotFound,
         b"42S01" | b"42710" => Status::AlreadyExists,
@@ -2369,6 +2376,10 @@ mod tests {
     fn maps_sqlstate_families_to_adbc_statuses() {
         for (message, expected) in [
             ("42000!syntax error", Status::InvalidArguments),
+            (
+                "42000!SELECT: access denied for user to table 'sys.private'",
+                Status::Unauthorized,
+            ),
             ("42S02!table not found", Status::NotFound),
             ("42S01!table exists", Status::AlreadyExists),
             ("40002!primary key violation", Status::Integrity),
