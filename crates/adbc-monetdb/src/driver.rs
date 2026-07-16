@@ -73,7 +73,11 @@ fn lock_connection(
 
 fn map_cursor_error(value: CursorError) -> Error {
     let status = match value {
-        CursorError::Closed | CursorError::NoResultSet => Status::InvalidState,
+        CursorError::Closed | CursorError::NoResultSet | CursorError::NoActiveOperation => {
+            Status::InvalidState
+        }
+        CursorError::Cancelled => Status::Cancelled,
+        CursorError::Timeout => Status::Timeout,
         CursorError::IO(_) => Status::IO,
         CursorError::Framing(_) | CursorError::BadReply(_) => Status::InvalidData,
         CursorError::Conversion { .. }
@@ -82,15 +86,7 @@ fn map_cursor_error(value: CursorError) -> Error {
         CursorError::FileTransfer(_) | CursorError::UploadRefused { .. } => Status::InvalidData,
         CursorError::PreparedResult => Status::InvalidState,
         CursorError::Metadata(_) | CursorError::Poisoned => Status::Internal,
-        CursorError::Server(ref message)
-            if message.starts_with("42S02!")
-                || message.starts_with("42S22!")
-                || message.starts_with("3F000!") =>
-        {
-            Status::NotFound
-        }
-        CursorError::Server(ref message) if message.starts_with("2DM30!") => Status::InvalidState,
-        CursorError::Server(_) => Status::Unknown,
+        CursorError::Server(ref message) => sqlstate_status(message),
     };
     let mut result = error(value.to_string(), status);
     if let CursorError::Server(message) = value
@@ -99,6 +95,30 @@ fn map_cursor_error(value: CursorError) -> Error {
         result.sqlstate = sqlstate;
     }
     result
+}
+
+fn sqlstate_status(message: &str) -> Status {
+    let Some(sqlstate) = message.as_bytes().get(..5) else {
+        return Status::Unknown;
+    };
+    if message.as_bytes().get(5) != Some(&b'!') {
+        return Status::Unknown;
+    }
+    match sqlstate {
+        b"42S02" | b"42S22" | b"3F000" | b"42703" => Status::NotFound,
+        b"42S01" | b"42710" => Status::AlreadyExists,
+        b"40002" => Status::Integrity,
+        b"42501" => Status::Unauthorized,
+        b"28000" => Status::Unauthenticated,
+        b"57014" => Status::Cancelled,
+        b"HYT00" | b"HYT01" => Status::Timeout,
+        b"2DM30" => Status::InvalidState,
+        code if code.starts_with(b"23") => Status::Integrity,
+        code if code.starts_with(b"25") || code.starts_with(b"2D") => Status::InvalidState,
+        code if code.starts_with(b"28") => Status::Unauthorized,
+        code if code.starts_with(b"42") => Status::InvalidArguments,
+        _ => Status::Unknown,
+    }
 }
 
 fn parse_sqlstate(message: &str) -> Option<[c_char; 5]> {
@@ -2092,6 +2112,26 @@ mod tests {
             ])
         );
         assert_eq!(parse_sqlstate("syntax error"), None);
+    }
+
+    #[test]
+    fn maps_sqlstate_families_to_adbc_statuses() {
+        for (message, expected) in [
+            ("42000!syntax error", Status::InvalidArguments),
+            ("42S02!table not found", Status::NotFound),
+            ("42S01!table exists", Status::AlreadyExists),
+            ("40002!primary key violation", Status::Integrity),
+            ("23503!foreign key violation", Status::Integrity),
+            ("42501!permission denied", Status::Unauthorized),
+            ("28000!authentication failed", Status::Unauthenticated),
+            ("25000!transaction state", Status::InvalidState),
+            ("HYT00!query timed out", Status::Timeout),
+            ("57014!query interrupted", Status::Cancelled),
+            ("XXXXX!vendor condition", Status::Unknown),
+            ("unstructured server error", Status::Unknown),
+        ] {
+            assert_eq!(sqlstate_status(message), expected, "{message}");
+        }
     }
 
     #[test]
