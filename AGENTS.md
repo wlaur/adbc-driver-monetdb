@@ -81,9 +81,10 @@ covers the conventions that are easy to get wrong.
 - Required status checks are matched by exact job name; renaming a job in
   `.github/workflows/ci.yml` requires updating the branch-protection rule in the same
   change.
-- Release (once feature parity is reached): bump the version in `pyproject.toml` *and*
-  `uv.lock`, PR, then tag `v<version>` — the workflow builds wheels for all four
-  platforms and publishes via PyPI Trusted Publishing, then creates the GitHub Release.
+- Release (once feature parity is reached): bump the version in `pyproject.toml`,
+  `uv.lock`, and all `packaging/dbc/MANIFEST.*.toml` files, PR, then tag `v<version>` —
+  the workflow builds wheels for all four platforms and publishes via PyPI Trusted
+  Publishing, then creates the GitHub Release.
 
 ## Public repo hygiene
 

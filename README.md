@@ -140,6 +140,24 @@ explicitly waived cross-catalog/statistics behavior and negative-scale decimals 
 itself does not support. Polars' announced future unknown-extension behavior is exercised in CI;
 HUGEINT and TIMETZ remain round-trippable when loaded as extension types.
 
+## Non-Python driver managers
+
+Each platform wheel can also be converted to a flat `dbc` package. Installing that archive makes
+the driver discoverable as `monetdb` by C/C++, Go, R, Ruby, Rust, Python, and other ADBC driver
+managers. `dbc` writes the installed ADBC TOML manifest with an absolute shared-library path; a
+relative `Driver.shared` path is not portable.
+
+```sh
+uv run python packaging/dbc/build_package.py \
+    --wheel dist/adbc_driver_monetdb-0.1.0-cp313-abi3-macosx_11_0_arm64.whl \
+    --platform macos_arm64 --out-dir dist/dbc
+ADBC_DRIVER_PATH="$PWD/.adbc-drivers" \
+    uvx --from dbc dbc install --no-verify dist/dbc/monetdb_macos_arm64_v0.1.0.tar.gz
+```
+
+The repository packages are unsigned development artifacts, hence `--no-verify`. A registry
+release should be signed and installed without that flag.
+
 ## Repository layout
 
 | Path | |
@@ -148,6 +166,7 @@ HUGEINT and TIMETZ remain round-trippable when loaded as extension types.
 | `crates/monetdb-arrow` | MonetDB binary wire format ⇄ Arrow conversion |
 | `monetdb-rust` | [our fork](https://github.com/wlaur/monetdb-rust) of [MonetDB/monetdb-rust](https://github.com/MonetDB/monetdb-rust) (git submodule, MPL-2.0) — MAPI protocol layer |
 | `adbc_driver_monetdb` | Python shim over `adbc-driver-manager`; ships the cdylib as `adbc_driver_monetdb._native` |
+| `packaging/dbc` | platform manifests and builder for non-Python driver-manager packages |
 
 ## Development
 

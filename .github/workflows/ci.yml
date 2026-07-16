@@ -108,11 +108,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-latest      # manylinux x86_64
-          - ubuntu-24.04-arm   # manylinux aarch64
-          - macos-14           # macOS arm64 (Apple Silicon; Intel x86_64 intentionally unsupported)
-          - windows-latest     # Windows x86_64
+        include:
+          - os: ubuntu-latest      # manylinux x86_64
+            dbc_platform: linux_amd64
+          - os: ubuntu-24.04-arm   # manylinux aarch64
+            dbc_platform: linux_arm64
+          - os: macos-14           # macOS arm64 (Apple Silicon; Intel x86_64 intentionally unsupported)
+            dbc_platform: macos_arm64
+          - os: windows-latest     # Windows x86_64
+            dbc_platform: windows_amd64
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -168,10 +172,29 @@ jobs:
           if (-not ($headers -match "machine \(x64\)")) { throw "extension is not x86-64 PE" }
           $forbidden = $imports | Select-String -Pattern '(?i)\b(?:MSVCP|CONCRT)[^\s]*\.dll\b'
           if ($forbidden) { throw "extension unexpectedly depends on the C++ runtime: $forbidden" }
+      - name: Build and load the dbc package
+        shell: bash
+        run: |
+          wheel=$(find wheelhouse -maxdepth 1 -name 'adbc_driver_monetdb-*.whl' -print -quit)
+          python packaging/dbc/build_package.py \
+            --wheel "$wheel" --platform '${{ matrix.dbc_platform }}' --out-dir dbc-dist
+          driver_path="$RUNNER_TEMP/adbc-drivers"
+          mkdir -p "$driver_path"
+          ADBC_DRIVER_PATH="$driver_path" uvx --from 'dbc==0.3.0' \
+            dbc install --no-verify dbc-dist/*.tar.gz
+          cd "$RUNNER_TEMP"
+          ADBC_DRIVER_PATH="$driver_path" uv run --isolated --no-project --python 3.13 \
+            --with 'adbc-driver-manager==1.11.0' \
+            python -c 'import adbc_driver_manager as m; db = m.AdbcDatabase(driver="monetdb"); db.close()'
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: wheels-${{ matrix.os }}
           path: wheelhouse/*.whl
+          if-no-files-found: error
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dbc-${{ matrix.os }}
+          path: dbc-dist/*.tar.gz
           if-no-files-found: error
 
   test:
