@@ -1277,7 +1277,12 @@ impl MonetdbStatement {
                 cursor
                     .execute(&format!("SELECT * FROM {target} WHERE FALSE"))
                     .map_err(map_cursor_error)?;
-                validate_append_schema(&schema, cursor.column_metadata())?;
+                let mismatch_status = if mode == "adbc.ingest.mode.create_append" {
+                    Status::AlreadyExists
+                } else {
+                    Status::InvalidArguments
+                };
+                validate_append_schema(&schema, cursor.column_metadata(), mismatch_status)?;
             }
 
             let files = (0..schema.fields().len())
@@ -1348,7 +1353,11 @@ impl MonetdbStatement {
     }
 }
 
-fn validate_append_schema(schema: &SchemaRef, columns: &[ResultColumn]) -> Result<()> {
+fn validate_append_schema(
+    schema: &SchemaRef,
+    columns: &[ResultColumn],
+    mismatch_status: Status,
+) -> Result<()> {
     if schema.fields().len() != columns.len() {
         return Err(error(
             format!(
@@ -1356,7 +1365,7 @@ fn validate_append_schema(schema: &SchemaRef, columns: &[ResultColumn]) -> Resul
                 schema.fields().len(),
                 columns.len()
             ),
-            Status::InvalidArguments,
+            mismatch_status,
         ));
     }
     for (index, (field, column)) in schema.fields().iter().zip(columns).enumerate() {
@@ -1367,7 +1376,7 @@ fn validate_append_schema(schema: &SchemaRef, columns: &[ResultColumn]) -> Resul
                     field.name(),
                     column.name()
                 ),
-                Status::InvalidArguments,
+                mismatch_status,
             ));
         }
         let source = monetdb_arrow::monet_type_for_field(field)
@@ -1385,7 +1394,7 @@ fn validate_append_schema(schema: &SchemaRef, columns: &[ResultColumn]) -> Resul
                     "append column {:?} has Arrow/MonetDB type {source}, but destination type is {destination}",
                     field.name()
                 ),
-                Status::InvalidArguments,
+                mismatch_status,
             ));
         }
     }
