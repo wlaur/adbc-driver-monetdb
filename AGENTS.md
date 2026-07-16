@@ -12,8 +12,11 @@ covers the conventions that are easy to get wrong.
   never add fallbacks for older servers and never decode text-protocol result sets.
 - **Current-stable consumers only:** Python ≥ 3.13, polars ≥ 1.42,
   adbc-driver-manager ≥ 1.11. Don't add version-compat shims — bump the pins instead.
-- **No PyPI release (no `v*` tag) until 100% feature parity.** No development-status
-  classifiers or alpha messaging anywhere.
+- **No PyPI release (no `v*` tag) until every required row in the README's release
+  baseline is supported and the acceptance gates are green.** Optional or
+  backend-inapplicable rows may remain unsupported only when the matrix names them
+  explicitly and tests verify `NotImplemented`. No development-status classifiers or
+  alpha messaging anywhere.
 
 ## The monetdb-rust submodule is a fork, not vendored code
 
