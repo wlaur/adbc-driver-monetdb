@@ -22,7 +22,7 @@ chrono = "0.4"
 memchr = "2"
 monetdb = { path = "monetdb-rust", features = ["rustls"] }
 monetdb-arrow = { path = "crates/monetdb-arrow" }
-pyo3 = "0.28"
+pyo3 = "0.29"
 percent-encoding = "2"
 rayon = "1"
 url = "2.5"
