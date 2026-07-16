@@ -78,7 +78,7 @@ with dbapi.connect(
 ) as conn:
     with conn.cursor(
         adbc_stmt_kwargs={
-            StatementOptions.OPERATION_TIMEOUT: "15",
+            StatementOptions.OPERATION_TIMEOUT: 15,
             StatementOptions.BATCH_ROWS: 65_536,
         }
     ) as cursor:

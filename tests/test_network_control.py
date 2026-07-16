@@ -182,7 +182,7 @@ def test_statement_read_timeout_closes_black_holed_connection() -> None:
         _BlackHoleServer(initialize=True) as server,
         dbapi.connect(server.uri, autocommit=True) as connection,
         connection.cursor(
-            adbc_stmt_kwargs={StatementOptions.READ_TIMEOUT: "1", StatementOptions.OPERATION_TIMEOUT: "0"}
+            adbc_stmt_kwargs={StatementOptions.READ_TIMEOUT: 1, StatementOptions.OPERATION_TIMEOUT: 0}
         ) as cursor,
     ):
         started = monotonic()
