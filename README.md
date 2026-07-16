@@ -94,6 +94,10 @@ cursor; it has no `engine="adbc"` parameter. Polars calls `connection.cursor()` 
 `adbc.monetdb.batch_rows`, and `DataFrame.write_database(..., engine_options=...)` supplies
 ingestion arguments rather than connection or timeout options.
 
+The DB-API module reports `threadsafety = 1`: threads may share the module, but each thread
+should use its own connection and cursors. Cross-thread cancellation of an active operation is
+supported explicitly.
+
 ## Support policy
 
 - MonetDB **Dec2025 (11.55) and newer**, little-endian servers only
