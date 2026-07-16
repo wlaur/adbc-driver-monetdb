@@ -17,7 +17,7 @@ adbc_core = "0.23"
 adbc_ffi = "0.23"
 arrow-array = "58"
 arrow-buffer = "58"
-arrow-schema = "58"
+arrow-schema = "59"
 chrono = "0.4"
 memchr = "2"
 monetdb = { path = "monetdb-rust", features = ["rustls"] }

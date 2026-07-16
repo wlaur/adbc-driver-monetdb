@@ -9,7 +9,7 @@ dependencies = [
  "adbc_core",
  "adbc_ffi",
  "arrow-array",
- "arrow-schema",
+ "arrow-schema 59.1.0",
  "cargo-lock",
  "chrono",
  "monetdb",
@@ -26,7 +26,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "46b169525a7c41670fe95874103c7c6ce713ac699123f81a200bc31f9ad3b02e"
 dependencies = [
  "arrow-array",
- "arrow-schema",
+ "arrow-schema 58.3.0",
 ]
 
 [[package]]
@@ -37,7 +37,7 @@ checksum = "e6851c2ab953511cf7a244aadcbc0586442fd3c67dfe371457369048880dd513"
 dependencies = [
  "adbc_core",
  "arrow-array",
- "arrow-schema",
+ "arrow-schema 58.3.0",
 ]
 
 [[package]]
@@ -78,7 +78,7 @@ dependencies = [
  "ahash",
  "arrow-buffer",
  "arrow-data",
- "arrow-schema",
+ "arrow-schema 58.3.0",
  "chrono",
  "half",
  "hashbrown",
@@ -106,7 +106,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3c88210023a2bfee1896af366309a3028fc3bcbd6515fa29a7990ee1baa08ee0"
 dependencies = [
  "arrow-buffer",
- "arrow-schema",
+ "arrow-schema 58.3.0",
  "half",
  "num-integer",
  "num-traits",
@@ -120,6 +120,12 @@ checksum = "f633dbfdf39c039ada1bf9e34c694816eb71fbb7dc78f613993b7245e078a1ed"
 dependencies = [
  "bitflags",
 ]
+
+[[package]]
+name = "arrow-schema"
+version = "59.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d9e4969dc350d571766247143ab36a5187d095d3d3690970408bc630d47c69e5"
 
 [[package]]
 name = "atoi"
@@ -827,7 +833,7 @@ version = "0.1.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
- "arrow-schema",
+ "arrow-schema 59.1.0",
  "chrono",
  "memchr",
  "monetdb",
