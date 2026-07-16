@@ -132,4 +132,4 @@ markers = [
 override-dependencies = ["pyarrow>=25"]
 
 [tool.uv.sources]
-adbc-drivers-validation = { git = "https://github.com/adbc-drivers/validation", rev = "20bcdbe0d498065565e727861ca7e1f94d9b66bb" }
+adbc-drivers-validation = { git = "https://github.com/adbc-drivers/validation", rev = "a4019a3f44ccffcbec4b5203531a88259d588257" }

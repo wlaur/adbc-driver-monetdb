@@ -288,7 +288,7 @@ jobs:
               --ignore "$GITHUB_WORKSPACE/tests/validation" -q
           uv run --isolated --no-project --python 3.13 \
             --with "$wheel" --with pytest --with pymonetdb \
-            --with 'adbc-drivers-validation @ git+https://github.com/adbc-drivers/validation@20bcdbe0d498065565e727861ca7e1f94d9b66bb' \
+            --with 'adbc-drivers-validation @ git+https://github.com/adbc-drivers/validation@a4019a3f44ccffcbec4b5203531a88259d588257' \
             python -m pytest "$GITHUB_WORKSPACE/tests/validation" -q
   publish:
     name: publish to PyPI

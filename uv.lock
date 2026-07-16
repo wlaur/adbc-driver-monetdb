@@ -70,7 +70,7 @@ requires-dist = [{ name = "adbc-driver-manager", specifier = ">=1.11" }]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "adbc-drivers-validation", git = "https://github.com/adbc-drivers/validation?rev=20bcdbe0d498065565e727861ca7e1f94d9b66bb" },
+    { name = "adbc-drivers-validation", git = "https://github.com/adbc-drivers/validation?rev=a4019a3f44ccffcbec4b5203531a88259d588257" },
     { name = "maturin", specifier = ">=1.8.2,<2" },
     { name = "pandas", specifier = ">=3.0" },
     { name = "pandas-stubs", specifier = ">=3.0.3.260530" },
@@ -85,7 +85,7 @@ dev = [
 [[package]]
 name = "adbc-drivers-validation"
 version = "0.1"
-source = { git = "https://github.com/adbc-drivers/validation?rev=20bcdbe0d498065565e727861ca7e1f94d9b66bb#20bcdbe0d498065565e727861ca7e1f94d9b66bb" }
+source = { git = "https://github.com/adbc-drivers/validation?rev=a4019a3f44ccffcbec4b5203531a88259d588257#a4019a3f44ccffcbec4b5203531a88259d588257" }
 dependencies = [
     { name = "adbc-driver-manager" },
     { name = "bidict" },
