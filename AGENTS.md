@@ -12,8 +12,11 @@ covers the conventions that are easy to get wrong.
   never add fallbacks for older servers and never decode text-protocol result sets.
 - **Current-stable consumers only:** Python ≥ 3.13, polars ≥ 1.42,
   adbc-driver-manager ≥ 1.11. Don't add version-compat shims — bump the pins instead.
-- **No PyPI release (no `v*` tag) until 100% feature parity.** No development-status
-  classifiers or alpha messaging anywhere.
+- **No PyPI release (no `v*` tag) until every required row in the README's release
+  baseline is supported and the acceptance gates are green.** Optional or
+  backend-inapplicable rows may remain unsupported only when the matrix names them
+  explicitly and tests verify `NotImplemented`. No development-status classifiers or
+  alpha messaging anywhere.
 
 ## The monetdb-rust submodule is a fork, not vendored code
 
@@ -35,6 +38,8 @@ covers the conventions that are easy to get wrong.
   errors.
 - One `arrow` major per workspace (currently 58; `adbc_core` 0.23 requires `<59`). Bump
   `adbc_core`/`adbc_ffi`/`arrow` together, never independently.
+- `cargo audit --deny warnings` is a CI gate. A temporary advisory exception requires
+  the exact RustSec ID, rationale, owner, and removal deadline in the workflow change.
 - Wire-format facts must cite the MonetDB source or docs in a comment (see the frame
   parser). Known trap: the temporal structs' field named `ms` holds **microseconds** —
   don't "fix" it.
@@ -76,9 +81,10 @@ covers the conventions that are easy to get wrong.
 - Required status checks are matched by exact job name; renaming a job in
   `.github/workflows/ci.yml` requires updating the branch-protection rule in the same
   change.
-- Release (once feature parity is reached): bump the version in `pyproject.toml` *and*
-  `uv.lock`, PR, then tag `v<version>` — the workflow builds wheels for all four
-  platforms and publishes via PyPI Trusted Publishing, then creates the GitHub Release.
+- Release (once feature parity is reached): bump the version in `pyproject.toml`,
+  `uv.lock`, and all `packaging/dbc/MANIFEST.*.toml` files, PR, then tag `v<version>` —
+  the workflow builds wheels for all four platforms and publishes via PyPI Trusted
+  Publishing, then creates the GitHub Release.
 
 ## Public repo hygiene
 

@@ -38,6 +38,82 @@ with dbapi.connect("monetdb://user:password@localhost:50000/db") as conn:
     df.to_sql("trades_copy", conn, if_exists="append", index=False)
 ```
 
+## Configuration and timeouts
+
+Timeout values are integer seconds. Defaults are a 30-second absolute connection deadline,
+60-second idle read and write timeouts, and a 300-second absolute operation deadline. Zero
+explicitly selects no deadline; negative values and values above the portable socket limit of
+4,294,967 seconds are rejected. A connection timeout covers DNS, every address attempt, TCP or
+Unix connection, TLS, authentication, redirects, and initial driver metadata. A timeout or
+cancellation closes the MAPI session, so the partially read connection cannot be reused.
+
+The URI names are `connect_timeout`, `read_timeout`, `write_timeout`, and
+`operation_timeout`. This is the only configuration channel available to
+`polars.read_database_uri`:
+
+```python
+df = pl.read_database_uri(
+    "SELECT * FROM trades",
+    "monetdb://localhost:50000/db?connect_timeout=10&operation_timeout=120",
+    engine="adbc",
+)
+```
+
+The same settings can be supplied separately through ADBC options. Database options override
+the URI; connection options override the database defaults; statement options override the
+connection for that statement.
+
+```python
+import polars as pl
+
+from adbc_driver_monetdb import ConnectionOptions, DatabaseOptions, StatementOptions, dbapi
+
+with dbapi.connect(
+    "monetdb://localhost:50000/db",
+    db_kwargs={
+        DatabaseOptions.CONNECT_TIMEOUT: "10",
+        DatabaseOptions.OPERATION_TIMEOUT: "120",
+    },
+    conn_kwargs={ConnectionOptions.READ_TIMEOUT: "30"},
+) as conn:
+    with conn.cursor(
+        adbc_stmt_kwargs={
+            StatementOptions.OPERATION_TIMEOUT: 15,
+            StatementOptions.BATCH_ROWS: 65_536,
+        }
+    ) as cursor:
+        frame = pl.read_database("SELECT * FROM trades", cursor)
+```
+
+`polars.read_database(query, connection)` selects ADBC from the supplied DB-API connection or
+cursor; it has no `engine="adbc"` parameter. Polars calls `connection.cursor()` without
+`adbc_stmt_kwargs`, so use a preconfigured cursor for statement-specific settings. Its
+`execute_options` are forwarded to `Cursor.execute`: use a sequence for positional `?` values
+and a dictionary for named `:name` values.
+`adbc_stmt_kwargs` is not an execute option. Polars' `batch_size` does not configure
+`adbc.monetdb.batch_rows`, and `DataFrame.write_database(..., engine_options=...)` supplies
+ingestion arguments rather than connection or timeout options.
+
+The DB-API module reports `threadsafety = 1`: threads may share the module, but each thread
+should use its own connection and cursors. Cross-thread cancellation of an active operation is
+supported explicitly.
+
+The native DB-API parameter style is `qmark` (`?`). Named `:name` parameters are also supported
+when a parameter dictionary is supplied, including SQLAlchemy expressions compiled to a SQL
+string:
+
+```python
+from sqlalchemy import Integer, bindparam, cast, select
+
+value = cast(bindparam("value", value=21), Integer)
+compiled = select((value + value).label("value")).compile()
+frame = pl.read_database(
+    str(compiled),
+    conn,
+    execute_options={"parameters": compiled.params},
+)
+```
+
 ## Support policy
 
 - MonetDB **Dec2025 (11.55) and newer**, little-endian servers only
@@ -45,24 +121,61 @@ with dbapi.connect("monetdb://user:password@localhost:50000/db") as conn:
   adbc-driver-manager **1.11+**
 - Platforms: Linux x86_64 + aarch64 (manylinux), macOS arm64, Windows x86_64
 
-## ADBC coverage
+## ADBC release baseline
 
-| Surface | Status |
+Feature parity means all required rows below are implemented and tested, not that every optional
+ADBC entry point must be synthesized for a backend that cannot use it. This follows ADBC's own
+[driver feature matrix](https://arrow.apache.org/adbc/current/driver/status.html): for example,
+the stable PostgreSQL driver does not support partitioned results or Substrait, while still
+covering the common SQL-driver baseline.
+
+| Required surface | Status |
 |---|---|
-| Arrow query streams and affected-row counts | Supported |
-| Prepared statements, positional binds, and `executemany` | Supported |
-| Bulk ingest: create, append, replace, create-append, schema, temporary tables | Supported |
-| Transactions and autocommit | Supported |
-| TLS (`monetdbs://`) | System roots, certificate file, SHA-256 certificate hash, and client certificates |
-| `GetInfo`, `GetObjects`, `GetTableSchema`, `GetTableTypes`, `ExecuteSchema` | Supported |
-| Query cancellation | Not supported: MAPI has one sequential channel and the Rust transport exposes no safe out-of-band interrupt |
-| Partitioned results | Not supported; MAPI exposes one sequential result channel |
-| Substrait plans | Not supported by MonetDB |
-| `GetStatistics` | Not implemented |
+| SQL query/update execution, Arrow streams, affected-row counts, and execute schema | Supported |
+| Prepared statements, positional/named binds, parameter schemas, and `executemany` | Supported |
+| Bulk ingest: create, append, replace, create-append, target schema, and temporary tables | Supported |
+| Transactions, autocommit, commit, rollback, and current-schema get/set | Supported |
+| `GetInfo`, `GetObjects`, `GetTableSchema`, and `GetTableTypes` | Supported |
+| TLS and authentication | System roots, certificate file/hash, and client certificates |
+| Finite connect/read/write/operation timeouts and cross-thread cancellation | Supported; timeout/cancel closes the session |
+| SQLSTATE diagnostics and semantic ADBC statuses | Supported |
+| Python DB-API, Polars URI/connection/cursor paths, pandas, wheels, and source builds | Supported |
 
-The reusable ADBC validation suite currently passes 242 tests and three subtests against
-Dec2025-SP3. Its six skips cover four cross-catalog operations, statistics, and
-negative-scale decimals that MonetDB itself does not support.
+These optional or backend-inapplicable surfaces are explicitly outside the release gate. Their
+entry points are still tested to return ADBC `NotImplemented`, rather than a transport, parser,
+or argument error.
+
+| Explicitly waived surface | Reason |
+|---|---|
+| Partitioned and incremental results | MAPI exposes one sequential result channel |
+| Substrait plans | MonetDB accepts SQL, not Substrait plans |
+| `GetStatistics` and `GetStatisticNames` | Optional federation metadata, not part of the common SQL-driver baseline |
+| Progress and maximum-progress reporting | MAPI does not expose compatible progress metadata |
+| Read-only `true` and isolation-level options | MonetDB does not expose matching per-connection controls through this interface; read-only `false` is accepted |
+| Setting the current catalog and cross-catalog ingest | A MAPI session is attached to one database; the current catalog remains readable |
+
+The reusable ADBC validation suite currently passes against Dec2025-SP3. Its skips cover
+explicitly waived cross-catalog/statistics behavior and negative-scale decimals that MonetDB
+itself does not support. Polars' announced future unknown-extension behavior is exercised in CI;
+HUGEINT and TIMETZ remain round-trippable when loaded as extension types.
+
+## Non-Python driver managers
+
+Each platform wheel can also be converted to a flat `dbc` package. Installing that archive makes
+the driver discoverable as `monetdb` by C/C++, Go, R, Ruby, Rust, Python, and other ADBC driver
+managers. `dbc` writes the installed ADBC TOML manifest with an absolute shared-library path; a
+relative `Driver.shared` path is not portable.
+
+```sh
+uv run python packaging/dbc/build_package.py \
+    --wheel dist/adbc_driver_monetdb-0.1.0-cp313-abi3-macosx_11_0_arm64.whl \
+    --platform macos_arm64 --out-dir dist/dbc
+ADBC_DRIVER_PATH="$PWD/.adbc-drivers" \
+    uvx --from dbc dbc install --no-verify dist/dbc/monetdb_macos_arm64_v0.1.0.tar.gz
+```
+
+The repository packages are unsigned development artifacts, hence `--no-verify`. A registry
+release should be signed and installed without that flag.
 
 ## Repository layout
 
@@ -72,6 +185,7 @@ negative-scale decimals that MonetDB itself does not support.
 | `crates/monetdb-arrow` | MonetDB binary wire format ⇄ Arrow conversion |
 | `monetdb-rust` | [our fork](https://github.com/wlaur/monetdb-rust) of [MonetDB/monetdb-rust](https://github.com/MonetDB/monetdb-rust) (git submodule, MPL-2.0) — MAPI protocol layer |
 | `adbc_driver_monetdb` | Python shim over `adbc-driver-manager`; ships the cdylib as `adbc_driver_monetdb._native` |
+| `packaging/dbc` | platform manifests and builder for non-Python driver-manager packages |
 
 ## Development
 

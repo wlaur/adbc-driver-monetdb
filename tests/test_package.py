@@ -4,6 +4,7 @@ from pathlib import Path
 from threading import Thread
 
 import adbc_driver_manager
+import adbc_driver_manager.dbapi as manager_dbapi
 import pytest
 
 import adbc_driver_monetdb
@@ -19,6 +20,14 @@ def test_driver_path_exists() -> None:
     from adbc_driver_monetdb import _native
 
     assert _native.__adbc_entrypoint__ == adbc_driver_monetdb.ENTRYPOINT
+
+
+def test_dbapi_module_surface() -> None:
+    assert dbapi.apilevel == "2.0"
+    assert dbapi.paramstyle == "qmark"
+    assert dbapi.threadsafety == 1
+    assert dbapi.Connection is manager_dbapi.Connection
+    assert dbapi.Error is manager_dbapi.Error
 
 
 def test_connect_rejects_invalid_uri() -> None:

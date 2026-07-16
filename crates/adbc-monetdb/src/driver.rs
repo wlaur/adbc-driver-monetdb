@@ -7,6 +7,7 @@ use std::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicU64, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use adbc_core::error::{Error, Result, Status};
@@ -20,19 +21,154 @@ use arrow_array::{
     UInt32Array, UnionArray, new_empty_array,
 };
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
-use monetdb::{CursorError, Endian, MonetType, Parameters, ResultColumn, parms::Parm};
+use monetdb::{
+    CancelHandle, CursorError, Endian, MonetType, Parameters, ResultColumn, Timeouts, parms::Parm,
+};
 use percent_encoding::percent_decode_str;
 
 mod metadata;
 mod parameters;
 use metadata::{like_pattern_matches, load_objects, objects_batch, table_schema};
-use parameters::{parameter_count, render_arguments, render_null_parameters, render_row};
+use parameters::{
+    ParameterLayout, parameter_layout, render_arguments, render_null_parameters, render_row,
+};
 
 const DEFAULT_BATCH_ROWS: usize = 131_072;
 const METADATA_REPLY_ROWS: usize = 1024;
 const BATCH_ROWS_OPTION: &str = "adbc.monetdb.batch_rows";
+const BIND_BY_NAME_OPTION: &str = "adbc.statement.bind_by_name";
+const CONNECT_TIMEOUT_OPTION: &str = "adbc.monetdb.connect_timeout_seconds";
+const READ_TIMEOUT_OPTION: &str = "adbc.monetdb.read_timeout_seconds";
+const WRITE_TIMEOUT_OPTION: &str = "adbc.monetdb.write_timeout_seconds";
+const OPERATION_TIMEOUT_OPTION: &str = "adbc.monetdb.operation_timeout_seconds";
 const MINIMUM_VERSION: (u16, u16, u16) = (11, 55, 0);
 static SAVEPOINT_ID: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimeoutOption {
+    Connect,
+    Read,
+    Write,
+    Operation,
+}
+
+impl TimeoutOption {
+    fn from_key(key: &str) -> Option<Self> {
+        match key {
+            CONNECT_TIMEOUT_OPTION => Some(Self::Connect),
+            READ_TIMEOUT_OPTION => Some(Self::Read),
+            WRITE_TIMEOUT_OPTION => Some(Self::Write),
+            OPERATION_TIMEOUT_OPTION => Some(Self::Operation),
+            _ => None,
+        }
+    }
+}
+
+fn timeout_seconds(key: &str, value: &OptionValue) -> Result<i64> {
+    let seconds = match value {
+        OptionValue::String(value) => value.parse().map_err(|_| {
+            error(
+                format!("option '{key}' must be an integer number of seconds"),
+                Status::InvalidArguments,
+            )
+        })?,
+        OptionValue::Int(value) => *value,
+        _ => {
+            return Err(error(
+                format!("option '{key}' must be an integer number of seconds"),
+                Status::InvalidArguments,
+            ));
+        }
+    };
+    if seconds < 0 {
+        return Err(error(
+            format!("option '{key}' must be nonnegative"),
+            Status::InvalidArguments,
+        ));
+    }
+    if seconds > monetdb::MAX_TIMEOUT_SECONDS {
+        return Err(error(
+            format!(
+                "option '{key}' must not exceed {} seconds",
+                monetdb::MAX_TIMEOUT_SECONDS
+            ),
+            Status::InvalidArguments,
+        ));
+    }
+    Ok(seconds)
+}
+
+fn apply_parameter_timeout(
+    parameters: &mut Parameters,
+    timeout: TimeoutOption,
+    key: &str,
+    value: &OptionValue,
+) -> Result<()> {
+    let seconds = timeout_seconds(key, value)?;
+    let result = match timeout {
+        TimeoutOption::Connect => parameters.set_connect_timeout(seconds),
+        TimeoutOption::Read => parameters.set_read_timeout(seconds),
+        TimeoutOption::Write => parameters.set_write_timeout(seconds),
+        TimeoutOption::Operation => parameters.set_operation_timeout(seconds),
+    };
+    result.map_err(|value| map_display(value, Status::InvalidArguments))
+}
+
+fn set_runtime_timeout(
+    timeouts: &mut Timeouts,
+    timeout: TimeoutOption,
+    key: &str,
+    value: &OptionValue,
+) -> Result<()> {
+    let seconds = timeout_seconds(key, value)?;
+    let duration = (seconds != 0).then(|| Duration::from_secs(seconds as u64));
+    match timeout {
+        TimeoutOption::Connect => {
+            return Err(error(
+                format!("option '{key}' is only valid as a database option"),
+                Status::InvalidState,
+            ));
+        }
+        TimeoutOption::Read => timeouts.read = duration,
+        TimeoutOption::Write => timeouts.write = duration,
+        TimeoutOption::Operation => timeouts.operation = duration,
+    }
+    Ok(())
+}
+
+fn configured_timeouts(parameters: &Parameters) -> Result<(Option<Duration>, Timeouts)> {
+    let validated = parameters
+        .validate()
+        .map_err(|value| map_display(value, Status::InvalidArguments))?;
+    Ok((
+        validated.connect_timeout,
+        Timeouts {
+            read: validated.read_timeout,
+            write: validated.write_timeout,
+            operation: validated.operation_timeout,
+        },
+    ))
+}
+
+fn initialization_timeouts(timeouts: Timeouts, deadline: Option<Instant>) -> Result<Timeouts> {
+    let Some(deadline) = deadline else {
+        return Ok(timeouts);
+    };
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or_else(|| {
+            error(
+                "connection initialization deadline expired",
+                Status::Timeout,
+            )
+        })?;
+    let bounded = |timeout: Option<Duration>| Some(timeout.unwrap_or(remaining).min(remaining));
+    Ok(Timeouts {
+        read: bounded(timeouts.read),
+        write: bounded(timeouts.write),
+        operation: bounded(timeouts.operation),
+    })
+}
 
 fn savepoint_name(purpose: &str) -> String {
     // The outer connection mutex serializes driver-created savepoints. MonetDB's
@@ -73,7 +209,11 @@ fn lock_connection(
 
 fn map_cursor_error(value: CursorError) -> Error {
     let status = match value {
-        CursorError::Closed | CursorError::NoResultSet => Status::InvalidState,
+        CursorError::Closed | CursorError::NoResultSet | CursorError::NoActiveOperation => {
+            Status::InvalidState
+        }
+        CursorError::Cancelled => Status::Cancelled,
+        CursorError::Timeout => Status::Timeout,
         CursorError::IO(_) => Status::IO,
         CursorError::Framing(_) | CursorError::BadReply(_) => Status::InvalidData,
         CursorError::Conversion { .. }
@@ -82,15 +222,7 @@ fn map_cursor_error(value: CursorError) -> Error {
         CursorError::FileTransfer(_) | CursorError::UploadRefused { .. } => Status::InvalidData,
         CursorError::PreparedResult => Status::InvalidState,
         CursorError::Metadata(_) | CursorError::Poisoned => Status::Internal,
-        CursorError::Server(ref message)
-            if message.starts_with("42S02!")
-                || message.starts_with("42S22!")
-                || message.starts_with("3F000!") =>
-        {
-            Status::NotFound
-        }
-        CursorError::Server(ref message) if message.starts_with("2DM30!") => Status::InvalidState,
-        CursorError::Server(_) => Status::Unknown,
+        CursorError::Server(ref message) => sqlstate_status(message),
     };
     let mut result = error(value.to_string(), status);
     if let CursorError::Server(message) = value
@@ -99,6 +231,37 @@ fn map_cursor_error(value: CursorError) -> Error {
         result.sqlstate = sqlstate;
     }
     result
+}
+
+fn sqlstate_status(message: &str) -> Status {
+    let Some(sqlstate) = message.as_bytes().get(..5) else {
+        return Status::Unknown;
+    };
+    if message.as_bytes().get(5) != Some(&b'!') {
+        return Status::Unknown;
+    }
+    if sqlstate == b"42000"
+        && message
+            .get(6..)
+            .is_some_and(|diagnostic| diagnostic.contains("access denied"))
+    {
+        return Status::Unauthorized;
+    }
+    match sqlstate {
+        b"42S02" | b"42S22" | b"3F000" | b"42703" => Status::NotFound,
+        b"42S01" | b"42710" => Status::AlreadyExists,
+        b"40002" => Status::Integrity,
+        b"42501" => Status::Unauthorized,
+        b"28000" => Status::Unauthenticated,
+        b"57014" => Status::Cancelled,
+        b"HYT00" | b"HYT01" => Status::Timeout,
+        b"2DM30" => Status::InvalidState,
+        code if code.starts_with(b"23") => Status::Integrity,
+        code if code.starts_with(b"25") || code.starts_with(b"2D") => Status::InvalidState,
+        code if code.starts_with(b"28") => Status::Unauthorized,
+        code if code.starts_with(b"42") => Status::InvalidArguments,
+        _ => Status::Unknown,
+    }
 }
 
 fn parse_sqlstate(message: &str) -> Option<[c_char; 5]> {
@@ -206,8 +369,11 @@ impl Optionable for MonetdbDatabase {
     type Option = OptionDatabase;
 
     fn set_option(&mut self, key: Self::Option, value: OptionValue) -> Result<()> {
-        if matches!(key, OptionDatabase::Other(_)) {
-            return Err(not_implemented(key.as_ref()));
+        if let OptionDatabase::Other(name) = &key {
+            if TimeoutOption::from_key(name).is_none() {
+                return Err(not_implemented(key.as_ref()));
+            }
+            timeout_seconds(name, &value)?;
         }
         self.options.set(key, value);
         Ok(())
@@ -247,6 +413,8 @@ impl Database for MonetdbDatabase {
         &self,
         opts: impl IntoIterator<Item = (OptionConnection, OptionValue)>,
     ) -> Result<Self::ConnectionType> {
+        let initialization_started = Instant::now();
+        let opts = opts.into_iter().collect::<Vec<_>>();
         let uri = self
             .options
             .optional_string(OptionDatabase::Uri)
@@ -292,6 +460,34 @@ impl Database for MonetdbDatabase {
                 .set_password(password)
                 .map_err(|value| map_display(value, Status::InvalidArguments))?;
         }
+        for key in [
+            CONNECT_TIMEOUT_OPTION,
+            READ_TIMEOUT_OPTION,
+            WRITE_TIMEOUT_OPTION,
+            OPERATION_TIMEOUT_OPTION,
+        ] {
+            if let Some(value) = self.options.get(key) {
+                apply_parameter_timeout(
+                    &mut parameters,
+                    TimeoutOption::from_key(key).expect("constant is a timeout option"),
+                    key,
+                    value,
+                )?;
+            }
+        }
+        for (key, value) in &opts {
+            if let OptionConnection::Other(name) = key
+                && let Some(timeout) = TimeoutOption::from_key(name)
+            {
+                if timeout == TimeoutOption::Connect {
+                    return Err(error(
+                        format!("option '{name}' is only valid as a database option"),
+                        Status::InvalidState,
+                    ));
+                }
+                apply_parameter_timeout(&mut parameters, timeout, name, value)?;
+            }
+        }
         // One minimizes the inline text prefix. Multi-row results remain open
         // for Xexportbin; a complete scalar row is decoded directly.
         parameters
@@ -310,6 +506,17 @@ impl Database for MonetdbDatabase {
             .get_str(Parm::Database)
             .map_err(|value| map_display(value, Status::InvalidArguments))?
             .into_owned();
+        let (connect_timeout, timeouts) = configured_timeouts(&parameters)?;
+        let initialization_deadline = connect_timeout
+            .map(|timeout| {
+                initialization_started.checked_add(timeout).ok_or_else(|| {
+                    error(
+                        "connection timeout is too large to represent",
+                        Status::InvalidArguments,
+                    )
+                })
+            })
+            .transpose()?;
 
         let connection_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             monetdb::Connection::new(parameters)
@@ -323,6 +530,7 @@ impl Database for MonetdbDatabase {
         let connection = connection_result.map_err(|value| {
             let status = match value {
                 monetdb::ConnectError::Rejected(_) => Status::Unauthenticated,
+                monetdb::ConnectError::Timeout => Status::Timeout,
                 monetdb::ConnectError::IO(_) => Status::IO,
                 _ => Status::InvalidArguments,
             };
@@ -341,7 +549,11 @@ impl Database for MonetdbDatabase {
                 Status::NotImplemented,
             ));
         }
-        let version = connection.metadata().map_err(map_cursor_error)?.version();
+        let metadata_timeouts = initialization_timeouts(timeouts, initialization_deadline)?;
+        let version = connection
+            .metadata_with_timeouts(metadata_timeouts)
+            .map_err(map_cursor_error)?
+            .version();
         if version < MINIMUM_VERSION {
             return Err(error(
                 format!(
@@ -352,9 +564,13 @@ impl Database for MonetdbDatabase {
             ));
         }
 
+        let cancel = connection.cancel_handle();
         let inner = Arc::new(Mutex::new(connection));
-        let current_schema =
-            scalar_string(&inner, "SELECT current_schema AS \"__adbc_current_schema\"")?;
+        let current_schema = scalar_string(
+            &inner,
+            "SELECT current_schema AS \"__adbc_current_schema\"",
+            initialization_timeouts(timeouts, initialization_deadline)?,
+        )?;
         let mut options = Options::default();
         options.set(OptionConnection::CurrentCatalog, catalog.clone().into());
         options.set(OptionConnection::CurrentSchema, current_schema.into());
@@ -362,6 +578,8 @@ impl Database for MonetdbDatabase {
         options.set(OptionConnection::ReadOnly, "false".into());
         let mut result = MonetdbConnection {
             inner,
+            cancel,
+            timeouts,
             options,
             version,
             catalog,
@@ -382,6 +600,8 @@ fn decode_userinfo(value: &str) -> Result<String> {
 
 pub struct MonetdbConnection {
     inner: Arc<Mutex<monetdb::Connection>>,
+    cancel: CancelHandle,
+    timeouts: Timeouts,
     options: Options,
     version: (u16, u16, u16),
     catalog: String,
@@ -391,6 +611,13 @@ impl Optionable for MonetdbConnection {
     type Option = OptionConnection;
 
     fn set_option(&mut self, key: Self::Option, value: OptionValue) -> Result<()> {
+        if let OptionConnection::Other(name) = &key
+            && let Some(timeout) = TimeoutOption::from_key(name)
+        {
+            set_runtime_timeout(&mut self.timeouts, timeout, name, &value)?;
+            self.options.set(key, value);
+            return Ok(());
+        }
         match &key {
             OptionConnection::AutoCommit => {
                 let enabled = option_bool(&value)?;
@@ -400,14 +627,13 @@ impl Optionable for MonetdbConnection {
                     .map_err(map_cursor_error)?
                     .autocommit;
                 if enabled && !current {
-                    connection
-                        .cursor()
-                        .execute("COMMIT")
-                        .map_err(map_cursor_error)?;
+                    let mut cursor = connection.cursor();
+                    cursor.set_timeouts(self.timeouts);
+                    cursor.execute("COMMIT").map_err(map_cursor_error)?;
                 }
                 if enabled != current {
                     connection
-                        .set_autocommit(enabled)
+                        .set_autocommit_with_timeouts(enabled, self.timeouts)
                         .map_err(map_cursor_error)?;
                 }
                 self.options.set(key, enabled.to_string().into());
@@ -423,6 +649,7 @@ impl Optionable for MonetdbConnection {
                 execute_update(
                     &self.inner,
                     &format!("SET SCHEMA {}", quote_identifier(schema)?),
+                    self.timeouts,
                 )?;
             }
             OptionConnection::ReadOnly => {
@@ -466,6 +693,8 @@ impl Connection for MonetdbConnection {
     fn new_statement(&mut self) -> Result<Self::StatementType> {
         Ok(MonetdbStatement {
             connection: Arc::clone(&self.inner),
+            cancel: self.cancel.clone(),
+            timeouts: self.timeouts,
             options: Options::default(),
             query: None,
             batch_rows: DEFAULT_BATCH_ROWS,
@@ -474,11 +703,12 @@ impl Connection for MonetdbConnection {
             prepared_id: None,
             prepared_parameter_schema: None,
             prepared_result_schema: None,
+            bind_by_name: false,
         })
     }
 
     fn cancel(&mut self) -> Result<()> {
-        Err(not_implemented("cancel"))
+        self.cancel.cancel().map_err(map_cursor_error)
     }
 
     fn get_info(
@@ -573,11 +803,11 @@ impl Connection for MonetdbConnection {
     }
 
     fn commit(&mut self) -> Result<()> {
-        execute_update(&self.inner, "COMMIT").map(|_| ())
+        execute_update(&self.inner, "COMMIT", self.timeouts).map(|_| ())
     }
 
     fn rollback(&mut self) -> Result<()> {
-        execute_update(&self.inner, "ROLLBACK").map(|_| ())
+        execute_update(&self.inner, "ROLLBACK", self.timeouts).map(|_| ())
     }
 
     fn read_partition(
@@ -607,6 +837,8 @@ fn option_bool(value: &OptionValue) -> Result<bool> {
 
 pub struct MonetdbStatement {
     connection: Arc<Mutex<monetdb::Connection>>,
+    cancel: CancelHandle,
+    timeouts: Timeouts,
     options: Options,
     query: Option<String>,
     batch_rows: usize,
@@ -615,12 +847,18 @@ pub struct MonetdbStatement {
     prepared_id: Option<u64>,
     prepared_parameter_schema: Option<Schema>,
     prepared_result_schema: Option<Schema>,
+    bind_by_name: bool,
 }
 
 impl Optionable for MonetdbStatement {
     type Option = OptionStatement;
 
     fn set_option(&mut self, key: Self::Option, value: OptionValue) -> Result<()> {
+        if let Some(timeout) = TimeoutOption::from_key(key.as_ref()) {
+            set_runtime_timeout(&mut self.timeouts, timeout, key.as_ref(), &value)?;
+            self.options.set(key, value);
+            return Ok(());
+        }
         if key.as_ref() == BATCH_ROWS_OPTION {
             let OptionValue::Int(rows) = value else {
                 return Err(error(
@@ -633,6 +871,11 @@ impl Optionable for MonetdbStatement {
                 .filter(|rows| *rows > 0)
                 .ok_or_else(|| error("batch_rows must be positive", Status::InvalidArguments))?;
             self.options.set(key, OptionValue::Int(rows));
+            return Ok(());
+        }
+        if key.as_ref() == BIND_BY_NAME_OPTION {
+            self.bind_by_name = option_bool(&value)?;
+            self.options.set(key, value);
             return Ok(());
         }
         match &key {
@@ -683,6 +926,9 @@ impl Optionable for MonetdbStatement {
     }
 
     fn get_option_string(&self, key: Self::Option) -> Result<String> {
+        if key.as_ref() == BIND_BY_NAME_OPTION {
+            return Ok(self.bind_by_name.to_string());
+        }
         self.options.get_string(key)
     }
 
@@ -733,32 +979,38 @@ impl Statement for MonetdbStatement {
                 .as_ref()
                 .is_some_and(|schema| schema.fields().is_empty())
             {
-                execute_updates_atomic(&self.connection, &mut queries)?;
+                execute_updates_atomic(&self.connection, &mut queries, self.timeouts)?;
                 return Ok(Box::new(EmptyReader::default()));
             }
             if self.prepared_result_schema.is_none() {
                 let schema = self.execute_schema()?;
                 if schema.fields().is_empty() {
-                    execute_updates_atomic(&self.connection, &mut queries)?;
+                    execute_updates_atomic(&self.connection, &mut queries, self.timeouts)?;
                     self.prepared_result_schema = Some(schema);
                     return Ok(Box::new(EmptyReader::default()));
                 }
                 self.prepared_result_schema = Some(schema);
             }
-            return parameter_query_reader(&self.connection, queries, self.batch_rows);
+            return parameter_query_reader(
+                &self.connection,
+                queries,
+                self.batch_rows,
+                self.timeouts,
+            );
         }
         let query = self
             .query
             .as_deref()
             .ok_or_else(|| error("SQL query is not set", Status::InvalidState))?;
         if let Some(id) = self.prepared_id {
-            return query_reader(
+            return query_reader_with_timeouts(
                 &self.connection,
                 &format!("EXECUTE {id}()"),
                 self.batch_rows,
+                self.timeouts,
             );
         }
-        query_reader(&self.connection, query, self.batch_rows)
+        query_reader_with_timeouts(&self.connection, query, self.batch_rows, self.timeouts)
     }
 
     fn execute_update(&mut self) -> Result<Option<i64>> {
@@ -772,16 +1024,16 @@ impl Statement for MonetdbStatement {
         }
         if self.bound.is_some() {
             let mut queries = self.take_bound_queries()?;
-            return execute_updates_atomic(&self.connection, &mut queries);
+            return execute_updates_atomic(&self.connection, &mut queries, self.timeouts);
         }
         let query = self
             .query
             .as_deref()
             .ok_or_else(|| error("SQL query is not set", Status::InvalidState))?;
         if let Some(id) = self.prepared_id {
-            return execute_update(&self.connection, &format!("EXECUTE {id}()"));
+            return execute_update(&self.connection, &format!("EXECUTE {id}()"), self.timeouts);
         }
-        execute_update(&self.connection, query)
+        execute_update(&self.connection, query, self.timeouts)
     }
 
     fn execute_schema(&mut self) -> Result<Schema> {
@@ -792,14 +1044,19 @@ impl Statement for MonetdbStatement {
             .query
             .as_deref()
             .ok_or_else(|| error("SQL query is not set", Status::InvalidState))?;
-        let parameter_count = parameter_count(query)?;
-        let metadata = match prepare_query(&self.connection, query, parameter_count) {
-            Ok(metadata) => metadata,
-            Err(value) if could_not_determine_parameter_type(&value) => {
-                let query = render_null_parameters(query)?;
-                prepare_query_allowing_any(&self.connection, &query, 0)?
+        let layout = parameter_layout(query)?;
+        let metadata = if layout.is_named() {
+            let query = render_null_parameters(query)?;
+            prepare_query_allowing_any(&self.connection, &query, 0, self.timeouts)?
+        } else {
+            match prepare_query(&self.connection, query, layout.count(), self.timeouts) {
+                Ok(metadata) => metadata,
+                Err(value) if could_not_determine_parameter_type(&value) => {
+                    let query = render_null_parameters(query)?;
+                    prepare_query_allowing_any(&self.connection, &query, 0, self.timeouts)?
+                }
+                Err(value) => return Err(value),
             }
-            Err(value) => return Err(value),
         };
         if let Ok(connection) = lock_connection(&self.connection) {
             connection.try_deallocate(metadata.id);
@@ -822,8 +1079,10 @@ impl Statement for MonetdbStatement {
             .query
             .as_deref()
             .ok_or_else(|| error("SQL query is not set", Status::InvalidState))?;
-        let fields = (0..parameter_count(query)?)
-            .map(|index| Field::new(index.to_string(), DataType::Null, true))
+        let fields = parameter_layout(query)?
+            .field_names()
+            .into_iter()
+            .map(|name| Field::new(name, DataType::Null, true))
             .collect::<Vec<_>>();
         Ok(Schema::new(fields))
     }
@@ -836,13 +1095,25 @@ impl Statement for MonetdbStatement {
             .query
             .as_deref()
             .ok_or_else(|| error("SQL query is not set", Status::InvalidState))?;
-        let parameter_count = parameter_count(query)?;
+        let layout = parameter_layout(query)?;
+        let parameter_count = layout.count();
         if parameter_count == 0 {
             self.prepared_parameter_schema = Some(Schema::empty());
             self.prepared = true;
             return Ok(());
         }
-        match prepare_query(&self.connection, query, parameter_count) {
+        if let ParameterLayout::Named(names) = layout {
+            self.prepared_parameter_schema = Some(Schema::new(
+                names
+                    .into_iter()
+                    .map(|name| Field::new(name, DataType::Null, true))
+                    .collect::<Vec<_>>(),
+            ));
+            self.prepared_result_schema = Some(self.execute_schema()?);
+            self.prepared = true;
+            return Ok(());
+        }
+        match prepare_query(&self.connection, query, parameter_count, self.timeouts) {
             Ok(metadata) => {
                 self.prepared_id = Some(metadata.id);
                 self.prepared_parameter_schema = Some(metadata.parameters);
@@ -872,7 +1143,7 @@ impl Statement for MonetdbStatement {
     }
 
     fn cancel(&mut self) -> Result<()> {
-        Err(not_implemented("cancel"))
+        self.cancel.cancel().map_err(map_cursor_error)
     }
 }
 
@@ -888,7 +1159,7 @@ fn could_not_determine_parameter_type(value: &Error) -> bool {
 impl MonetdbStatement {
     fn clear_prepared(&mut self) {
         if let Some(id) = self.prepared_id.take() {
-            let _ = execute_update(&self.connection, &format!("DEALLOCATE {id}"));
+            let _ = execute_update(&self.connection, &format!("DEALLOCATE {id}"), self.timeouts);
         }
         self.prepared_parameter_schema = None;
         self.prepared_result_schema = None;
@@ -906,21 +1177,48 @@ impl MonetdbStatement {
             .take()
             .ok_or_else(|| error("no Arrow parameters are bound", Status::InvalidState))?;
         let schema = reader.schema();
-        let expected = parameter_count(&query)?;
-        if schema.fields().len() != expected {
+        let layout = parameter_layout(&query)?;
+        if layout.is_named() != self.bind_by_name {
             return Err(error(
-                format!(
-                    "query has {expected} positional parameters but the bound stream has {} columns",
-                    schema.fields().len()
-                ),
+                if layout.is_named() {
+                    "named parameters require adbc.statement.bind_by_name"
+                } else {
+                    "positional parameters cannot be bound by name"
+                },
                 Status::InvalidArguments,
             ));
+        }
+        match &layout {
+            ParameterLayout::Positional(expected) if schema.fields().len() != *expected => {
+                return Err(error(
+                    format!(
+                        "query has {expected} positional parameters but the bound stream has {} columns",
+                        schema.fields().len()
+                    ),
+                    Status::InvalidArguments,
+                ));
+            }
+            ParameterLayout::Named(names) => {
+                let fields = schema.fields();
+                if fields.len() != names.len()
+                    || names
+                        .iter()
+                        .any(|name| !fields.iter().any(|field| field.name() == name))
+                {
+                    return Err(error(
+                        "bound parameter names do not match the query",
+                        Status::InvalidArguments,
+                    ));
+                }
+            }
+            ParameterLayout::Positional(_) => {}
         }
         Ok(BoundQueryStream {
             reader,
             schema,
             query,
             prepared_id: self.prepared_id,
+            bind_by_name: self.bind_by_name,
             batch: None,
             next_row: 0,
             pending: None,
@@ -1008,7 +1306,7 @@ impl MonetdbStatement {
         );
 
         let connection = lock_connection(&self.connection)?;
-        let (mut cursor, atomic_scope) = begin_atomic(&connection, "ingest")?;
+        let (mut cursor, atomic_scope) = begin_atomic(&connection, "ingest", self.timeouts)?;
         let result = (|| {
             match mode {
                 "adbc.ingest.mode.create" => cursor.execute(&create).map_err(map_cursor_error)?,
@@ -1037,7 +1335,12 @@ impl MonetdbStatement {
                 cursor
                     .execute(&format!("SELECT * FROM {target} WHERE FALSE"))
                     .map_err(map_cursor_error)?;
-                validate_append_schema(&schema, cursor.column_metadata())?;
+                let mismatch_status = if mode == "adbc.ingest.mode.create_append" {
+                    Status::AlreadyExists
+                } else {
+                    Status::InvalidArguments
+                };
+                validate_append_schema(&schema, cursor.column_metadata(), mismatch_status)?;
             }
 
             let files = (0..schema.fields().len())
@@ -1097,11 +1400,22 @@ impl MonetdbStatement {
             }
             Ok(rows)
         })();
-        finish_atomic(&connection, &mut cursor, atomic_scope, result).map(Some)
+        finish_atomic(
+            &connection,
+            &mut cursor,
+            atomic_scope,
+            result,
+            self.timeouts,
+        )
+        .map(Some)
     }
 }
 
-fn validate_append_schema(schema: &SchemaRef, columns: &[ResultColumn]) -> Result<()> {
+fn validate_append_schema(
+    schema: &SchemaRef,
+    columns: &[ResultColumn],
+    mismatch_status: Status,
+) -> Result<()> {
     if schema.fields().len() != columns.len() {
         return Err(error(
             format!(
@@ -1109,7 +1423,7 @@ fn validate_append_schema(schema: &SchemaRef, columns: &[ResultColumn]) -> Resul
                 schema.fields().len(),
                 columns.len()
             ),
-            Status::InvalidArguments,
+            mismatch_status,
         ));
     }
     for (index, (field, column)) in schema.fields().iter().zip(columns).enumerate() {
@@ -1120,7 +1434,7 @@ fn validate_append_schema(schema: &SchemaRef, columns: &[ResultColumn]) -> Resul
                     field.name(),
                     column.name()
                 ),
-                Status::InvalidArguments,
+                mismatch_status,
             ));
         }
         let source = monetdb_arrow::monet_type_for_field(field)
@@ -1138,7 +1452,7 @@ fn validate_append_schema(schema: &SchemaRef, columns: &[ResultColumn]) -> Resul
                     "append column {:?} has Arrow/MonetDB type {source}, but destination type is {destination}",
                     field.name()
                 ),
-                Status::InvalidArguments,
+                mismatch_status,
             ));
         }
     }
@@ -1170,6 +1484,7 @@ struct BoundQueryStream {
     schema: SchemaRef,
     query: String,
     prepared_id: Option<u64>,
+    bind_by_name: bool,
     batch: Option<RecordBatch>,
     next_row: usize,
     pending: Option<ExecutableQuery>,
@@ -1207,7 +1522,7 @@ impl Iterator for BoundQueryStream {
                 let sql = match self.prepared_id {
                     Some(id) => render_arguments(batch, row)
                         .map(|values| format!("EXECUTE {id}({})", values.join(", "))),
-                    None => render_row(&self.query, batch, row),
+                    None => render_row(&self.query, batch, row, self.bind_by_name),
                 };
                 return Some(sql.map(|sql| ExecutableQuery { sql }));
             }
@@ -1357,16 +1672,18 @@ fn prepare_query(
     connection: &Arc<Mutex<monetdb::Connection>>,
     query: &str,
     parameter_count: usize,
+    timeouts: Timeouts,
 ) -> Result<PreparedMetadata> {
-    prepare_query_inner(connection, query, parameter_count, false)
+    prepare_query_inner(connection, query, parameter_count, false, timeouts)
 }
 
 fn prepare_query_allowing_any(
     connection: &Arc<Mutex<monetdb::Connection>>,
     query: &str,
     parameter_count: usize,
+    timeouts: Timeouts,
 ) -> Result<PreparedMetadata> {
-    prepare_query_inner(connection, query, parameter_count, true)
+    prepare_query_inner(connection, query, parameter_count, true, timeouts)
 }
 
 fn prepare_query_inner(
@@ -1374,6 +1691,7 @@ fn prepare_query_inner(
     query: &str,
     parameter_count: usize,
     allow_any: bool,
+    timeouts: Timeouts,
 ) -> Result<PreparedMetadata> {
     let query = query.trim().trim_end_matches(';');
     let connection = lock_connection(connection)?;
@@ -1383,6 +1701,7 @@ fn prepare_query_inner(
         .autocommit;
     let savepoint = use_savepoint.then(|| savepoint_name("prepare_probe"));
     let mut cursor = connection.cursor();
+    cursor.set_timeouts(timeouts);
     cursor.set_reply_size(NonZeroUsize::new(METADATA_REPLY_ROWS).expect("constant is positive"));
     if let Some(savepoint) = &savepoint {
         cursor
@@ -1619,10 +1938,11 @@ fn prepared_arrow_field(name: String, data_type: &MonetType) -> Result<Field> {
         .map_err(|value| map_display(value, Status::InvalidData))
 }
 
-fn query_reader(
+fn query_reader_with_timeouts(
     connection: &Arc<Mutex<monetdb::Connection>>,
     query: &str,
     batch_rows: usize,
+    timeouts: Timeouts,
 ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
     if is_prepare_statement(query) {
         return Err(error(
@@ -1632,6 +1952,7 @@ fn query_reader(
     }
     let connection_guard = lock_connection(connection)?;
     let mut cursor = connection_guard.cursor();
+    cursor.set_timeouts(timeouts);
     cursor.execute(query).map_err(map_cursor_error)?;
     if !cursor.has_result_set() {
         return Ok(Box::new(EmptyReader::default()));
@@ -1663,6 +1984,18 @@ fn query_reader(
     }))
 }
 
+fn query_reader(
+    connection: &Arc<Mutex<monetdb::Connection>>,
+    query: &str,
+    batch_rows: usize,
+) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
+    let timeouts = {
+        let connection = lock_connection(connection)?;
+        connection.timeouts()
+    };
+    query_reader_with_timeouts(connection, query, batch_rows, timeouts)
+}
+
 fn is_prepare_statement(query: &str) -> bool {
     let query = query.trim_start();
     query
@@ -1678,12 +2011,13 @@ fn parameter_query_reader(
     connection: &Arc<Mutex<monetdb::Connection>>,
     mut queries: BoundQueryStream,
     batch_rows: usize,
+    timeouts: Timeouts,
 ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
     let first = queries
         .next()
         .transpose()?
         .ok_or_else(|| error("no parameter rows to execute", Status::InvalidArguments))?;
-    let current = query_reader(connection, &first.sql, batch_rows)?;
+    let current = query_reader_with_timeouts(connection, &first.sql, batch_rows, timeouts)?;
     let schema = current.schema();
     Ok(Box::new(ParameterQueryReader {
         connection: Arc::clone(connection),
@@ -1691,12 +2025,17 @@ fn parameter_query_reader(
         current: Some(current),
         schema,
         batch_rows,
+        timeouts,
         finished: false,
     }))
 }
 
-fn scalar_string(connection: &Arc<Mutex<monetdb::Connection>>, query: &str) -> Result<String> {
-    let mut reader = query_reader(connection, query, 1)?;
+fn scalar_string(
+    connection: &Arc<Mutex<monetdb::Connection>>,
+    query: &str,
+    timeouts: Timeouts,
+) -> Result<String> {
+    let mut reader = query_reader_with_timeouts(connection, query, 1, timeouts)?;
     let batch = reader
         .next()
         .transpose()
@@ -1716,9 +2055,11 @@ fn scalar_string(connection: &Arc<Mutex<monetdb::Connection>>, query: &str) -> R
 fn execute_update(
     connection: &Arc<Mutex<monetdb::Connection>>,
     query: &str,
+    timeouts: Timeouts,
 ) -> Result<Option<i64>> {
     let connection = lock_connection(connection)?;
     let mut cursor = connection.cursor();
+    cursor.set_timeouts(timeouts);
     cursor.execute(query).map_err(map_cursor_error)?;
     let affected_rows = cursor.affected_rows();
     drop(connection);
@@ -1733,17 +2074,23 @@ enum AtomicScope {
 fn begin_atomic(
     connection: &monetdb::Connection,
     purpose: &str,
+    timeouts: Timeouts,
 ) -> Result<(monetdb::Cursor, AtomicScope)> {
     let originally_autocommit = connection
         .server_info()
         .map_err(map_cursor_error)?
         .autocommit;
     if originally_autocommit {
-        connection.set_autocommit(false).map_err(map_cursor_error)?;
-        return Ok((connection.cursor(), AtomicScope::Autocommit));
+        connection
+            .set_autocommit_with_timeouts(false, timeouts)
+            .map_err(map_cursor_error)?;
+        let mut cursor = connection.cursor();
+        cursor.set_timeouts(timeouts);
+        return Ok((cursor, AtomicScope::Autocommit));
     }
     let savepoint = savepoint_name(purpose);
     let mut cursor = connection.cursor();
+    cursor.set_timeouts(timeouts);
     cursor
         .execute(&format!("SAVEPOINT {savepoint}"))
         .map_err(map_cursor_error)?;
@@ -1773,6 +2120,7 @@ fn finish_atomic<T>(
     cursor: &mut monetdb::Cursor,
     scope: AtomicScope,
     operation: Result<T>,
+    timeouts: Timeouts,
 ) -> Result<T> {
     let mut result = match operation {
         Ok(value) => {
@@ -1799,7 +2147,7 @@ fn finish_atomic<T>(
     if matches!(scope, AtomicScope::Autocommit) {
         result = combine_atomic_error(
             result,
-            connection.set_autocommit(true),
+            connection.set_autocommit_with_timeouts(true, timeouts),
             "restoring autocommit",
         );
     }
@@ -1809,12 +2157,13 @@ fn finish_atomic<T>(
 fn execute_updates_atomic(
     connection: &Arc<Mutex<monetdb::Connection>>,
     queries: &mut BoundQueryStream,
+    timeouts: Timeouts,
 ) -> Result<Option<i64>> {
     if queries.is_empty()? {
         return Ok(Some(0));
     }
     let connection = lock_connection(connection)?;
-    let (mut cursor, atomic_scope) = begin_atomic(&connection, "parameter_batch")?;
+    let (mut cursor, atomic_scope) = begin_atomic(&connection, "parameter_batch", timeouts)?;
     let result = (|| {
         let mut total = 0i64;
         let mut has_count = false;
@@ -1830,7 +2179,7 @@ fn execute_updates_atomic(
         }
         Ok(has_count.then_some(total))
     })();
-    finish_atomic(&connection, &mut cursor, atomic_scope, result)
+    finish_atomic(&connection, &mut cursor, atomic_scope, result, timeouts)
 }
 
 fn schema_for_columns(columns: &[ResultColumn]) -> Result<SchemaRef> {
@@ -1939,6 +2288,7 @@ struct ParameterQueryReader {
     current: Option<Box<dyn RecordBatchReader + Send + 'static>>,
     schema: SchemaRef,
     batch_rows: usize,
+    timeouts: Timeouts,
     finished: bool,
 }
 
@@ -1974,7 +2324,12 @@ impl ParameterQueryReader {
                 Ok(query) => query,
                 Err(value) => return Some(Err(ArrowError::ExternalError(Box::new(value)))),
             };
-            match query_reader(&self.connection, &query.sql, self.batch_rows) {
+            match query_reader_with_timeouts(
+                &self.connection,
+                &query.sql,
+                self.batch_rows,
+                self.timeouts,
+            ) {
                 Ok(reader) if reader.schema() == self.schema => self.current = Some(reader),
                 Ok(_) => {
                     return Some(Err(ArrowError::SchemaError(
@@ -2095,10 +2450,72 @@ mod tests {
     }
 
     #[test]
+    fn maps_sqlstate_families_to_adbc_statuses() {
+        for (message, expected) in [
+            ("42000!syntax error", Status::InvalidArguments),
+            (
+                "42000!SELECT: access denied for user to table 'sys.private'",
+                Status::Unauthorized,
+            ),
+            ("42S02!table not found", Status::NotFound),
+            ("42S01!table exists", Status::AlreadyExists),
+            ("40002!primary key violation", Status::Integrity),
+            ("23503!foreign key violation", Status::Integrity),
+            ("42501!permission denied", Status::Unauthorized),
+            ("28000!authentication failed", Status::Unauthenticated),
+            ("25000!transaction state", Status::InvalidState),
+            ("HYT00!query timed out", Status::Timeout),
+            ("57014!query interrupted", Status::Cancelled),
+            ("XXXXX!vendor condition", Status::Unknown),
+            ("unstructured server error", Status::Unknown),
+        ] {
+            assert_eq!(sqlstate_status(message), expected, "{message}");
+        }
+    }
+
+    #[test]
     fn validates_boolean_options() {
         assert!(option_bool(&OptionValue::String("enabled".into())).unwrap());
         assert!(!option_bool(&OptionValue::String("false".into())).unwrap());
         assert!(option_bool(&OptionValue::String("maybe".into())).is_err());
+    }
+
+    #[test]
+    fn validates_timeout_options_and_zero_semantics() {
+        let mut parameters = Parameters::default();
+        apply_parameter_timeout(
+            &mut parameters,
+            TimeoutOption::Connect,
+            CONNECT_TIMEOUT_OPTION,
+            &OptionValue::String("7".into()),
+        )
+        .unwrap();
+        let (connect, mut timeouts) = configured_timeouts(&parameters).unwrap();
+        assert_eq!(connect, Some(Duration::from_secs(7)));
+
+        set_runtime_timeout(
+            &mut timeouts,
+            TimeoutOption::Operation,
+            OPERATION_TIMEOUT_OPTION,
+            &OptionValue::Int(0),
+        )
+        .unwrap();
+        assert_eq!(timeouts.operation, None);
+        assert!(timeout_seconds(READ_TIMEOUT_OPTION, &OptionValue::String("-1".into())).is_err());
+        assert!(
+            timeout_seconds(
+                READ_TIMEOUT_OPTION,
+                &OptionValue::Int(monetdb::MAX_TIMEOUT_SECONDS + 1),
+            )
+            .is_err()
+        );
+        assert!(timeout_seconds(WRITE_TIMEOUT_OPTION, &OptionValue::Double(1.0)).is_err());
+        assert_eq!(
+            initialization_timeouts(timeouts, Some(Instant::now() - Duration::from_millis(1)))
+                .unwrap_err()
+                .status,
+            Status::Timeout
+        );
     }
 
     #[test]

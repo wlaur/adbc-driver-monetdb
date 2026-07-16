@@ -1,5 +1,6 @@
 """ADBC driver for MonetDB."""
 
+from enum import StrEnum
 from importlib.metadata import PackageNotFoundError, version
 
 from adbc_driver_monetdb import _native
@@ -10,6 +11,26 @@ except PackageNotFoundError:  # pragma: no cover - source checkout without an in
     __version__ = "0.0.0"
 
 ENTRYPOINT = _native.__adbc_entrypoint__
+
+
+class DatabaseOptions(StrEnum):
+    CONNECT_TIMEOUT = "adbc.monetdb.connect_timeout_seconds"
+    READ_TIMEOUT = "adbc.monetdb.read_timeout_seconds"
+    WRITE_TIMEOUT = "adbc.monetdb.write_timeout_seconds"
+    OPERATION_TIMEOUT = "adbc.monetdb.operation_timeout_seconds"
+
+
+class ConnectionOptions(StrEnum):
+    READ_TIMEOUT = "adbc.monetdb.read_timeout_seconds"
+    WRITE_TIMEOUT = "adbc.monetdb.write_timeout_seconds"
+    OPERATION_TIMEOUT = "adbc.monetdb.operation_timeout_seconds"
+
+
+class StatementOptions(StrEnum):
+    READ_TIMEOUT = "adbc.monetdb.read_timeout_seconds"
+    WRITE_TIMEOUT = "adbc.monetdb.write_timeout_seconds"
+    OPERATION_TIMEOUT = "adbc.monetdb.operation_timeout_seconds"
+    BATCH_ROWS = "adbc.monetdb.batch_rows"
 
 
 def driver_path() -> str:
@@ -24,4 +45,11 @@ def driver_path() -> str:
     return file
 
 
-__all__ = ["ENTRYPOINT", "__version__", "driver_path"]
+__all__ = [
+    "ENTRYPOINT",
+    "ConnectionOptions",
+    "DatabaseOptions",
+    "StatementOptions",
+    "__version__",
+    "driver_path",
+]
