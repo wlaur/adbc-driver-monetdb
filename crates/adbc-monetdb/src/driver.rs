@@ -83,6 +83,15 @@ fn timeout_seconds(key: &str, value: &OptionValue) -> Result<i64> {
             Status::InvalidArguments,
         ));
     }
+    if seconds > monetdb::MAX_TIMEOUT_SECONDS {
+        return Err(error(
+            format!(
+                "option '{key}' must not exceed {} seconds",
+                monetdb::MAX_TIMEOUT_SECONDS
+            ),
+            Status::InvalidArguments,
+        ));
+    }
     Ok(seconds)
 }
 
@@ -2425,6 +2434,13 @@ mod tests {
         .unwrap();
         assert_eq!(timeouts.operation, None);
         assert!(timeout_seconds(READ_TIMEOUT_OPTION, &OptionValue::String("-1".into())).is_err());
+        assert!(
+            timeout_seconds(
+                READ_TIMEOUT_OPTION,
+                &OptionValue::Int(monetdb::MAX_TIMEOUT_SECONDS + 1),
+            )
+            .is_err()
+        );
         assert!(timeout_seconds(WRITE_TIMEOUT_OPTION, &OptionValue::Double(1.0)).is_err());
         assert_eq!(
             initialization_timeouts(timeouts, Some(Instant::now() - Duration::from_millis(1)))

@@ -42,10 +42,10 @@ with dbapi.connect("monetdb://user:password@localhost:50000/db") as conn:
 
 Timeout values are integer seconds. Defaults are a 30-second absolute connection deadline,
 60-second idle read and write timeouts, and a 300-second absolute operation deadline. Zero
-explicitly selects no deadline; negative or unrepresentable values are rejected. A connection
-timeout covers DNS, every address attempt, TCP or Unix connection, TLS, authentication,
-redirects, and initial driver metadata. A timeout or cancellation closes the MAPI session, so
-the partially read connection cannot be reused.
+explicitly selects no deadline; negative values and values above the portable socket limit of
+4,294,967 seconds are rejected. A connection timeout covers DNS, every address attempt, TCP or
+Unix connection, TLS, authentication, redirects, and initial driver metadata. A timeout or
+cancellation closes the MAPI session, so the partially read connection cannot be reused.
 
 The URI names are `connect_timeout`, `read_timeout`, `write_timeout`, and
 `operation_timeout`. This is the only configuration channel available to
