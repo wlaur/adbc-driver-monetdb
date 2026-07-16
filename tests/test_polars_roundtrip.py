@@ -1,5 +1,8 @@
 import gc
 import os
+import subprocess
+import sys
+import textwrap
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, time, timedelta
@@ -877,6 +880,66 @@ def test_extension_parameters_and_hugeint_timetz_append_back(monetdb_uri: str) -
             cursor.execute("DROP TABLE IF EXISTS extension_ingest")  # pyright: ignore[reportUnknownMemberType]
             cursor.execute("DROP TABLE IF EXISTS extension_oid_ingest")  # pyright: ignore[reportUnknownMemberType]
             cursor.execute("DROP TABLE IF EXISTS extension_bind")  # pyright: ignore[reportUnknownMemberType]
+
+
+@pytest.mark.integration
+def test_polars_future_unknown_extension_behavior(monetdb_uri: str) -> None:
+    code = textwrap.dedent(
+        """
+        import os
+        import polars as pl
+        from adbc_driver_monetdb import dbapi
+
+        with dbapi.connect(os.environ["MONETDB_TEST_URI"], autocommit=True) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("DROP TABLE IF EXISTS polars_future_extension_source")
+                cursor.execute("DROP TABLE IF EXISTS polars_future_extension_target")
+                cursor.execute(
+                    "CREATE TABLE polars_future_extension_source(h HUGEINT, t TIME WITH TIME ZONE)"
+                )
+                cursor.execute(
+                    "CREATE TABLE polars_future_extension_target(h HUGEINT, t TIME WITH TIME ZONE)"
+                )
+                cursor.execute(
+                    "INSERT INTO polars_future_extension_source "
+                    "VALUES (123456789012345678901234567890, TIMETZ '12:34:56.123456+00:00')"
+                )
+            try:
+                frame = pl.read_database(
+                    "SELECT h, t FROM polars_future_extension_source", connection
+                )
+                assert "monetdb.hugeint" in str(frame.schema["h"])
+                assert "monetdb.timetz" in str(frame.schema["t"])
+                assert frame.write_database(
+                    "polars_future_extension_target",
+                    connection,
+                    if_table_exists="append",
+                    engine="adbc",
+                ) == 1
+                back = pl.read_database(
+                    "SELECT CAST(h AS STRING) AS h FROM polars_future_extension_target",
+                    connection,
+                )
+                assert back.get_column("h").to_list() == ["123456789012345678901234567890"]
+            finally:
+                with connection.cursor() as cursor:
+                    cursor.execute("DROP TABLE IF EXISTS polars_future_extension_target")
+                    cursor.execute("DROP TABLE IF EXISTS polars_future_extension_source")
+        print("future extension behavior passed")
+        """
+    )
+    environment = os.environ.copy()
+    environment["MONETDB_TEST_URI"] = monetdb_uri
+    environment["POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR"] = "load_as_extension"
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=environment,
+    )
+    assert "future extension behavior passed" in completed.stdout
 
 
 @pytest.mark.integration
