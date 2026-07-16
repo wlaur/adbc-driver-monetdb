@@ -76,7 +76,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cfd33d3e92f207444098c75b42de99d329562be0cf686b307b097cc52b4e999e"
 dependencies = [
  "ahash",
- "arrow-buffer",
+ "arrow-buffer 58.3.0",
  "arrow-data",
  "arrow-schema",
  "chrono",
@@ -100,12 +100,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrow-buffer"
+version = "59.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4776577a87794bfdf0b4e90e2ea12454fa7738ea2823c4be5b9d1851da7b434"
+dependencies = [
+ "bytes",
+ "half",
+ "num-bigint",
+ "num-traits",
+]
+
+[[package]]
 name = "arrow-data"
 version = "58.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3c88210023a2bfee1896af366309a3028fc3bcbd6515fa29a7990ee1baa08ee0"
 dependencies = [
- "arrow-buffer",
+ "arrow-buffer 58.3.0",
  "arrow-schema",
  "half",
  "num-integer",
@@ -826,7 +838,7 @@ name = "monetdb-arrow"
 version = "0.1.0"
 dependencies = [
  "arrow-array",
- "arrow-buffer",
+ "arrow-buffer 59.1.0",
  "arrow-schema",
  "chrono",
  "memchr",
