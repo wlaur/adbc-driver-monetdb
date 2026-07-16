@@ -223,7 +223,8 @@ jobs:
         run: |
           wheel=$(find "$GITHUB_WORKSPACE/wheelhouse" -maxdepth 1 -name 'adbc_driver_monetdb-*.whl' -print -quit)
           uv run --isolated --no-project --python '${{ matrix.python }}' \
-            --with "$wheel" --with 'pytest>=9' --with 'polars>=1.42' --with 'pandas>=3.0' --with 'pyarrow>=25' \
+            --with "$wheel" --with 'pytest>=9' --with 'polars>=1.42' --with 'pandas>=3.0' \
+            --with 'pyarrow>=25' --with 'sqlalchemy>=2.0' \
             python -m pytest "$GITHUB_WORKSPACE/tests" -m 'not integration' \
               --ignore "$GITHUB_WORKSPACE/tests/validation" -q
 
@@ -283,7 +284,7 @@ jobs:
           wheel=$(find "$GITHUB_WORKSPACE/wheelhouse" -maxdepth 1 -name 'adbc_driver_monetdb-*.whl' -print -quit)
           uv run --isolated --no-project --python 3.13 \
             --with "$wheel" --with 'pytest>=9' --with 'polars>=1.42' --with 'pandas>=3.0' \
-            --with pymonetdb --with 'pyarrow>=25' \
+            --with pymonetdb --with 'pyarrow>=25' --with 'sqlalchemy>=2.0' \
             python -m pytest "$GITHUB_WORKSPACE/tests" -m integration \
               --ignore "$GITHUB_WORKSPACE/tests/validation" -q
           uv run --isolated --no-project --python 3.13 \
