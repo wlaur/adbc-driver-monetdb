@@ -19,7 +19,7 @@ import pyarrow as pa  # pyright: ignore[reportMissingTypeStubs]
 import pytest
 from server_version import MONETDB_SERVER_VERSION
 
-from adbc_driver_monetdb import dbapi
+from adbc_driver_monetdb import StatementOptions, dbapi
 
 
 class _ArrowField(Protocol):
@@ -102,6 +102,26 @@ def test_polars_uri_resolution_and_streaming_batches(monetdb_uri: str) -> None:
 
     with dbapi.connect(monetdb_uri, db_kwargs={"uri": "not-the-positional-uri"}) as conn:
         assert conn.execute("SELECT 1").fetchone() == (1,)  # pyright: ignore[reportUnknownMemberType]
+
+
+@pytest.mark.integration
+def test_polars_preconfigured_cursor_and_execute_options(monetdb_uri: str) -> None:
+    with dbapi.connect(monetdb_uri) as connection:
+        with connection.cursor(adbc_stmt_kwargs={StatementOptions.BATCH_ROWS: 2}) as cursor:
+            batches = list(
+                pl.read_database(  # pyright: ignore[reportUnknownMemberType]
+                    "SELECT value FROM sys.generate_series(1, 6)",
+                    cursor,
+                    iter_batches=True,
+                )
+            )
+        parameterized = pl.read_database(  # pyright: ignore[reportUnknownMemberType]
+            "SELECT CAST(? AS INT) AS value",
+            connection,
+            execute_options={"parameters": (42,)},
+        )
+    assert [batch.height for batch in batches] == [2, 2, 1]
+    assert parameterized.get_column("value").to_list() == [42]
 
 
 @pytest.mark.integration
