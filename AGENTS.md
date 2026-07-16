@@ -35,6 +35,8 @@ covers the conventions that are easy to get wrong.
   errors.
 - One `arrow` major per workspace (currently 58; `adbc_core` 0.23 requires `<59`). Bump
   `adbc_core`/`adbc_ffi`/`arrow` together, never independently.
+- `cargo audit --deny warnings` is a CI gate. A temporary advisory exception requires
+  the exact RustSec ID, rationale, owner, and removal deadline in the workflow change.
 - Wire-format facts must cite the MonetDB source or docs in a comment (see the frame
   parser). Known trap: the temporal structs' field named `ms` holds **microseconds** —
   don't "fix" it.

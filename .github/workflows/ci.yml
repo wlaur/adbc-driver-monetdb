@@ -60,6 +60,10 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo test --locked --workspace
+      - name: Audit Rust dependencies
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo audit --deny warnings
       - run: ./checklicense.py --check
         working-directory: monetdb-rust
       - name: Verify the NOTICE fork revision
