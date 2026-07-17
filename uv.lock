@@ -81,7 +81,7 @@ dev = [
     { name = "pyarrow-stubs", specifier = ">=20.0.0.20260625" },
     { name = "pymonetdb", specifier = ">=1.9" },
     { name = "pyright" },
-    { name = "pytest" },
+    { name = "pytest", specifier = ">=9" },
     { name = "ruff" },
     { name = "sqlalchemy", specifier = ">=2.0" },
 ]
