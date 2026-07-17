@@ -220,6 +220,7 @@ def test_statement_cancel_interrupts_black_holed_query() -> None:
         result = outcome.get_nowait()
         assert isinstance(result, adbc_driver_manager.OperationalError)
         assert result.status_code == adbc_driver_manager.AdbcStatusCode.CANCELLED
+        assert "connection closed by cancel" in str(result)
         with pytest.raises(adbc_driver_manager.ProgrammingError):
             cursor.execute("SELECT 2")
 
