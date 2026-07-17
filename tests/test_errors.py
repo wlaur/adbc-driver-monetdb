@@ -98,6 +98,9 @@ def test_authentication_channels_and_password_readback(monetdb_uri: str) -> None
     try:
         with dbapi.connect(userinfo_uri, autocommit=True) as connection:
             assert connection.execute("SELECT current_user").fetchone() == (username,)
+            returned_uri = urlsplit(connection.adbc_database.get_option("uri"))
+            assert returned_uri.username is None
+            assert returned_uri.password is None
         with dbapi.connect(bare_uri, autocommit=True, db_kwargs=credentials) as connection:
             assert connection.execute("SELECT current_user").fetchone() == (username,)
             with pytest.raises(adbc_driver_manager.NotSupportedError, match="cannot be read back"):

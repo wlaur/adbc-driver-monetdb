@@ -399,7 +399,11 @@ impl Optionable for MonetdbDatabase {
                 Status::NotImplemented,
             ));
         }
-        self.options.get_string(key)
+        let value = self.options.get_string(&key)?;
+        if key == OptionDatabase::Uri {
+            return uri_without_userinfo(&value);
+        }
+        Ok(value)
     }
 
     fn get_option_bytes(&self, key: Self::Option) -> Result<Vec<u8>> {
@@ -611,6 +615,18 @@ fn decode_userinfo(value: &str) -> Result<String> {
         .map_err(|value| map_display(value, Status::InvalidArguments))
 }
 
+fn uri_without_userinfo(uri: &str) -> Result<String> {
+    let mut parsed =
+        url::Url::parse(uri).map_err(|value| map_display(value, Status::InvalidArguments))?;
+    parsed
+        .set_username("")
+        .map_err(|()| error("URI user information is invalid", Status::InvalidArguments))?;
+    parsed
+        .set_password(None)
+        .map_err(|()| error("URI user information is invalid", Status::InvalidArguments))?;
+    Ok(parsed.into())
+}
+
 pub struct MonetdbConnection {
     inner: Arc<Mutex<monetdb::Connection>>,
     cancel: CancelHandle,
@@ -684,6 +700,13 @@ impl Optionable for MonetdbConnection {
     }
 
     fn get_option_string(&self, key: Self::Option) -> Result<String> {
+        if key == OptionConnection::AutoCommit {
+            return Ok(lock_connection(&self.inner)?
+                .server_info()
+                .map_err(map_cursor_error)?
+                .autocommit
+                .to_string());
+        }
         if key == OptionConnection::CurrentSchema {
             return scalar_string(
                 &self.inner,

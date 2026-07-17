@@ -985,6 +985,16 @@ def test_enabling_autocommit_commits_the_open_transaction(monetdb_uri: str) -> N
 
 
 @pytest.mark.integration
+def test_autocommit_option_tracks_sql_transaction_control(monetdb_uri: str) -> None:
+    with dbapi.connect(monetdb_uri, autocommit=True) as conn, conn.cursor() as cursor:
+        assert conn.adbc_connection.get_option("adbc.connection.autocommit") == "true"
+        cursor.execute("START TRANSACTION")
+        assert conn.adbc_connection.get_option("adbc.connection.autocommit") == "false"
+        cursor.execute("COMMIT")
+        assert conn.adbc_connection.get_option("adbc.connection.autocommit") == "true"
+
+
+@pytest.mark.integration
 def test_failed_ingest_uses_a_savepoint_inside_user_transaction(monetdb_uri: str) -> None:
     with dbapi.connect(monetdb_uri, autocommit=True) as setup, setup.cursor() as cursor:
         cursor.execute("CREATE TABLE savepoint_prior(value INT)")
