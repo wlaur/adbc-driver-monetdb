@@ -61,7 +61,7 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo test --locked --workspace
-      - run: cargo test --locked --all-features
+      - run: cargo test --all-features
         working-directory: monetdb-rust
       - name: Audit Rust dependencies
         run: |
