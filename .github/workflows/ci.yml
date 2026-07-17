@@ -61,7 +61,9 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo test --locked --workspace
-      - run: cargo test --all-features
+      - run: cargo test --all-features --lib
+        working-directory: monetdb-rust
+      - run: cargo test --all-features --doc
         working-directory: monetdb-rust
       - name: Audit Rust dependencies
         run: |
@@ -313,6 +315,11 @@ jobs:
           else:
               raise SystemExit(f"MonetDB never became ready: {last}")
           PY
+      - name: Run the monetdb-rust integration suite
+        working-directory: monetdb-rust
+        env:
+          CI_SERVER_URL: "monetdb://localhost:50000/test?user=monetdb&password=monetdb"
+        run: cargo test --all-features --test ci
       - name: Run the integration suite against the installed wheel
         # NOT from the workspace: the adbc_driver_monetdb source dir at the repo root
         # would shadow the installed wheel on sys.path (no compiled _native there)
