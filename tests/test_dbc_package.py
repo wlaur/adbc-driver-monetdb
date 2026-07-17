@@ -27,6 +27,8 @@ def test_builds_flat_dbc_archive(
     wheel_suffix: str,
 ) -> None:
     wheel = tmp_path / "driver.whl"
+    license_path = tmp_path / "THIRD_PARTY_LICENSES"
+    license_path.write_text("dependency licenses")
     with ZipFile(wheel, "w") as archive:
         archive.writestr(f"adbc_driver_monetdb/_native.abi3{wheel_suffix}", b"native")
         archive.writestr("driver.dist-info/licenses/LICENSE", b"MIT")
@@ -43,6 +45,8 @@ def test_builds_flat_dbc_archive(
             platform,
             "--out-dir",
             str(tmp_path / "out"),
+            "--license",
+            str(license_path),
         ],
         check=True,
     )
@@ -60,5 +64,10 @@ def test_builds_flat_dbc_archive(
         manifest_file = archive.extractfile("MANIFEST")
         assert manifest_file is not None
         manifest = tomllib.loads(manifest_file.read().decode())
+        license_file = archive.extractfile("LICENSE")
+        assert license_file is not None
+        assert license_file.read() == b"dependency licenses"
+    assert manifest["description"] == "ADBC driver for MonetDB: Arrow-native reads and writes"
+    assert manifest["url"] == "https://github.com/wlaur/adbc-driver-monetdb"
     assert manifest["Driver"]["entrypoint"] == "AdbcDriverMonetdbInit"
     assert manifest["Files"]["driver"] == driver_name
