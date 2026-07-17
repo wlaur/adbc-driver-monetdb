@@ -38,14 +38,51 @@ with dbapi.connect("monetdb://user:password@localhost:50000/db") as conn:
     df.to_sql("trades_copy", conn, if_exists="append", index=False)
 ```
 
+## Credentials and read-only access
+
+SQLAlchemy-style URIs work: userinfo in `monetdb://user:password@localhost:50000/db` is
+percent-decoded and stripped from the URI before it reaches the protocol layer. URIs end up in
+shell history, logs, and tracebacks, so prefer supplying credentials separately through the
+standard ADBC database options `username` and `password` (also available as
+`adbc_driver_manager.DatabaseOptions.USERNAME` / `.PASSWORD`), which override any URI userinfo:
+
+```python
+import os
+
+from adbc_driver_monetdb import dbapi
+
+with dbapi.connect(
+    "monetdb://localhost:50000/db",
+    db_kwargs={
+        "username": os.environ["MONETDB_USER"],
+        "password": os.environ["MONETDB_PASSWORD"],
+    },
+) as conn:
+    ...
+```
+
+The password option is write-only: reading it back through `get_option` is an error.
+
+MonetDB has no per-connection read-only mode — the server rejects read-only transactions
+outright (`42000!Readonly transactions not supported`), so setting the ADBC option
+`adbc.connection.readonly` to `true` returns `NotImplemented` (see the waived-surface table
+below). For read-only access, connect as a user that holds only `SELECT` privileges; the
+server then enforces this for every statement on the connection:
+
+```sql
+CREATE USER reader WITH PASSWORD 'secret' NAME 'Reporting' SCHEMA sys;
+GRANT SELECT ON sys.trades TO reader;
+```
+
 ## Configuration and timeouts
 
-Timeout values are integer seconds. Defaults are a 30-second absolute connection deadline,
-60-second idle read and write timeouts, and a 300-second absolute operation deadline. Zero
-explicitly selects no deadline; negative values and values above the portable socket limit of
-4,294,967 seconds are rejected. A connection timeout covers DNS, every address attempt, TCP or
-Unix connection, TLS, authentication, redirects, and initial driver metadata. A timeout or
-cancellation closes the MAPI session, so the partially read connection cannot be reused.
+Timeout values are integer seconds. The default connection deadline is 30 seconds and the default
+idle write timeout is 60 seconds. Read and operation timeouts are disabled by default so a healthy
+long-running query is not terminated merely because it exceeds a client-side wall-clock limit.
+Zero explicitly selects no deadline; negative values and values above the portable socket limit of
+4,294,967 seconds are rejected. A connection timeout covers DNS, every address attempt, TCP or Unix
+connection, TLS, authentication, redirects, and initial driver metadata. A timeout or cancellation
+closes the MAPI session, so the partially read connection cannot be reused.
 
 The URI names are `connect_timeout`, `read_timeout`, `write_timeout`, and
 `operation_timeout`. This is the only configuration channel available to
@@ -78,8 +115,8 @@ with dbapi.connect(
 ) as conn:
     with conn.cursor(
         adbc_stmt_kwargs={
-            StatementOptions.OPERATION_TIMEOUT: 15,
-            StatementOptions.BATCH_ROWS: 65_536,
+            StatementOptions.OPERATION_TIMEOUT: "15",
+            StatementOptions.BATCH_ROWS: "65536",
         }
     ) as cursor:
         frame = pl.read_database("SELECT * FROM trades", cursor)
@@ -94,9 +131,15 @@ and a dictionary for named `:name` values.
 `adbc.monetdb.batch_rows`, and `DataFrame.write_database(..., engine_options=...)` supplies
 ingestion arguments rather than connection or timeout options.
 
-The DB-API module reports `threadsafety = 1`: threads may share the module, but each thread
-should use its own connection and cursors. Cross-thread cancellation of an active operation is
-supported explicitly.
+The examples use strings because `adbc-driver-manager` publishes string-valued type hints for
+database and connection option mappings. Statement options also accept native integers through the
+ADBC integer option path.
+
+The DB-API module reports `threadsafety = 1`: threads may share the module, but each thread should
+use its own connection and cursors. Cancellation is connection-scoped: it interrupts the operation
+currently using that connection, not necessarily the statement object on which `cancel` was called.
+MAPI cannot safely resume a partially read response, so cancellation closes the session permanently;
+close that connection and open another one before issuing more work.
 
 The native DB-API parameter style is `qmark` (`?`). Named `:name` parameters are also supported
 when a parameter dictionary is supplied, including SQLAlchemy expressions compiled to a SQL
@@ -136,8 +179,8 @@ covering the common SQL-driver baseline.
 | Bulk ingest: create, append, replace, create-append, target schema, and temporary tables | Supported |
 | Transactions, autocommit, commit, rollback, and current-schema get/set | Supported |
 | `GetInfo`, `GetObjects`, `GetTableSchema`, and `GetTableTypes` | Supported |
-| TLS and authentication | System roots, certificate file/hash, and client certificates |
-| Finite connect/read/write/operation timeouts and cross-thread cancellation | Supported; timeout/cancel closes the session |
+| TLS and authentication | Certificate file/hash and client certificates are integration-tested; the rustls system-root path is supported |
+| Configurable connect/read/write/operation timeouts and cross-thread cancellation | Supported; timeout/cancel closes the session |
 | SQLSTATE diagnostics and semantic ADBC statuses | Supported |
 | Python DB-API, Polars URI/connection/cursor paths, pandas, wheels, and source builds | Supported |
 
@@ -151,15 +194,18 @@ or argument error.
 | Substrait plans | MonetDB accepts SQL, not Substrait plans |
 | `GetStatistics` and `GetStatisticNames` | Optional federation metadata, not part of the common SQL-driver baseline |
 | Progress and maximum-progress reporting | MAPI does not expose compatible progress metadata |
-| Read-only `true` and isolation-level options | MonetDB does not expose matching per-connection controls through this interface; read-only `false` is accepted |
+| Read-only `true` and isolation-level options | The server rejects read-only transactions (`42000!Readonly transactions not supported`), so there is no per-connection control to map; read-only `false` is accepted. Use a `SELECT`-only user instead (see Credentials) |
 | Setting the current catalog and cross-catalog ingest | A MAPI session is attached to one database; the current catalog remains readable |
 
 The reusable ADBC validation suite currently passes against Dec2025-SP3. Its skips cover
 explicitly waived cross-catalog/statistics behavior and negative-scale decimals that MonetDB
 itself does not support. Polars' announced future unknown-extension behavior is exercised in CI;
-HUGEINT and TIMETZ remain round-trippable when loaded as extension types.
+HUGEINT and TIMETZ remain round-trippable when loaded as extension types. The
+`monetdb.hugeint` extension uses Arrow `Decimal128(38, 0)`, so its supported domain is
+−(10^38−1) through 10^38−1; wider values in MonetDB's signed 128-bit domain return a bounded
+conversion error instead of silently changing the public Arrow type.
 
-## Non-Python driver managers
+## dbc packages and driver-manager loading
 
 Each platform wheel can also be converted to a flat `dbc` package. Installing that archive makes
 the driver discoverable as `monetdb` by C/C++, Go, R, Ruby, Rust, Python, and other ADBC driver
@@ -167,15 +213,39 @@ managers. `dbc` writes the installed ADBC TOML manifest with an absolute shared-
 relative `Driver.shared` path is not portable.
 
 ```sh
+cargo about generate --all-features --fail --locked \
+    --target aarch64-apple-darwin,aarch64-unknown-linux-gnu,x86_64-pc-windows-msvc,x86_64-unknown-linux-gnu \
+    license.tpl > THIRD_PARTY_LICENSES
 uv run python packaging/dbc/build_package.py \
     --wheel dist/adbc_driver_monetdb-0.1.0-cp313-abi3-macosx_11_0_arm64.whl \
-    --platform macos_arm64 --out-dir dist/dbc
+    --platform macos_arm64 --out-dir dist/dbc --license THIRD_PARTY_LICENSES
 ADBC_DRIVER_PATH="$PWD/.adbc-drivers" \
     uvx --from dbc dbc install --no-verify dist/dbc/monetdb_macos_arm64_v0.1.0.tar.gz
 ```
 
 The repository packages are unsigned development artifacts, hence `--no-verify`. A registry
 release should be signed and installed without that flag.
+
+Polars can use a dbc-installed driver without the `adbc-driver-monetdb` Python package when the
+connection is created by the Python driver manager (which is still required by polars' ADBC engine):
+
+```python
+import polars as pl
+from adbc_driver_manager import dbapi
+
+# The driver itself was installed with: dbc install monetdb
+with dbapi.connect(
+    driver="monetdb",
+    db_kwargs={"uri": "monetdb://user:password@localhost:50000/db"},
+) as conn:
+    frame = pl.read_database("SELECT * FROM trades", connection=conn)
+    frame.write_database("trades_copy", connection=conn, engine="adbc")
+```
+
+The URI-string conveniences `pl.read_database_uri(..., engine="adbc")` and
+`DataFrame.write_database(..., connection="monetdb://...")` still import
+`adbc_driver_monetdb` by scheme and therefore require the PyPI package. Both distribution channels
+are intentional and ship the same native driver.
 
 ## Repository layout
 
@@ -189,6 +259,9 @@ release should be signed and installed without that flag.
 
 ## Development
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for bug, security, feature-request, and contribution
+guidance.
+
 ```sh
 git clone --recurse-submodules https://github.com/wlaur/adbc-driver-monetdb
 uv sync                                # installs deps + builds the extension via maturin
@@ -196,9 +269,7 @@ uv run pytest -m "not integration"     # python tests (no server needed)
 cargo test --workspace                 # rust tests
 
 # integration tests against a real server:
-docker run -d --platform linux/amd64 -p 50000:50000 \
-    -e MDB_DB_ADMIN_PASS=monetdb -e MDB_CREATE_DBS=test \
-    monetdb/monetdb:Dec2025-SP3@sha256:a71e6e8c8402beadc51aebf944b465ee5b185c7ae4a9e6808b5d9133ee921786
+docker compose up -d
 MONETDB_TEST_URI=monetdb://monetdb:monetdb@localhost:50000/test uv run pytest -m integration
 
 # run the reusable ADBC conformance suite:
