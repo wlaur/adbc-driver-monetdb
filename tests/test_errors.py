@@ -26,31 +26,27 @@ def test_dbapi_classifies_server_sqlstates(monetdb_uri: str) -> None:
     constraint_table = f"adbc_constraint_{suffix}"
     with dbapi.connect(monetdb_uri, autocommit=True) as connection, connection.cursor() as cursor:
         try:
-            cursor.execute(f"CREATE TABLE {duplicate_table}(value INT)")  # pyright: ignore[reportUnknownMemberType]
-            cursor.execute(  # pyright: ignore[reportUnknownMemberType]
-                f"CREATE TABLE {constraint_table}(value INT PRIMARY KEY)"
-            )
-            cursor.execute(f"INSERT INTO {constraint_table} VALUES (1)")  # pyright: ignore[reportUnknownMemberType]
+            cursor.execute(f"CREATE TABLE {duplicate_table}(value INT)")
+            cursor.execute(f"CREATE TABLE {constraint_table}(value INT PRIMARY KEY)")
+            cursor.execute(f"INSERT INTO {constraint_table} VALUES (1)")
 
             with pytest.raises(adbc_driver_manager.ProgrammingError) as syntax:
-                cursor.execute("SELEC 1")  # pyright: ignore[reportUnknownMemberType]
+                cursor.execute("SELEC 1")
             assert syntax.value.status_code == adbc_driver_manager.AdbcStatusCode.INVALID_ARGUMENT
             assert syntax.value.sqlstate == "42000"
 
             with pytest.raises(adbc_driver_manager.ProgrammingError) as duplicate:
-                cursor.execute(  # pyright: ignore[reportUnknownMemberType]
-                    f"CREATE TABLE {duplicate_table}(value INT)"
-                )
+                cursor.execute(f"CREATE TABLE {duplicate_table}(value INT)")
             assert duplicate.value.status_code == adbc_driver_manager.AdbcStatusCode.ALREADY_EXISTS
             assert duplicate.value.sqlstate == "42S01"
 
             with pytest.raises(adbc_driver_manager.IntegrityError) as constraint:
-                cursor.execute(f"INSERT INTO {constraint_table} VALUES (1)")  # pyright: ignore[reportUnknownMemberType]
+                cursor.execute(f"INSERT INTO {constraint_table} VALUES (1)")
             assert constraint.value.status_code == adbc_driver_manager.AdbcStatusCode.INTEGRITY
             assert constraint.value.sqlstate == "40002"
         finally:
-            cursor.execute(f"DROP TABLE IF EXISTS {constraint_table}")  # pyright: ignore[reportUnknownMemberType]
-            cursor.execute(f"DROP TABLE IF EXISTS {duplicate_table}")  # pyright: ignore[reportUnknownMemberType]
+            cursor.execute(f"DROP TABLE IF EXISTS {constraint_table}")
+            cursor.execute(f"DROP TABLE IF EXISTS {duplicate_table}")
 
 
 @pytest.mark.integration
@@ -62,17 +58,15 @@ def test_dbapi_classifies_permission_denial(monetdb_uri: str) -> None:
     restricted_uri = _uri_with_credentials(monetdb_uri, username, password)
 
     with dbapi.connect(monetdb_uri, autocommit=True) as admin:
-        admin.execute(f"CREATE TABLE {table}(value INT)")  # pyright: ignore[reportUnknownMemberType]
-        admin.execute(  # pyright: ignore[reportUnknownMemberType]
-            f"CREATE USER {username} WITH PASSWORD '{password}' NAME 'ADBC permission test' SCHEMA sys"
-        )
+        admin.execute(f"CREATE TABLE {table}(value INT)")
+        admin.execute(f"CREATE USER {username} WITH PASSWORD '{password}' NAME 'ADBC permission test' SCHEMA sys")
     try:
         with dbapi.connect(restricted_uri, autocommit=True) as restricted:
             with pytest.raises(adbc_driver_manager.ProgrammingError) as denied:
-                restricted.execute(f"SELECT * FROM sys.{table}")  # pyright: ignore[reportUnknownMemberType]
+                restricted.execute(f"SELECT * FROM sys.{table}")
             assert denied.value.status_code == adbc_driver_manager.AdbcStatusCode.UNAUTHORIZED
             assert denied.value.sqlstate == "42000"
     finally:
         with dbapi.connect(monetdb_uri, autocommit=True) as admin:
-            admin.execute(f"DROP USER IF EXISTS {username}")  # pyright: ignore[reportUnknownMemberType]
-            admin.execute(f"DROP TABLE IF EXISTS {table}")  # pyright: ignore[reportUnknownMemberType]
+            admin.execute(f"DROP USER IF EXISTS {username}")
+            admin.execute(f"DROP TABLE IF EXISTS {table}")

@@ -15,18 +15,22 @@ def test_ingest_schema_mismatch_status_depends_on_mode(monetdb_uri: str) -> None
 
     with dbapi.connect(monetdb_uri, autocommit=True) as connection, connection.cursor() as cursor:
         try:
-            assert cursor.adbc_ingest(table, initial, mode="create_append") == 1  # pyright: ignore[reportUnknownMemberType]
+            assert cursor.adbc_ingest(table, initial, mode="create_append") == 1
 
             with pytest.raises(adbc_driver_manager.ProgrammingError) as create_append:
-                cursor.adbc_ingest(  # pyright: ignore[reportUnknownMemberType]
-                    table, mismatched, mode="create_append"
+                cursor.adbc_ingest(
+                    table,
+                    mismatched,
+                    mode="create_append",
                 )
             assert create_append.value.status_code == adbc_driver_manager.AdbcStatusCode.ALREADY_EXISTS
 
             with pytest.raises(adbc_driver_manager.ProgrammingError) as append:
-                cursor.adbc_ingest(  # pyright: ignore[reportUnknownMemberType]
-                    table, mismatched, mode="append"
+                cursor.adbc_ingest(
+                    table,
+                    mismatched,
+                    mode="append",
                 )
             assert append.value.status_code == adbc_driver_manager.AdbcStatusCode.INVALID_ARGUMENT
         finally:
-            cursor.execute(f'DROP TABLE IF EXISTS "{table}"')  # pyright: ignore[reportUnknownMemberType]
+            cursor.execute(f'DROP TABLE IF EXISTS "{table}"')
