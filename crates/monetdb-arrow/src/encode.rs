@@ -19,6 +19,8 @@ use arrow_array::{
         UInt8Type, UInt16Type, UInt32Type, UInt64Type,
     },
 };
+#[cfg(target_endian = "little")]
+use arrow_buffer::ToByteSlice;
 use arrow_schema::{DataType, Field, TimeUnit};
 use chrono::{Datelike, NaiveDate, TimeDelta};
 use monetdb::MonetType;
@@ -78,6 +80,7 @@ pub fn monet_type_for_field(field: &Field) -> Result<MonetType, EncodeError> {
         }
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => match extension {
             Some("arrow.json") => MonetType::Json,
+            Some("monetdb.inet") => MonetType::Inet,
             Some("monetdb.url") => MonetType::Url,
             _ => MonetType::Varchar(0),
         },
@@ -161,9 +164,7 @@ pub fn encode_column(field: &Field, array: &dyn Array) -> Result<Vec<u8>, Encode
     macro_rules! signed {
         ($array:ty, $type:ty, $variant:expr) => {{
             let values = downcast::<$array>(array, $variant)?;
-            encode_primitive(values, <$type>::MIN, &mut out, |value, out| {
-                out.extend_from_slice(&value.to_le_bytes())
-            })?;
+            encode_primitive(values, <$type>::MIN, &mut out)?;
         }};
     }
     macro_rules! unsigned {
@@ -203,19 +204,28 @@ pub fn encode_column(field: &Field, array: &dyn Array) -> Result<Vec<u8>, Encode
         DataType::Float16 => encode_f16(downcast(array, DataType::Float16)?, &mut out)?,
         DataType::Float32 => encode_f32(downcast(array, DataType::Float32)?, &mut out)?,
         DataType::Float64 => encode_f64(downcast(array, DataType::Float64)?, &mut out)?,
-        DataType::Decimal128(precision, _) => encode_decimal(
-            downcast(array, array.data_type().clone())?,
-            *precision,
-            &mut out,
-        )?,
-        DataType::Utf8 => encode_strings(
-            downcast::<StringArray>(array, DataType::Utf8)?.iter(),
-            &mut out,
-        )?,
-        DataType::LargeUtf8 => encode_strings(
-            downcast::<LargeStringArray>(array, DataType::LargeUtf8)?.iter(),
-            &mut out,
-        )?,
+        DataType::Decimal128(precision, _) => {
+            let enforce_precision = monet_type_for_field(field)? != MonetType::HugeInt;
+            encode_decimal(
+                downcast(array, array.data_type().clone())?,
+                *precision,
+                enforce_precision,
+                &mut out,
+            )?
+        }
+        DataType::Utf8 if monet_type_for_field(field)? == MonetType::Inet => {
+            return Err(EncodeError::Unsupported(DataType::Utf8));
+        }
+        DataType::Utf8 => {
+            let values = downcast::<StringArray>(array, DataType::Utf8)?;
+            reserve_strings(values.value_offsets(), values.len(), &mut out)?;
+            encode_strings(values.iter(), &mut out)?;
+        }
+        DataType::LargeUtf8 => {
+            let values = downcast::<LargeStringArray>(array, DataType::LargeUtf8)?;
+            reserve_strings(values.value_offsets(), values.len(), &mut out)?;
+            encode_strings(values.iter(), &mut out)?;
+        }
         DataType::Utf8View => encode_strings(
             downcast::<StringViewArray>(array, DataType::Utf8View)?.iter(),
             &mut out,
@@ -248,7 +258,12 @@ pub fn encode_column(field: &Field, array: &dyn Array) -> Result<Vec<u8>, Encode
         DataType::Time32(unit) => encode_time32(array, *unit, &mut out)?,
         DataType::Time64(unit) => encode_time64(array, *unit, &mut out)?,
         DataType::Timestamp(unit, _) => encode_timestamp(array, *unit, &mut out)?,
-        DataType::Duration(unit) => encode_duration(array, *unit, &mut out)?,
+        DataType::Duration(unit) => encode_duration(
+            array,
+            *unit,
+            monet_type_for_field(field)? == MonetType::DayInterval,
+            &mut out,
+        )?,
         data_type => return Err(EncodeError::Unsupported(data_type.clone())),
     }
     Ok(out)
@@ -304,23 +319,50 @@ fn encode_primitive<T: ArrowPrimitiveType>(
     array: &PrimitiveArray<T>,
     null: T::Native,
     out: &mut Vec<u8>,
-    mut append: impl FnMut(T::Native, &mut Vec<u8>),
 ) -> Result<(), EncodeError>
 where
     T::Native: PartialEq,
 {
     for row in 0..array.len() {
-        let is_null = array.is_null(row);
-        let value = if is_null { null } else { array.value(row) };
-        if !is_null && value == null {
+        if !array.is_null(row) && array.value(row) == null {
             return Err(EncodeError::InvalidValue {
                 row,
                 message: "value collides with MonetDB's NULL sentinel",
             });
         }
-        append(value, out);
+    }
+    #[cfg(target_endian = "little")]
+    copy_native_with_nulls(array, null.to_byte_slice(), out);
+    #[cfg(target_endian = "big")]
+    for row in 0..array.len() {
+        let value = if array.is_null(row) {
+            null
+        } else {
+            array.value(row)
+        };
+        out.extend_from_slice(value.to_le_bytes().as_ref());
     }
     Ok(())
+}
+
+#[cfg(target_endian = "little")]
+fn copy_native_with_nulls<T: ArrowPrimitiveType>(
+    array: &PrimitiveArray<T>,
+    null: &[u8],
+    out: &mut Vec<u8>,
+) {
+    let start = out.len();
+    out.extend_from_slice(array.values().inner().as_slice());
+    if array.null_count() == 0 {
+        return;
+    }
+    let width = std::mem::size_of::<T::Native>();
+    for row in 0..array.len() {
+        if array.is_null(row) {
+            let offset = start + row * width;
+            out[offset..offset + width].copy_from_slice(null);
+        }
+    }
 }
 
 fn encode_bool(array: &BooleanArray, out: &mut Vec<u8>) {
@@ -357,9 +399,7 @@ fn encode_oid(array: &UInt64Array, out: &mut Vec<u8>) -> Result<(), EncodeError>
 
 fn encode_f32(array: &Float32Array, out: &mut Vec<u8>) -> Result<(), EncodeError> {
     for row in 0..array.len() {
-        let value = if array.is_null(row) {
-            f32::NAN
-        } else {
+        if !array.is_null(row) {
             let value = array.value(row);
             if !value.is_finite() {
                 return Err(EncodeError::InvalidValue {
@@ -367,7 +407,16 @@ fn encode_f32(array: &Float32Array, out: &mut Vec<u8>) -> Result<(), EncodeError
                     message: "non-finite floats are outside MonetDB's supported value domain",
                 });
             }
-            value
+        }
+    }
+    #[cfg(target_endian = "little")]
+    copy_native_with_nulls(array, &f32::NAN.to_le_bytes(), out);
+    #[cfg(target_endian = "big")]
+    for row in 0..array.len() {
+        let value = if array.is_null(row) {
+            f32::NAN
+        } else {
+            array.value(row)
         };
         out.extend_from_slice(&value.to_le_bytes());
     }
@@ -395,9 +444,7 @@ fn encode_f16(array: &Float16Array, out: &mut Vec<u8>) -> Result<(), EncodeError
 
 fn encode_f64(array: &Float64Array, out: &mut Vec<u8>) -> Result<(), EncodeError> {
     for row in 0..array.len() {
-        let value = if array.is_null(row) {
-            f64::NAN
-        } else {
+        if !array.is_null(row) {
             let value = array.value(row);
             if !value.is_finite() {
                 return Err(EncodeError::InvalidValue {
@@ -405,7 +452,16 @@ fn encode_f64(array: &Float64Array, out: &mut Vec<u8>) -> Result<(), EncodeError
                     message: "non-finite floats are outside MonetDB's supported value domain",
                 });
             }
-            value
+        }
+    }
+    #[cfg(target_endian = "little")]
+    copy_native_with_nulls(array, &f64::NAN.to_le_bytes(), out);
+    #[cfg(target_endian = "big")]
+    for row in 0..array.len() {
+        let value = if array.is_null(row) {
+            f64::NAN
+        } else {
+            array.value(row)
         };
         out.extend_from_slice(&value.to_le_bytes());
     }
@@ -415,14 +471,28 @@ fn encode_f64(array: &Float64Array, out: &mut Vec<u8>) -> Result<(), EncodeError
 fn encode_decimal(
     array: &Decimal128Array,
     precision: u8,
+    enforce_precision: bool,
     out: &mut Vec<u8>,
 ) -> Result<(), EncodeError> {
+    if !(1..=38).contains(&precision) {
+        return Err(EncodeError::InvalidValue {
+            row: 0,
+            message: "decimal precision must be 1..=38",
+        });
+    }
+    let limit = enforce_precision.then(|| 10i128.pow(u32::from(precision)));
     for row in 0..array.len() {
         let value = if array.is_null(row) {
             None
         } else {
             Some(array.value(row))
         };
+        if value.is_some_and(|value| limit.is_some_and(|limit| value <= -limit || value >= limit)) {
+            return Err(EncodeError::InvalidValue {
+                row,
+                message: "decimal value exceeds its declared precision",
+            });
+        }
         macro_rules! narrow {
             ($type:ty) => {{
                 let wire = match value {
@@ -449,12 +519,7 @@ fn encode_decimal(
             5..=9 => narrow!(i32),
             10..=18 => narrow!(i64),
             19..=38 => narrow!(i128),
-            _ => {
-                return Err(EncodeError::InvalidValue {
-                    row,
-                    message: "decimal precision must be 1..=38",
-                });
-            }
+            _ => unreachable!("precision was validated before encoding"),
         }
     }
     Ok(())
@@ -483,9 +548,7 @@ fn encode_strings<'a>(
             },
             None => {
                 match null {
-                    Some(previous) if row - previous < 16_384 => {
-                        append_backref(row - previous, out)
-                    }
+                    Some(previous) if row - previous < 64 => append_backref(row - previous, out),
                     _ => out.extend_from_slice(&[0x80, 0]),
                 }
                 null = Some(row);
@@ -493,6 +556,28 @@ fn encode_strings<'a>(
         }
     }
     Ok(())
+}
+
+fn reserve_strings<T: Copy + Into<i64>>(
+    offsets: &[T],
+    rows: usize,
+    out: &mut Vec<u8>,
+) -> Result<(), EncodeError> {
+    let bytes = match (offsets.first(), offsets.last()) {
+        (Some(first), Some(last)) => (*last).into().checked_sub((*first).into()),
+        _ => Some(0),
+    }
+    .and_then(|bytes| usize::try_from(bytes).ok())
+    .and_then(|bytes| bytes.checked_add(rows))
+    .ok_or(EncodeError::InvalidValue {
+        row: 0,
+        message: "encoded string column length overflows",
+    })?;
+    out.try_reserve_exact(bytes)
+        .map_err(|_| EncodeError::InvalidValue {
+            row: 0,
+            message: "encoded string column is too large",
+        })
 }
 
 fn append_backref(mut distance: usize, out: &mut Vec<u8>) {
@@ -800,6 +885,7 @@ fn append_timestamp(micros: i64, row: usize, out: &mut Vec<u8>) -> Result<(), En
 fn encode_duration(
     array: &dyn Array,
     unit: TimeUnit,
+    require_whole_days: bool,
     out: &mut Vec<u8>,
 ) -> Result<(), EncodeError> {
     macro_rules! durations {
@@ -808,6 +894,7 @@ fn encode_duration(
                 downcast::<$array>(array, DataType::Duration(unit))?,
                 $mul,
                 $div,
+                require_whole_days,
                 out,
             )
         }};
@@ -824,6 +911,7 @@ fn encode_duration_values<T>(
     array: &PrimitiveArray<T>,
     multiplier: i64,
     divisor: i64,
+    require_whole_days: bool,
     out: &mut Vec<u8>,
 ) -> Result<(), EncodeError>
 where
@@ -848,6 +936,12 @@ where
                 return Err(EncodeError::InvalidValue {
                     row,
                     message: "duration collides with MonetDB's NULL sentinel",
+                });
+            }
+            if require_whole_days && value % 86_400_000 != 0 {
+                return Err(EncodeError::InvalidValue {
+                    row,
+                    message: "INTERVAL DAY value is not a whole day",
                 });
             }
             value
@@ -953,6 +1047,18 @@ mod tests {
     }
 
     #[test]
+    fn rejects_decimal_values_outside_declared_precision() {
+        let field = Field::new("d", DataType::Decimal128(9, 0), true);
+        let array = Decimal128Array::from(vec![Some(1_000_000_000)])
+            .with_precision_and_scale(9, 0)
+            .unwrap();
+        assert!(matches!(
+            encode_column(&field, &array),
+            Err(EncodeError::InvalidValue { row: 0, .. })
+        ));
+    }
+
+    #[test]
     fn encodes_strings_with_backrefs() {
         let field = Field::new("s", DataType::Utf8, true);
         let array = StringArray::from(vec![Some("foo"), None, None, Some("foo")]);
@@ -980,6 +1086,13 @@ mod tests {
         let array = StringArray::from(values);
         let encoded = encode_column(&field, &array).unwrap();
         assert_eq!(&encoded[..2], &[0x80, 0]);
+        assert_eq!(&encoded[encoded.len() - 2..], &[0x80, 0]);
+
+        let values = (0..=64)
+            .map(|row| (row != 0 && row != 64).then_some("x"))
+            .collect::<Vec<_>>();
+        let array = StringArray::from(values);
+        let encoded = encode_column(&field, &array).unwrap();
         assert_eq!(&encoded[encoded.len() - 2..], &[0x80, 0]);
     }
 
@@ -1021,6 +1134,14 @@ mod tests {
         let url = Field::new("url", DataType::Utf8, true)
             .with_metadata([("ARROW:extension:name".to_owned(), "monetdb.url".to_owned())].into());
         assert_eq!(monet_type_for_field(&url).unwrap(), MonetType::Url);
+
+        let inet = Field::new("inet", DataType::Utf8, true)
+            .with_metadata([("ARROW:extension:name".to_owned(), "monetdb.inet".to_owned())].into());
+        assert_eq!(monet_type_for_field(&inet).unwrap(), MonetType::Inet);
+        assert!(matches!(
+            encode_column(&inet, &StringArray::from(vec!["127.0.0.1"])),
+            Err(EncodeError::Unsupported(DataType::Utf8))
+        ));
     }
 
     #[test]
@@ -1052,6 +1173,24 @@ mod tests {
             encode_column(&field, &values),
             Err(EncodeError::InvalidValue { row: 0, .. })
         ));
+    }
+
+    #[test]
+    fn interval_day_requires_whole_days() {
+        let field = Field::new("d", DataType::Duration(TimeUnit::Millisecond), true).with_metadata(
+            [(
+                "ARROW:extension:name".to_owned(),
+                "monetdb.interval_day".to_owned(),
+            )]
+            .into(),
+        );
+        let invalid = DurationMillisecondArray::from(vec![Some(1_234)]);
+        assert!(matches!(
+            encode_column(&field, &invalid),
+            Err(EncodeError::InvalidValue { row: 0, .. })
+        ));
+        let valid = DurationMillisecondArray::from(vec![Some(86_400_000)]);
+        assert!(encode_column(&field, &valid).is_ok());
     }
 
     #[test]

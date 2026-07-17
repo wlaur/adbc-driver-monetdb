@@ -36,6 +36,7 @@ dev = [
     "pandas>=3.0",
     "pandas-stubs>=3.0.3.260530",
     "sqlalchemy>=2.0",
+    "pyarrow-stubs>=20.0.0.20260625",
 ]
 
 [project.urls]

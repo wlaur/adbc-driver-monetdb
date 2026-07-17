@@ -14,6 +14,8 @@ ENTRYPOINT = _native.__adbc_entrypoint__
 
 
 class DatabaseOptions(StrEnum):
+    USERNAME = "username"
+    PASSWORD = "password"
     CONNECT_TIMEOUT = "adbc.monetdb.connect_timeout_seconds"
     READ_TIMEOUT = "adbc.monetdb.read_timeout_seconds"
     WRITE_TIMEOUT = "adbc.monetdb.write_timeout_seconds"

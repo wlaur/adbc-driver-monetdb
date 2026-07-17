@@ -204,8 +204,8 @@ def _tls_uri(monetdb_uri: str, port: int, **parameters: str) -> str:
 
 def _select_42(uri: str) -> tuple[object, ...] | None:
     with dbapi.connect(uri) as connection, connection.cursor() as cursor:
-        cursor.execute("SELECT 42")  # pyright: ignore[reportUnknownMemberType]
-        return cursor.fetchone()  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+        cursor.execute("SELECT 42")
+        return cursor.fetchone()
 
 
 @pytest.mark.integration

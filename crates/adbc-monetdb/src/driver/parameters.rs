@@ -1,4 +1,7 @@
-use std::collections::HashMap;
+use std::{
+    collections::{HashMap, HashSet},
+    ops::Range,
+};
 
 use adbc_core::error::{Result, Status};
 use arrow_array::{
@@ -46,86 +49,149 @@ impl ParameterLayout {
     }
 }
 
-enum RenderValues<'a> {
-    Inspect,
-    Null,
-    Positional(&'a [String]),
-    Named(&'a HashMap<&'a str, String>),
+#[derive(Debug, Clone, Copy)]
+enum ParameterSlot {
+    Positional(usize),
+    Named(usize),
+}
+
+pub(super) struct QueryTemplate {
+    query: String,
+    segments: Vec<Range<usize>>,
+    slots: Vec<ParameterSlot>,
+    layout: ParameterLayout,
+}
+
+impl QueryTemplate {
+    pub(super) fn parse(query: &str) -> Result<Self> {
+        compile_query(query)
+    }
+
+    pub(super) fn layout(&self) -> &ParameterLayout {
+        &self.layout
+    }
+
+    pub(super) fn render_nulls(&self) -> Result<String> {
+        self.render(|_| Ok("NULL"))
+    }
+
+    pub(super) fn render_row(
+        &self,
+        batch: &RecordBatch,
+        row: usize,
+        bind_by_name: bool,
+    ) -> Result<String> {
+        let values = render_arguments(batch, row)?;
+        match &self.layout {
+            ParameterLayout::Positional(count) => {
+                if bind_by_name {
+                    return Err(error(
+                        "positional parameters cannot be bound by name",
+                        Status::InvalidArguments,
+                    ));
+                }
+                if *count != values.len() {
+                    return Err(error(
+                        format!(
+                            "query has {count} positional parameters but {} values were bound",
+                            values.len()
+                        ),
+                        Status::InvalidArguments,
+                    ));
+                }
+                self.render(|slot| match slot {
+                    ParameterSlot::Positional(index) => Ok(values[*index].as_str()),
+                    ParameterSlot::Named(_) => unreachable!("layout and slots agree"),
+                })
+            }
+            ParameterLayout::Named(names) => {
+                if !bind_by_name {
+                    return Err(error(
+                        "named parameters require adbc.statement.bind_by_name",
+                        Status::InvalidArguments,
+                    ));
+                }
+                let schema = batch.schema();
+                let mut named_values = HashMap::with_capacity(values.len());
+                for (field, value) in schema.fields().iter().zip(&values) {
+                    if named_values
+                        .insert(field.name().as_str(), value.as_str())
+                        .is_some()
+                    {
+                        return Err(error(
+                            format!("bound parameter name '{}' is duplicated", field.name()),
+                            Status::InvalidArguments,
+                        ));
+                    }
+                }
+                if let Some(missing) = names
+                    .iter()
+                    .find(|name| !named_values.contains_key(name.as_str()))
+                {
+                    return Err(error(
+                        format!("named parameter '{missing}' was not bound"),
+                        Status::InvalidArguments,
+                    ));
+                }
+                if named_values.len() > names.len() {
+                    let expected: HashSet<&str> = names.iter().map(String::as_str).collect();
+                    let extra = named_values
+                        .keys()
+                        .find(|name| !expected.contains(**name))
+                        .expect("more bound names guarantees an unexpected name");
+                    return Err(error(
+                        format!("bound parameter '{extra}' is not present in the query"),
+                        Status::InvalidArguments,
+                    ));
+                }
+                self.render(|slot| match slot {
+                    ParameterSlot::Named(index) => named_values
+                        .get(names[*index].as_str())
+                        .copied()
+                        .ok_or_else(|| {
+                            error(
+                                format!("named parameter '{}' was not bound", names[*index]),
+                                Status::InvalidArguments,
+                            )
+                        }),
+                    ParameterSlot::Positional(_) => unreachable!("layout and slots agree"),
+                })
+            }
+        }
+    }
+
+    fn render<'a>(
+        &self,
+        mut resolve: impl FnMut(&ParameterSlot) -> Result<&'a str>,
+    ) -> Result<String> {
+        let mut output = String::with_capacity(self.query.len());
+        for (segment, slot) in self.segments.iter().zip(&self.slots) {
+            output.push_str(&self.query[segment.clone()]);
+            output.push_str(resolve(slot)?);
+        }
+        if let Some(segment) = self.segments.last() {
+            output.push_str(&self.query[segment.clone()]);
+        }
+        Ok(output)
+    }
 }
 
 pub(super) fn parameter_layout(query: &str) -> Result<ParameterLayout> {
-    render_query(query, RenderValues::Inspect).map(|(_, layout)| layout)
+    Ok(QueryTemplate::parse(query)?.layout)
 }
 
 pub(super) fn render_null_parameters(query: &str) -> Result<String> {
-    render_query(query, RenderValues::Null).map(|(rendered, _)| rendered)
+    QueryTemplate::parse(query)?.render_nulls()
 }
 
+#[cfg(test)]
 pub(super) fn render_row(
     query: &str,
     batch: &RecordBatch,
     row: usize,
     bind_by_name: bool,
 ) -> Result<String> {
-    let values = render_arguments(batch, row)?;
-    let layout = parameter_layout(query)?;
-    match &layout {
-        ParameterLayout::Positional(count) => {
-            if bind_by_name {
-                return Err(error(
-                    "positional parameters cannot be bound by name",
-                    Status::InvalidArguments,
-                ));
-            }
-            if *count != values.len() {
-                return Err(error(
-                    format!(
-                        "query has {count} positional parameters but {} values were bound",
-                        values.len()
-                    ),
-                    Status::InvalidArguments,
-                ));
-            }
-            render_query(query, RenderValues::Positional(&values)).map(|(rendered, _)| rendered)
-        }
-        ParameterLayout::Named(names) => {
-            if !bind_by_name {
-                return Err(error(
-                    "named parameters require adbc.statement.bind_by_name",
-                    Status::InvalidArguments,
-                ));
-            }
-            let schema = batch.schema();
-            let mut named_values = HashMap::with_capacity(values.len());
-            for (field, value) in schema.fields().iter().zip(values) {
-                if named_values.insert(field.name().as_str(), value).is_some() {
-                    return Err(error(
-                        format!("bound parameter name '{}' is duplicated", field.name()),
-                        Status::InvalidArguments,
-                    ));
-                }
-            }
-            if let Some(missing) = names
-                .iter()
-                .find(|name| !named_values.contains_key(name.as_str()))
-            {
-                return Err(error(
-                    format!("named parameter '{missing}' was not bound"),
-                    Status::InvalidArguments,
-                ));
-            }
-            if let Some(extra) = named_values
-                .keys()
-                .find(|name| !names.iter().any(|expected| expected == **name))
-            {
-                return Err(error(
-                    format!("bound parameter '{extra}' is not present in the query"),
-                    Status::InvalidArguments,
-                ));
-            }
-            render_query(query, RenderValues::Named(&named_values)).map(|(rendered, _)| rendered)
-        }
-    }
+    QueryTemplate::parse(query)?.render_row(batch, row, bind_by_name)
 }
 
 pub(super) fn render_arguments(batch: &RecordBatch, row: usize) -> Result<Vec<String>> {
@@ -143,89 +209,70 @@ pub(super) fn render_arguments(batch: &RecordBatch, row: usize) -> Result<Vec<St
         .collect()
 }
 
-fn render_query(query: &str, values: RenderValues<'_>) -> Result<(String, ParameterLayout)> {
-    #[derive(Clone, Copy)]
-    enum State {
-        Normal,
-        SingleQuote,
-        EscapedSingleQuote,
-        RawSingleQuote,
-        DoubleQuote,
-        LineComment,
-        BlockComment,
-    }
+#[derive(Clone, Copy)]
+enum LexState {
+    Normal,
+    SingleQuote,
+    EscapedSingleQuote,
+    RawSingleQuote,
+    DoubleQuote,
+    LineComment,
+    BlockComment,
+}
 
+struct ScannedSlot {
+    range: Range<usize>,
+    name: Option<Range<usize>>,
+}
+
+struct QueryScan {
+    statements: Vec<Range<usize>>,
+    slots: Vec<ScannedSlot>,
+}
+
+fn scan_query(query: &str) -> Result<QueryScan> {
     let bytes = query.as_bytes();
-    let mut output = String::with_capacity(query.len());
-    let mut state = State::Normal;
+    let mut state = LexState::Normal;
     let mut index = 0;
-    let mut positional_count = 0;
-    let mut named = Vec::new();
-    let mut terminated = false;
+    let mut statement_start = 0;
+    let mut statement_has_code = false;
+    let mut statements = Vec::new();
+    let mut slots = Vec::new();
     while index < bytes.len() {
         let current = bytes[index];
         let next = bytes.get(index + 1).copied();
         let third = bytes.get(index + 2).copied();
         match state {
-            State::Normal => match (current, next, third) {
+            LexState::Normal => match (current, next, third) {
                 (b';', _, _) => {
-                    if terminated {
-                        return Err(error(
-                            "multiple SQL statements are not supported",
-                            Status::InvalidArguments,
-                        ));
+                    if statement_has_code {
+                        statements.push(statement_start..index);
                     }
-                    output.push(';');
-                    terminated = true;
+                    statement_start = index + 1;
+                    statement_has_code = false;
                     index += 1;
                 }
-                (_, _, _) if terminated && current.is_ascii_whitespace() => {
-                    index = copy_char(query, index, &mut output);
+                (_, _, _) if current.is_ascii_whitespace() => {
+                    index = next_char(query, index);
                 }
                 (b'-', Some(b'-'), _) => {
-                    output.push_str("--");
-                    state = State::LineComment;
+                    state = LexState::LineComment;
                     index += 2;
                 }
                 (b'#', _, _) => {
-                    output.push('#');
-                    state = State::LineComment;
+                    state = LexState::LineComment;
                     index += 1;
                 }
                 (b'/', Some(b'*'), _) => {
-                    output.push_str("/*");
-                    state = State::BlockComment;
+                    state = LexState::BlockComment;
                     index += 2;
                 }
-                (_, _, _) if terminated => {
-                    return Err(error(
-                        "multiple SQL statements are not supported",
-                        Status::InvalidArguments,
-                    ));
-                }
                 (b'?', _, _) => {
-                    if !named.is_empty() {
-                        return Err(error(
-                            "positional and named parameters cannot be mixed",
-                            Status::InvalidArguments,
-                        ));
-                    }
-                    match values {
-                        RenderValues::Inspect => {}
-                        RenderValues::Null => output.push_str("NULL"),
-                        RenderValues::Positional(values) => {
-                            if let Some(value) = values.get(positional_count) {
-                                output.push_str(value);
-                            }
-                        }
-                        RenderValues::Named(_) => {
-                            return Err(error(
-                                "positional parameters cannot be bound by name",
-                                Status::InvalidArguments,
-                            ));
-                        }
-                    }
-                    positional_count += 1;
+                    statement_has_code = true;
+                    slots.push(ScannedSlot {
+                        range: index..index + 1,
+                        name: None,
+                    });
                     index += 1;
                 }
                 (b':', Some(next), _)
@@ -233,12 +280,7 @@ fn render_query(query: &str, values: RenderValues<'_>) -> Result<(String, Parame
                         && index.checked_sub(1).and_then(|index| bytes.get(index))
                             != Some(&b':') =>
                 {
-                    if positional_count > 0 {
-                        return Err(error(
-                            "positional and named parameters cannot be mixed",
-                            Status::InvalidArguments,
-                        ));
-                    }
+                    statement_has_code = true;
                     let mut end = index + 2;
                     while bytes
                         .get(end)
@@ -246,149 +288,193 @@ fn render_query(query: &str, values: RenderValues<'_>) -> Result<(String, Parame
                     {
                         end += 1;
                     }
-                    let name = &query[index + 1..end];
-                    if !named.iter().any(|existing| existing == name) {
-                        named.push(name.to_owned());
-                    }
-                    match values {
-                        RenderValues::Inspect => {}
-                        RenderValues::Null => output.push_str("NULL"),
-                        RenderValues::Positional(_) => {
-                            return Err(error(
-                                "named parameters require adbc.statement.bind_by_name",
-                                Status::InvalidArguments,
-                            ));
-                        }
-                        RenderValues::Named(values) => {
-                            let value = values.get(name).ok_or_else(|| {
-                                error(
-                                    format!("named parameter '{name}' was not bound"),
-                                    Status::InvalidArguments,
-                                )
-                            })?;
-                            output.push_str(value);
-                        }
-                    }
+                    slots.push(ScannedSlot {
+                        range: index..end,
+                        name: Some(index + 1..end),
+                    });
                     index = end;
                 }
                 (b'r' | b'R' | b'x' | b'X', Some(b'\''), _) => {
-                    output.push(current as char);
-                    output.push('\'');
-                    state = State::RawSingleQuote;
+                    statement_has_code = true;
+                    state = LexState::RawSingleQuote;
                     index += 2;
                 }
                 (b'e' | b'E', Some(b'\''), _) => {
-                    output.push(current as char);
-                    output.push('\'');
-                    state = State::EscapedSingleQuote;
+                    statement_has_code = true;
+                    state = LexState::EscapedSingleQuote;
                     index += 2;
                 }
                 (b'u' | b'U', Some(b'&'), Some(b'\'')) => {
-                    output.push(current as char);
-                    output.push_str("&'");
-                    state = State::RawSingleQuote;
+                    statement_has_code = true;
+                    state = LexState::RawSingleQuote;
                     index += 3;
                 }
                 (b'u' | b'U', Some(b'&'), Some(b'"')) => {
-                    output.push(current as char);
-                    output.push_str("&\"");
-                    state = State::DoubleQuote;
+                    statement_has_code = true;
+                    state = LexState::DoubleQuote;
                     index += 3;
                 }
                 (b'\'', _, _) => {
-                    output.push('\'');
-                    state = State::SingleQuote;
+                    statement_has_code = true;
+                    state = LexState::SingleQuote;
                     index += 1;
                 }
                 (b'"', _, _) => {
-                    output.push('"');
-                    state = State::DoubleQuote;
+                    statement_has_code = true;
+                    state = LexState::DoubleQuote;
                     index += 1;
                 }
                 _ => {
-                    index = copy_char(query, index, &mut output);
+                    statement_has_code = true;
+                    index = next_char(query, index);
                 }
             },
-            State::SingleQuote => {
+            LexState::SingleQuote => {
                 if current == b'\\' && next == Some(b'\'') {
                     return Err(error(
                         "backslash-escaped quotes in ordinary SQL strings depend on the server's raw_strings setting; use E'...' or R'...'",
                         Status::InvalidArguments,
                     ));
                 }
-                index = copy_char(query, index, &mut output);
+                index = next_char(query, index);
                 if current == b'\'' {
                     if next == Some(b'\'') {
-                        output.push('\'');
                         index += 1;
                     } else {
-                        state = State::Normal;
+                        state = LexState::Normal;
                     }
                 }
             }
-            State::EscapedSingleQuote => {
-                index = copy_char(query, index, &mut output);
+            LexState::EscapedSingleQuote => {
+                index = next_char(query, index);
                 if current == b'\\' && index < bytes.len() {
-                    index = copy_char(query, index, &mut output);
+                    index = next_char(query, index);
                 } else if current == b'\'' {
                     if next == Some(b'\'') {
-                        output.push('\'');
                         index += 1;
                     } else {
-                        state = State::Normal;
+                        state = LexState::Normal;
                     }
                 }
             }
-            State::RawSingleQuote => {
-                index = copy_char(query, index, &mut output);
+            LexState::RawSingleQuote => {
+                index = next_char(query, index);
                 if current == b'\'' {
                     if next == Some(b'\'') {
-                        output.push('\'');
                         index += 1;
                     } else {
-                        state = State::Normal;
+                        state = LexState::Normal;
                     }
                 }
             }
-            State::DoubleQuote => {
-                index = copy_char(query, index, &mut output);
+            LexState::DoubleQuote => {
+                index = next_char(query, index);
                 if current == b'"' {
                     if next == Some(b'"') {
-                        output.push('"');
                         index += 1;
                     } else {
-                        state = State::Normal;
+                        state = LexState::Normal;
                     }
                 }
             }
-            State::LineComment => {
-                index = copy_char(query, index, &mut output);
+            LexState::LineComment => {
+                index = next_char(query, index);
                 if current == b'\n' {
-                    state = State::Normal;
+                    state = LexState::Normal;
                 }
             }
-            State::BlockComment => {
-                index = copy_char(query, index, &mut output);
+            LexState::BlockComment => {
+                index = next_char(query, index);
                 if current == b'*' && next == Some(b'/') {
-                    output.push('/');
                     index += 1;
-                    state = State::Normal;
+                    state = LexState::Normal;
                 }
             }
         }
     }
-    if !matches!(state, State::Normal | State::LineComment) {
+    if !matches!(state, LexState::Normal | LexState::LineComment) {
         return Err(error(
             "query contains an unterminated quoted string, identifier, or comment",
             Status::InvalidArguments,
         ));
+    }
+    if statement_has_code {
+        statements.push(statement_start..query.len());
+    }
+    Ok(QueryScan { statements, slots })
+}
+
+pub(super) fn unbound_statements(query: &str) -> Result<Vec<&str>> {
+    let scan = scan_query(query)?;
+    if !scan.slots.is_empty() {
+        return Err(error("parameters are not bound", Status::InvalidState));
+    }
+    if scan.statements.is_empty() {
+        return Err(error("SQL query is empty", Status::InvalidArguments));
+    }
+    Ok(scan
+        .statements
+        .into_iter()
+        .map(|range| query[range].trim())
+        .collect())
+}
+
+fn compile_query(query: &str) -> Result<QueryTemplate> {
+    let scan = scan_query(query)?;
+    if scan.statements.len() > 1 {
+        return Err(error(
+            "multiple SQL statements are not supported",
+            Status::InvalidArguments,
+        ));
+    }
+    let mut segment_start = 0;
+    let mut segments = Vec::with_capacity(scan.slots.len() + 1);
+    let mut slots = Vec::with_capacity(scan.slots.len());
+    let mut positional_count = 0;
+    let mut named = Vec::new();
+    let mut named_indices = HashMap::new();
+    for scanned in scan.slots {
+        segments.push(segment_start..scanned.range.start);
+        match scanned.name {
+            None => {
+                if !named.is_empty() {
+                    return Err(error(
+                        "positional and named parameters cannot be mixed",
+                        Status::InvalidArguments,
+                    ));
+                }
+                slots.push(ParameterSlot::Positional(positional_count));
+                positional_count += 1;
+            }
+            Some(name_range) => {
+                if positional_count > 0 {
+                    return Err(error(
+                        "positional and named parameters cannot be mixed",
+                        Status::InvalidArguments,
+                    ));
+                }
+                let name = &query[name_range];
+                let name_index = *named_indices.entry(name).or_insert_with(|| {
+                    named.push(name.to_owned());
+                    named.len() - 1
+                });
+                slots.push(ParameterSlot::Named(name_index));
+            }
+        }
+        segment_start = scanned.range.end;
     }
     let layout = if named.is_empty() {
         ParameterLayout::Positional(positional_count)
     } else {
         ParameterLayout::Named(named)
     };
-    Ok((output, layout))
+    segments.push(segment_start..query.len());
+    Ok(QueryTemplate {
+        query: query.to_owned(),
+        segments,
+        slots,
+        layout,
+    })
 }
 
 fn is_identifier_start(byte: u8) -> bool {
@@ -399,12 +485,11 @@ fn is_identifier_continue(byte: u8) -> bool {
     is_identifier_start(byte) || byte.is_ascii_digit()
 }
 
-fn copy_char(query: &str, index: usize, output: &mut String) -> usize {
+fn next_char(query: &str, index: usize) -> usize {
     let character = query[index..]
         .chars()
         .next()
         .expect("index is within the UTF-8 query");
-    output.push(character);
     index + character.len_utf8()
 }
 
@@ -835,7 +920,7 @@ fn date_from_days(days: i64) -> Result<NaiveDate> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{fmt::Write, sync::Arc, time::Duration};
 
     use arrow_array::{
         DictionaryArray, DurationMillisecondArray, Float64Array, Int8Array, Int32Array,
@@ -891,6 +976,18 @@ mod tests {
             render_null_parameters("SELECT ?, '?' /* ? */").unwrap(),
             "SELECT NULL, '?' /* ? */"
         );
+        assert_eq!(
+            unbound_statements(
+                "/* ÅÄÖ */ CREATE TABLE \"MiXeD;ÅÄÖ\"(value STRING); \
+                 INSERT INTO \"MiXeD;ÅÄÖ\" VALUES ('SeLeCt;ÅäÖ'); -- trailing ;"
+            )
+            .unwrap(),
+            [
+                "/* ÅÄÖ */ CREATE TABLE \"MiXeD;ÅÄÖ\"(value STRING)",
+                "INSERT INTO \"MiXeD;ÅÄÖ\" VALUES ('SeLeCt;ÅäÖ')"
+            ]
+        );
+        assert!(unbound_statements("SELECT ?; SELECT 1").is_err());
     }
 
     #[test]
@@ -925,14 +1022,44 @@ mod tests {
 
     #[test]
     fn preserves_utf8_in_every_lexer_state() {
-        let query = "SELECT ä, 'ö\\界', R'tail\\', X'00ff', U&'\\0061', \"列\", ? -- коммент\n/* 注釈 */ # ?";
-        let values = ["42".into()];
-        let (rendered, layout) = render_query(query, RenderValues::Positional(&values)).unwrap();
+        let query = "sElEcT ÅÄÖ, åäö, 'SeLeCt ö\\界', R'tail\\', X'00ff', U&'\\0061', \"MiXeD_列\", ? -- коммент\n/* 注釈 */ # ?";
+        let template = QueryTemplate::parse(query).unwrap();
+        let rendered = template.render(|_| Ok("42")).unwrap();
         assert_eq!(
             rendered,
-            "SELECT ä, 'ö\\界', R'tail\\', X'00ff', U&'\\0061', \"列\", 42 -- коммент\n/* 注釈 */ # ?"
+            "sElEcT ÅÄÖ, åäö, 'SeLeCt ö\\界', R'tail\\', X'00ff', U&'\\0061', \"MiXeD_列\", 42 -- коммент\n/* 注釈 */ # ?"
         );
-        assert_eq!(layout, ParameterLayout::Positional(1));
+        assert_eq!(template.layout(), &ParameterLayout::Positional(1));
+    }
+
+    #[test]
+    fn compiles_massive_bi_query_without_quadratic_parameter_lookup() {
+        let mut query = String::with_capacity(6 * 1024 * 1024);
+        query.push_str("/* BI generated ÅÄÖ */\nsElEcT\n");
+        for index in 0..75_000 {
+            if index > 0 {
+                query.push_str(",\n");
+            }
+            write!(
+                query,
+                "  :parameter_{index:05} AS \"MiXeD_ÅÄÖ_{index:05}\", 'SeLeCt ÅäÖ' AS \"LiTeRaL_{index:05}\""
+            )
+            .unwrap();
+        }
+        query.push_str("\nFROM \"FaCt_ÅÄÖ\"\n/* end BI query ÅÄÖ */");
+        assert!(query.len() > 4 * 1024 * 1024);
+
+        let started = std::time::Instant::now();
+        let template = QueryTemplate::parse(&query).unwrap();
+        let rendered = template.render_nulls().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(template.layout().count(), 75_000);
+        assert!(rendered.starts_with(
+            "/* BI generated ÅÄÖ */\nsElEcT\n  NULL AS \"MiXeD_ÅÄÖ_00000\", 'SeLeCt ÅäÖ' AS \"LiTeRaL_00000\""
+        ));
+        assert!(rendered.ends_with(
+            "NULL AS \"MiXeD_ÅÄÖ_74999\", 'SeLeCt ÅäÖ' AS \"LiTeRaL_74999\"\nFROM \"FaCt_ÅÄÖ\"\n/* end BI query ÅÄÖ */"
+        ));
     }
 
     #[test]

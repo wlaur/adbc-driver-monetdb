@@ -30,7 +30,8 @@ mod metadata;
 mod parameters;
 use metadata::{like_pattern_matches, load_objects, objects_batch, table_schema};
 use parameters::{
-    ParameterLayout, parameter_layout, render_arguments, render_null_parameters, render_row,
+    ParameterLayout, QueryTemplate, parameter_layout, render_arguments, render_null_parameters,
+    unbound_statements,
 };
 
 const DEFAULT_BATCH_ROWS: usize = 131_072;
@@ -65,21 +66,7 @@ impl TimeoutOption {
 }
 
 fn timeout_seconds(key: &str, value: &OptionValue) -> Result<i64> {
-    let seconds = match value {
-        OptionValue::String(value) => value.parse().map_err(|_| {
-            error(
-                format!("option '{key}' must be an integer number of seconds"),
-                Status::InvalidArguments,
-            )
-        })?,
-        OptionValue::Int(value) => *value,
-        _ => {
-            return Err(error(
-                format!("option '{key}' must be an integer number of seconds"),
-                Status::InvalidArguments,
-            ));
-        }
-    };
+    let seconds = integer_option(key, value)?;
     if seconds < 0 {
         return Err(error(
             format!("option '{key}' must be nonnegative"),
@@ -96,6 +83,25 @@ fn timeout_seconds(key: &str, value: &OptionValue) -> Result<i64> {
         ));
     }
     Ok(seconds)
+}
+
+fn integer_option(key: &str, value: &OptionValue) -> Result<i64> {
+    let value = match value {
+        OptionValue::String(value) => value.parse::<i64>().map_err(|_| {
+            error(
+                format!("option '{key}' must be an integer"),
+                Status::InvalidArguments,
+            )
+        })?,
+        OptionValue::Int(value) => *value,
+        _ => {
+            return Err(error(
+                format!("option '{key}' must be an integer"),
+                Status::InvalidArguments,
+            ));
+        }
+    };
+    Ok(value)
 }
 
 fn apply_parameter_timeout(
@@ -222,29 +228,22 @@ fn map_cursor_error(value: CursorError) -> Error {
         CursorError::FileTransfer(_) | CursorError::UploadRefused { .. } => Status::InvalidData,
         CursorError::PreparedResult => Status::InvalidState,
         CursorError::Metadata(_) | CursorError::Poisoned => Status::Internal,
-        CursorError::Server(ref message) => sqlstate_status(message),
+        CursorError::Server(ref error) => sqlstate_status(error.sqlstate(), error.message()),
     };
     let mut result = error(value.to_string(), status);
-    if let CursorError::Server(message) = value
-        && let Some(sqlstate) = parse_sqlstate(&message)
+    if let CursorError::Server(error) = value
+        && let Some(sqlstate) = error.sqlstate().and_then(parse_sqlstate)
     {
         result.sqlstate = sqlstate;
     }
     result
 }
 
-fn sqlstate_status(message: &str) -> Status {
-    let Some(sqlstate) = message.as_bytes().get(..5) else {
+fn sqlstate_status(sqlstate: Option<&str>, message: &str) -> Status {
+    let Some(sqlstate) = sqlstate.map(str::as_bytes) else {
         return Status::Unknown;
     };
-    if message.as_bytes().get(5) != Some(&b'!') {
-        return Status::Unknown;
-    }
-    if sqlstate == b"42000"
-        && message
-            .get(6..)
-            .is_some_and(|diagnostic| diagnostic.contains("access denied"))
-    {
+    if sqlstate == b"42000" && message.contains("access denied") {
         return Status::Unauthorized;
     }
     match sqlstate {
@@ -264,9 +263,9 @@ fn sqlstate_status(message: &str) -> Status {
     }
 }
 
-fn parse_sqlstate(message: &str) -> Option<[c_char; 5]> {
-    let code: [u8; 5] = message.as_bytes().get(..5)?.try_into().ok()?;
-    if message.as_bytes().get(5) != Some(&b'!') || !code.iter().all(u8::is_ascii_alphanumeric) {
+fn parse_sqlstate(sqlstate: &str) -> Option<[c_char; 5]> {
+    let code: [u8; 5] = sqlstate.as_bytes().try_into().ok()?;
+    if !code.iter().all(u8::is_ascii_alphanumeric) {
         return None;
     }
     Some(code.map(|byte| byte as c_char))
@@ -369,6 +368,16 @@ impl Optionable for MonetdbDatabase {
     type Option = OptionDatabase;
 
     fn set_option(&mut self, key: Self::Option, value: OptionValue) -> Result<()> {
+        if matches!(
+            key,
+            OptionDatabase::Uri | OptionDatabase::Username | OptionDatabase::Password
+        ) && !matches!(value, OptionValue::String(_))
+        {
+            return Err(error(
+                format!("database option '{}' must be a string", key.as_ref()),
+                Status::InvalidArguments,
+            ));
+        }
         if let OptionDatabase::Other(name) = &key {
             if TimeoutOption::from_key(name).is_none() {
                 return Err(not_implemented(key.as_ref()));
@@ -524,7 +533,7 @@ impl Database for MonetdbDatabase {
         .map_err(|_| {
             error(
                 "MonetDB connection initialization panicked",
-                Status::InvalidArguments,
+                Status::Internal,
             )
         })?;
         let connection = connection_result.map_err(|value| {
@@ -671,6 +680,13 @@ impl Optionable for MonetdbConnection {
     }
 
     fn get_option_string(&self, key: Self::Option) -> Result<String> {
+        if key == OptionConnection::CurrentSchema {
+            return scalar_string(
+                &self.inner,
+                "SELECT current_schema AS \"__adbc_current_schema\"",
+                self.timeouts,
+            );
+        }
         self.options.get_string(key)
     }
 
@@ -737,10 +753,12 @@ impl Connection for MonetdbConnection {
         let schemas = if include_catalog && depth != ObjectDepth::Catalogs {
             load_objects(
                 &self.inner,
+                depth,
                 db_schema,
                 table_name,
                 table_type.as_deref(),
                 column_name,
+                self.timeouts,
             )?
         } else {
             Vec::new()
@@ -761,13 +779,19 @@ impl Connection for MonetdbConnection {
                 Status::NotFound,
             ));
         }
+        let current_schema = if db_schema.is_none() {
+            Some(scalar_string(
+                &self.inner,
+                "SELECT current_schema AS \"__adbc_current_schema\"",
+                self.timeouts,
+            )?)
+        } else {
+            None
+        };
         let schema_name = db_schema
-            .or_else(|| {
-                self.options
-                    .optional_string(OptionConnection::CurrentSchema)
-            })
+            .or(current_schema.as_deref())
             .ok_or_else(|| error("current schema is not set", Status::InvalidState))?;
-        table_schema(&self.inner, schema_name, table_name)
+        table_schema(&self.inner, schema_name, table_name, self.timeouts)
     }
 
     fn get_table_types(&self) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
@@ -860,17 +884,12 @@ impl Optionable for MonetdbStatement {
             return Ok(());
         }
         if key.as_ref() == BATCH_ROWS_OPTION {
-            let OptionValue::Int(rows) = value else {
-                return Err(error(
-                    "batch_rows must be an integer",
-                    Status::InvalidArguments,
-                ));
-            };
+            let rows = integer_option(BATCH_ROWS_OPTION, &value)?;
             self.batch_rows = usize::try_from(rows)
                 .ok()
                 .filter(|rows| *rows > 0)
                 .ok_or_else(|| error("batch_rows must be positive", Status::InvalidArguments))?;
-            self.options.set(key, OptionValue::Int(rows));
+            self.options.set(key, value);
             return Ok(());
         }
         if key.as_ref() == BIND_BY_NAME_OPTION {
@@ -919,6 +938,15 @@ impl Optionable for MonetdbStatement {
             OptionStatement::TargetCatalog => {
                 return Err(not_implemented("ingest target catalogs"));
             }
+            OptionStatement::Incremental => {
+                return Err(not_implemented("incremental execution"));
+            }
+            OptionStatement::Progress | OptionStatement::MaxProgress => {
+                return Err(error(
+                    format!("option '{}' is read-only", key.as_ref()),
+                    Status::InvalidArguments,
+                ));
+            }
             _ => return Err(not_implemented(key.as_ref())),
         }
         self.options.set(key, value);
@@ -928,6 +956,20 @@ impl Optionable for MonetdbStatement {
     fn get_option_string(&self, key: Self::Option) -> Result<String> {
         if key.as_ref() == BIND_BY_NAME_OPTION {
             return Ok(self.bind_by_name.to_string());
+        }
+        if key == OptionStatement::IngestMode {
+            return Ok(self
+                .options
+                .optional_string(OptionStatement::IngestMode)
+                .unwrap_or("adbc.ingest.mode.create")
+                .to_owned());
+        }
+        if key == OptionStatement::Temporary {
+            return Ok(self
+                .options
+                .optional_string(OptionStatement::Temporary)
+                .unwrap_or("false")
+                .to_owned());
         }
         self.options.get_string(key)
     }
@@ -945,6 +987,12 @@ impl Optionable for MonetdbStatement {
     }
 
     fn get_option_double(&self, key: Self::Option) -> Result<f64> {
+        if matches!(
+            key,
+            OptionStatement::Progress | OptionStatement::MaxProgress
+        ) {
+            return Err(not_implemented("statement progress reporting"));
+        }
         self.options.get_double(key)
     }
 }
@@ -1002,6 +1050,7 @@ impl Statement for MonetdbStatement {
             .query
             .as_deref()
             .ok_or_else(|| error("SQL query is not set", Status::InvalidState))?;
+        validate_unbound_query(query)?;
         if let Some(id) = self.prepared_id {
             return query_reader_with_timeouts(
                 &self.connection,
@@ -1031,9 +1080,10 @@ impl Statement for MonetdbStatement {
             .as_deref()
             .ok_or_else(|| error("SQL query is not set", Status::InvalidState))?;
         if let Some(id) = self.prepared_id {
+            validate_unbound_query(query)?;
             return execute_update(&self.connection, &format!("EXECUTE {id}()"), self.timeouts);
         }
-        execute_update(&self.connection, query, self.timeouts)
+        execute_update_script(&self.connection, query, self.timeouts)
     }
 
     fn execute_schema(&mut self) -> Result<Schema> {
@@ -1058,9 +1108,8 @@ impl Statement for MonetdbStatement {
                 Err(value) => return Err(value),
             }
         };
-        if let Ok(connection) = lock_connection(&self.connection) {
-            connection.try_deallocate(metadata.id);
-        }
+        let connection = lock_connection(&self.connection)?;
+        connection.try_deallocate(metadata.id);
         Ok(metadata.result)
     }
 
@@ -1159,7 +1208,9 @@ fn could_not_determine_parameter_type(value: &Error) -> bool {
 impl MonetdbStatement {
     fn clear_prepared(&mut self) {
         if let Some(id) = self.prepared_id.take() {
-            let _ = execute_update(&self.connection, &format!("DEALLOCATE {id}"), self.timeouts);
+            let connection = lock_connection(&self.connection)
+                .expect("locking a poison-tolerant connection cannot fail");
+            connection.try_deallocate(id);
         }
         self.prepared_parameter_schema = None;
         self.prepared_result_schema = None;
@@ -1177,7 +1228,8 @@ impl MonetdbStatement {
             .take()
             .ok_or_else(|| error("no Arrow parameters are bound", Status::InvalidState))?;
         let schema = reader.schema();
-        let layout = parameter_layout(&query)?;
+        let template = QueryTemplate::parse(&query)?;
+        let layout = template.layout();
         if layout.is_named() != self.bind_by_name {
             return Err(error(
                 if layout.is_named() {
@@ -1200,10 +1252,15 @@ impl MonetdbStatement {
             }
             ParameterLayout::Named(names) => {
                 let fields = schema.fields();
+                let field_names = fields
+                    .iter()
+                    .map(|field| field.name().as_str())
+                    .collect::<HashSet<_>>();
                 if fields.len() != names.len()
+                    || field_names.len() != fields.len()
                     || names
                         .iter()
-                        .any(|name| !fields.iter().any(|field| field.name() == name))
+                        .any(|name| !field_names.contains(name.as_str()))
                 {
                     return Err(error(
                         "bound parameter names do not match the query",
@@ -1216,7 +1273,7 @@ impl MonetdbStatement {
         Ok(BoundQueryStream {
             reader,
             schema,
-            query,
+            template,
             prepared_id: self.prepared_id,
             bind_by_name: self.bind_by_name,
             batch: None,
@@ -1262,6 +1319,11 @@ impl MonetdbStatement {
             ));
         }
         let target = qualified_name(schema_name, table)?;
+        let operation_target = if temporary {
+            qualified_name(Some("tmp"), table)?
+        } else {
+            target.clone()
+        };
         let schema = reader.schema();
         if schema.fields().is_empty() {
             return Err(error(
@@ -1313,7 +1375,7 @@ impl MonetdbStatement {
                 "adbc.ingest.mode.append" => {}
                 "adbc.ingest.mode.replace" => {
                     cursor
-                        .execute(&format!("DROP TABLE IF EXISTS {target}"))
+                        .execute(&format!("DROP TABLE IF EXISTS {operation_target}"))
                         .map_err(map_cursor_error)?;
                     cursor.execute(&create).map_err(map_cursor_error)?;
                 }
@@ -1333,7 +1395,7 @@ impl MonetdbStatement {
                 "adbc.ingest.mode.append" | "adbc.ingest.mode.create_append"
             ) {
                 cursor
-                    .execute(&format!("SELECT * FROM {target} WHERE FALSE"))
+                    .execute(&format!("SELECT * FROM {operation_target} WHERE FALSE"))
                     .map_err(map_cursor_error)?;
                 let mismatch_status = if mode == "adbc.ingest.mode.create_append" {
                     Status::AlreadyExists
@@ -1347,7 +1409,8 @@ impl MonetdbStatement {
                 .map(|index| format!("'c{index}'"))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let copy = format!("COPY LITTLE ENDIAN BINARY INTO {target} FROM {files} ON CLIENT");
+            let copy =
+                format!("COPY LITTLE ENDIAN BINARY INTO {operation_target} FROM {files} ON CLIENT");
             let mut rows = 0i64;
             for batch in &mut reader {
                 let batch = batch.map_err(Error::from)?;
@@ -1475,19 +1538,15 @@ impl Drop for MonetdbStatement {
     }
 }
 
-struct ExecutableQuery {
-    sql: String,
-}
-
 struct BoundQueryStream {
     reader: Box<dyn RecordBatchReader + Send>,
     schema: SchemaRef,
-    query: String,
+    template: QueryTemplate,
     prepared_id: Option<u64>,
     bind_by_name: bool,
     batch: Option<RecordBatch>,
     next_row: usize,
-    pending: Option<ExecutableQuery>,
+    pending: Option<String>,
     finished: bool,
 }
 
@@ -1504,7 +1563,7 @@ impl BoundQueryStream {
 }
 
 impl Iterator for BoundQueryStream {
-    type Item = Result<ExecutableQuery>;
+    type Item = Result<String>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(query) = self.pending.take() {
@@ -1522,9 +1581,9 @@ impl Iterator for BoundQueryStream {
                 let sql = match self.prepared_id {
                     Some(id) => render_arguments(batch, row)
                         .map(|values| format!("EXECUTE {id}({})", values.join(", "))),
-                    None => render_row(&self.query, batch, row, self.bind_by_name),
+                    None => self.template.render_row(batch, row, self.bind_by_name),
                 };
-                return Some(sql.map(|sql| ExecutableQuery { sql }));
+                return Some(sql);
             }
             match self.reader.next() {
                 Some(Ok(batch)) if batch.schema() == self.schema => {
@@ -1713,14 +1772,11 @@ fn prepare_query_inner(
             let recovery = cursor
                 .execute(&format!("ROLLBACK TO SAVEPOINT {savepoint}"))
                 .and_then(|_| cursor.execute(&format!("RELEASE SAVEPOINT {savepoint}")));
-            if let Err(recovery) = recovery {
-                return Err(error(
-                    format!(
-                        "PREPARE failed ({root_cause}); restoring the transaction also failed ({recovery})"
-                    ),
-                    Status::Internal,
-                ));
-            }
+            return combine_atomic_error(
+                Err(map_cursor_error(root_cause)),
+                recovery,
+                "restoring the transaction after PREPARE",
+            );
         }
         return Err(map_cursor_error(root_cause));
     }
@@ -1811,12 +1867,11 @@ fn prepare_query_inner(
     if parsed.is_err() {
         let _ = cursor.execute(&format!("DEALLOCATE {id}"));
     }
-    if let Some(savepoint) = &savepoint {
-        cursor
-            .execute(&format!("RELEASE SAVEPOINT {savepoint}"))
-            .map_err(map_cursor_error)?;
-    }
-    parsed
+    let release = match &savepoint {
+        Some(savepoint) => cursor.execute(&format!("RELEASE SAVEPOINT {savepoint}")),
+        None => Ok(()),
+    };
+    combine_atomic_error(parsed, release, "releasing the PREPARE savepoint")
 }
 
 fn restore_declared_result_types(
@@ -1959,6 +2014,16 @@ fn query_reader_with_timeouts(
     }
     let result = cursor.binary_result().map_err(map_cursor_error)?;
     let total_rows = result.total_rows;
+    if result.is_server_resident()
+        && result
+            .columns
+            .iter()
+            .any(|column| *column.sql_type() == MonetType::Oid)
+    {
+        return Err(not_implemented(
+            "multi-row OID results are unavailable through Xexportbin; cast OID columns to VARCHAR in SQL",
+        ));
+    }
     if total_rows >= 16_384 && result.columns.len() > 1 {
         monetdb_arrow::initialize_parallel_decoder();
     }
@@ -1984,27 +2049,60 @@ fn query_reader_with_timeouts(
     }))
 }
 
-fn query_reader(
-    connection: &Arc<Mutex<monetdb::Connection>>,
-    query: &str,
-    batch_rows: usize,
-) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-    let timeouts = {
-        let connection = lock_connection(connection)?;
-        connection.timeouts()
-    };
-    query_reader_with_timeouts(connection, query, batch_rows, timeouts)
+fn is_prepare_statement(query: &str) -> bool {
+    leading_sql_keyword(query).is_some_and(|keyword| keyword.eq_ignore_ascii_case("prepare"))
 }
 
-fn is_prepare_statement(query: &str) -> bool {
-    let query = query.trim_start();
-    query
-        .get(..7)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("prepare"))
-        && query
-            .as_bytes()
-            .get(7)
-            .is_none_or(|byte| byte.is_ascii_whitespace())
+fn leading_sql_keyword(query: &str) -> Option<&str> {
+    let bytes = query.as_bytes();
+    let mut index = 0;
+    loop {
+        while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+            index += 1;
+        }
+        match (bytes.get(index), bytes.get(index + 1)) {
+            (Some(b'-'), Some(b'-')) => {
+                index += 2;
+                while bytes.get(index).is_some_and(|byte| *byte != b'\n') {
+                    index += 1;
+                }
+            }
+            (Some(b'#'), _) => {
+                index += 1;
+                while bytes.get(index).is_some_and(|byte| *byte != b'\n') {
+                    index += 1;
+                }
+            }
+            (Some(b'/'), Some(b'*')) => {
+                let end = bytes[index + 2..]
+                    .windows(2)
+                    .position(|pair| pair == b"*/")?;
+                index += end + 4;
+            }
+            _ => break,
+        }
+    }
+    let start = index;
+    while bytes
+        .get(index)
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+    {
+        index += 1;
+    }
+    (index > start).then(|| &query[start..index])
+}
+
+fn validate_unbound_query(query: &str) -> Result<()> {
+    if is_prepare_statement(query) {
+        return Err(error(
+            "execution does not accept a PREPARE statement; call Statement::prepare() instead",
+            Status::InvalidArguments,
+        ));
+    }
+    if parameter_layout(query)?.count() != 0 {
+        return Err(error("parameters are not bound", Status::InvalidState));
+    }
+    Ok(())
 }
 
 fn parameter_query_reader(
@@ -2017,7 +2115,7 @@ fn parameter_query_reader(
         .next()
         .transpose()?
         .ok_or_else(|| error("no parameter rows to execute", Status::InvalidArguments))?;
-    let current = query_reader_with_timeouts(connection, &first.sql, batch_rows, timeouts)?;
+    let current = query_reader_with_timeouts(connection, &first, batch_rows, timeouts)?;
     let schema = current.schema();
     Ok(Box::new(ParameterQueryReader {
         connection: Arc::clone(connection),
@@ -2057,11 +2155,48 @@ fn execute_update(
     query: &str,
     timeouts: Timeouts,
 ) -> Result<Option<i64>> {
+    if is_prepare_statement(query) {
+        return Err(error(
+            "execute_update() does not accept a PREPARE statement; call Statement::prepare() instead",
+            Status::InvalidArguments,
+        ));
+    }
     let connection = lock_connection(connection)?;
     let mut cursor = connection.cursor();
     cursor.set_timeouts(timeouts);
     cursor.execute(query).map_err(map_cursor_error)?;
     let affected_rows = cursor.affected_rows();
+    drop(connection);
+    Ok(affected_rows)
+}
+
+fn execute_update_script(
+    connection: &Arc<Mutex<monetdb::Connection>>,
+    query: &str,
+    timeouts: Timeouts,
+) -> Result<Option<i64>> {
+    let statements = unbound_statements(query)?;
+    if statements.iter().any(|query| is_prepare_statement(query)) {
+        return Err(error(
+            "execute_update() does not accept a PREPARE statement; call Statement::prepare() instead",
+            Status::InvalidArguments,
+        ));
+    }
+    let connection = lock_connection(connection)?;
+    let mut cursor = connection.cursor();
+    cursor.set_timeouts(timeouts);
+    let mut affected_rows = None;
+    for statement in statements {
+        cursor.execute(statement).map_err(map_cursor_error)?;
+        if let Some(rows) = cursor.affected_rows() {
+            affected_rows = Some(
+                affected_rows
+                    .unwrap_or(0i64)
+                    .checked_add(rows)
+                    .ok_or_else(|| error("affected row count overflows i64", Status::Internal))?,
+            );
+        }
+    }
     drop(connection);
     Ok(affected_rows)
 }
@@ -2104,14 +2239,15 @@ fn combine_atomic_error<T>(
 ) -> Result<T> {
     match (result, secondary) {
         (result, Ok(())) => result,
-        (Err(root), Err(secondary)) => Err(error(
-            format!("{root}; {context} also failed: {secondary}"),
-            Status::Internal,
-        )),
-        (Ok(_), Err(secondary)) => Err(error(
-            format!("{context} failed: {secondary}"),
-            Status::Internal,
-        )),
+        (Err(mut root), Err(secondary)) => {
+            root.message = format!("{}; {context} also failed: {secondary}", root.message);
+            Err(root)
+        }
+        (Ok(_), Err(secondary)) => {
+            let mut secondary = map_cursor_error(secondary);
+            secondary.message = format!("{context} failed: {}", secondary.message);
+            Err(secondary)
+        }
     }
 }
 
@@ -2169,7 +2305,7 @@ fn execute_updates_atomic(
         let mut has_count = false;
         for query in queries {
             let query = query?;
-            cursor.execute(&query.sql).map_err(map_cursor_error)?;
+            cursor.execute(&query).map_err(map_cursor_error)?;
             if let Some(rows) = cursor.affected_rows() {
                 total = total
                     .checked_add(rows)
@@ -2231,17 +2367,19 @@ impl BinaryReader {
             .batch_rows
             .min(usize::try_from(remaining).unwrap_or(usize::MAX));
         let result = if self.adopt_frame {
-            let mut response = Vec::new();
+            let capacity = monetdb_arrow::owned_frame_capacity(&self.columns, count).unwrap_or(0);
+            let mut response = Vec::with_capacity(capacity);
             self.cursor
                 .fetch_binary_into(self.next_row, count, &mut response)
                 .map_err(|value| ArrowError::ExternalError(Box::new(value)))
                 .and_then(|()| {
-                    monetdb_arrow::decode_frame_owned(
+                    monetdb_arrow::decode_frame_owned_with_schema(
                         response,
                         &self.columns,
                         self.result_id,
                         self.next_row,
                         count,
+                        Arc::clone(&self.schema),
                     )
                     .map_err(|value| ArrowError::ExternalError(Box::new(value)))
                 })
@@ -2250,12 +2388,13 @@ impl BinaryReader {
                 .fetch_binary_into(self.next_row, count, &mut self.response)
                 .map_err(|value| ArrowError::ExternalError(Box::new(value)))
                 .and_then(|()| {
-                    monetdb_arrow::decode_frame(
+                    monetdb_arrow::decode_frame_with_schema(
                         &self.response,
                         &self.columns,
                         self.result_id,
                         self.next_row,
                         count,
+                        Arc::clone(&self.schema),
                     )
                     .map_err(|value| ArrowError::ExternalError(Box::new(value)))
                 })
@@ -2326,7 +2465,7 @@ impl ParameterQueryReader {
             };
             match query_reader_with_timeouts(
                 &self.connection,
-                &query.sql,
+                &query,
                 self.batch_rows,
                 self.timeouts,
             ) {
@@ -2437,7 +2576,7 @@ mod tests {
     #[test]
     fn extracts_sqlstate() {
         assert_eq!(
-            parse_sqlstate("42000!syntax error"),
+            parse_sqlstate("42000"),
             Some([
                 b'4' as c_char,
                 b'2' as c_char,
@@ -2469,7 +2608,11 @@ mod tests {
             ("XXXXX!vendor condition", Status::Unknown),
             ("unstructured server error", Status::Unknown),
         ] {
-            assert_eq!(sqlstate_status(message), expected, "{message}");
+            let (sqlstate, diagnostic) = match message.split_once('!') {
+                Some((sqlstate, diagnostic)) => (Some(sqlstate), diagnostic),
+                None => (None, message),
+            };
+            assert_eq!(sqlstate_status(sqlstate, diagnostic), expected, "{message}");
         }
     }
 
@@ -2524,7 +2667,49 @@ mod tests {
         assert!(quote_identifier("a\0b").is_err());
         assert_eq!(decode_userinfo("").unwrap(), "");
         assert!(is_prepare_statement("  PrEpArE SELECT 1"));
+        assert!(is_prepare_statement(
+            "/* cannot obscure the statement kind */ -- comment\n PREPARE SELECT 1"
+        ));
+        assert!(is_prepare_statement("# comment\nPREPARE SELECT 1"));
         assert!(!is_prepare_statement("prepared_value"));
+        assert_eq!(
+            qualified_name(
+                Some("s'; DROP SCHEMA sys; --"),
+                "t\"; DELETE FROM guard; --"
+            )
+            .unwrap(),
+            "\"s'; DROP SCHEMA sys; --\".\"t\"\"; DELETE FROM guard; --\""
+        );
+    }
+
+    #[test]
+    fn database_standard_options_require_strings() {
+        for key in [
+            OptionDatabase::Uri,
+            OptionDatabase::Username,
+            OptionDatabase::Password,
+        ] {
+            let mut database = MonetdbDatabase::default();
+            let error = database.set_option(key, OptionValue::Int(1)).unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments);
+            assert!(error.message.contains("must be a string"));
+        }
+    }
+
+    #[test]
+    fn atomic_cleanup_keeps_the_root_status_and_sqlstate() {
+        let mut root = error("operation failed", Status::Cancelled);
+        root.sqlstate = parse_sqlstate("57014").unwrap();
+        let combined =
+            combine_atomic_error::<()>(Err(root), Err(CursorError::Closed), "transaction recovery")
+                .unwrap_err();
+        assert_eq!(combined.status, Status::Cancelled);
+        assert_eq!(combined.sqlstate, parse_sqlstate("57014").unwrap());
+        assert!(
+            combined
+                .message
+                .contains("transaction recovery also failed")
+        );
     }
 
     #[test]
