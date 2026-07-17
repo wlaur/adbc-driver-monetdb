@@ -6,7 +6,7 @@ authors = [{ name = "William Laurén", email = "lauren.william.a@gmail.com" }]
 requires-python = ">=3.13"
 readme = "README.md"
 license = "MIT AND MPL-2.0"
-license-files = ["LICENSE", "NOTICE", "monetdb-rust/LICENSE"]
+license-files = ["LICENSE", "NOTICE", "THIRD_PARTY_LICENSES", "monetdb-rust/LICENSE"]
 keywords = ["monetdb", "adbc", "arrow", "polars", "database", "driver", "olap"]
 classifiers = [
     "Intended Audience :: Developers",
@@ -27,7 +27,7 @@ dependencies = ["adbc-driver-manager>=1.11"]
 dev = [
     "maturin>=1.8.2,<2",
     "ruff",
-    "pytest",
+    "pytest>=9",
     "pyright",
     "polars>=1.42",
     "pymonetdb>=1.9",

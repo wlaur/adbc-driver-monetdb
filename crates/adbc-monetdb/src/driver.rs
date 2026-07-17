@@ -279,6 +279,10 @@ impl Options {
         self.0.insert(key.as_ref().to_owned(), value);
     }
 
+    fn remove(&mut self, key: impl AsRef<str>) {
+        self.0.remove(key.as_ref());
+    }
+
     fn get(&self, key: impl AsRef<str>) -> Option<&OptionValue> {
         self.0.get(key.as_ref())
     }
@@ -395,7 +399,11 @@ impl Optionable for MonetdbDatabase {
                 Status::NotImplemented,
             ));
         }
-        self.options.get_string(key)
+        let value = self.options.get_string(&key)?;
+        if key == OptionDatabase::Uri {
+            return uri_without_userinfo(&value);
+        }
+        Ok(value)
     }
 
     fn get_option_bytes(&self, key: Self::Option) -> Result<Vec<u8>> {
@@ -607,6 +615,18 @@ fn decode_userinfo(value: &str) -> Result<String> {
         .map_err(|value| map_display(value, Status::InvalidArguments))
 }
 
+fn uri_without_userinfo(uri: &str) -> Result<String> {
+    let mut parsed =
+        url::Url::parse(uri).map_err(|value| map_display(value, Status::InvalidArguments))?;
+    parsed
+        .set_username("")
+        .map_err(|()| error("URI user information is invalid", Status::InvalidArguments))?;
+    parsed
+        .set_password(None)
+        .map_err(|()| error("URI user information is invalid", Status::InvalidArguments))?;
+    Ok(parsed.into())
+}
+
 pub struct MonetdbConnection {
     inner: Arc<Mutex<monetdb::Connection>>,
     cancel: CancelHandle,
@@ -680,6 +700,13 @@ impl Optionable for MonetdbConnection {
     }
 
     fn get_option_string(&self, key: Self::Option) -> Result<String> {
+        if key == OptionConnection::AutoCommit {
+            return Ok(lock_connection(&self.inner)?
+                .server_info()
+                .map_err(map_cursor_error)?
+                .autocommit
+                .to_string());
+        }
         if key == OptionConnection::CurrentSchema {
             return scalar_string(
                 &self.inner,
@@ -1010,16 +1037,30 @@ impl Statement for MonetdbStatement {
 
     fn execute(&mut self) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
         if self.bound.is_some() {
+            if self
+                .options
+                .optional_string(OptionStatement::TargetTable)
+                .is_some()
+            {
+                return Err(error(
+                    "bulk ingestion requires ExecuteUpdate",
+                    Status::InvalidState,
+                ));
+            }
             if !self.prepared {
                 self.prepare()?;
             }
             let mut queries = self.take_bound_queries()?;
             if queries.is_empty()? {
-                let schema = self
-                    .prepared_result_schema
-                    .clone()
-                    .map(Arc::new)
-                    .unwrap_or_else(|| Arc::new(Schema::empty()));
+                let schema = match self.prepared_result_schema.clone() {
+                    Some(schema) => schema,
+                    None => {
+                        let schema = self.execute_schema()?;
+                        self.prepared_result_schema = Some(schema.clone());
+                        schema
+                    }
+                };
+                let schema = Arc::new(schema);
                 return Ok(Box::new(EmptyReader::new(schema)));
             }
             if self
@@ -1183,6 +1224,15 @@ impl Statement for MonetdbStatement {
 
     fn set_sql_query(&mut self, query: impl AsRef<str>) -> Result<()> {
         self.clear_prepared();
+        for key in [
+            OptionStatement::IngestMode,
+            OptionStatement::TargetCatalog,
+            OptionStatement::TargetDbSchema,
+            OptionStatement::TargetTable,
+            OptionStatement::Temporary,
+        ] {
+            self.options.remove(key);
+        }
         self.query = Some(query.as_ref().to_owned());
         Ok(())
     }
@@ -1337,6 +1387,14 @@ impl MonetdbStatement {
             if data_type == MonetType::Oid {
                 return Err(not_implemented(
                     "COPY BINARY ingestion for OID columns is not supported by MonetDB",
+                ));
+            }
+            if matches!(
+                data_type,
+                MonetType::Inet | MonetType::Inet4 | MonetType::Inet6
+            ) {
+                return Err(not_implemented(
+                    "COPY BINARY ingestion for INET columns is not supported by MonetDB",
                 ));
             }
         }
@@ -1966,12 +2024,16 @@ fn restore_declared_result_types(
 }
 
 fn prepared_monet_type(code: &str, digits: i32, scale: i32) -> Result<MonetType> {
-    let mut data_type = MonetType::from_mapi_code(code).ok_or_else(|| {
-        error(
-            format!("unknown MonetDB prepared type '{code}'"),
-            Status::InvalidData,
-        )
-    })?;
+    let mut data_type = if code.eq_ignore_ascii_case("clob") {
+        MonetType::Varchar(0)
+    } else {
+        MonetType::from_mapi_code(code).ok_or_else(|| {
+            error(
+                format!("unknown MonetDB prepared type '{code}'"),
+                Status::InvalidData,
+            )
+        })?
+    };
     match &mut data_type {
         MonetType::Decimal(precision, decimal_scale) => {
             *precision = u8::try_from(digits)
@@ -2165,7 +2227,9 @@ fn execute_update(
     let mut cursor = connection.cursor();
     cursor.set_timeouts(timeouts);
     cursor.execute(query).map_err(map_cursor_error)?;
-    let affected_rows = cursor.affected_rows();
+    let affected_rows = (!cursor.has_result_set())
+        .then(|| cursor.affected_rows())
+        .flatten();
     drop(connection);
     Ok(affected_rows)
 }
@@ -2188,7 +2252,9 @@ fn execute_update_script(
     let mut affected_rows = None;
     for statement in statements {
         cursor.execute(statement).map_err(map_cursor_error)?;
-        if let Some(rows) = cursor.affected_rows() {
+        if !cursor.has_result_set()
+            && let Some(rows) = cursor.affected_rows()
+        {
             affected_rows = Some(
                 affected_rows
                     .unwrap_or(0i64)
@@ -2740,5 +2806,13 @@ mod tests {
         let empty = info_batch((11, 55, 7), Some(HashSet::new())).unwrap();
         assert_eq!(empty.schema(), GET_INFO_SCHEMA.clone());
         assert_eq!(empty.num_rows(), 0);
+    }
+
+    #[test]
+    fn maps_legacy_clob_prepare_metadata_to_string() {
+        assert_eq!(
+            prepared_monet_type("clob", 1024, 0).unwrap(),
+            MonetType::Varchar(1024)
+        );
     }
 }

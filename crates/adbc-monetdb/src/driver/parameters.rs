@@ -230,6 +230,134 @@ struct QueryScan {
     slots: Vec<ScannedSlot>,
 }
 
+#[derive(Clone, Copy)]
+enum CreatePrefix {
+    Start,
+    Create,
+    Or,
+    Replace,
+    Modifier,
+    Procedural,
+    Other,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProceduralBlock {
+    Begin,
+    Case,
+    If,
+    While,
+}
+
+struct ProceduralScan {
+    prefix: CreatePrefix,
+    active: bool,
+    blocks: Vec<ProceduralBlock>,
+    statement_start: bool,
+    after_end: Option<ProceduralBlock>,
+}
+
+impl ProceduralScan {
+    fn new() -> Self {
+        Self {
+            prefix: CreatePrefix::Start,
+            active: false,
+            blocks: Vec::new(),
+            statement_start: true,
+            after_end: None,
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    fn observe_word(&mut self, word: &str) {
+        if !self.active {
+            self.prefix = match self.prefix {
+                CreatePrefix::Start if word.eq_ignore_ascii_case("create") => CreatePrefix::Create,
+                CreatePrefix::Start => CreatePrefix::Other,
+                CreatePrefix::Create if word.eq_ignore_ascii_case("or") => CreatePrefix::Or,
+                CreatePrefix::Create | CreatePrefix::Replace if is_routine_keyword(word) => {
+                    CreatePrefix::Procedural
+                }
+                CreatePrefix::Create | CreatePrefix::Replace if is_routine_modifier(word) => {
+                    CreatePrefix::Modifier
+                }
+                CreatePrefix::Or if word.eq_ignore_ascii_case("replace") => CreatePrefix::Replace,
+                CreatePrefix::Modifier if word.eq_ignore_ascii_case("function") => {
+                    CreatePrefix::Procedural
+                }
+                CreatePrefix::Procedural => CreatePrefix::Procedural,
+                _ => CreatePrefix::Other,
+            };
+            if matches!(self.prefix, CreatePrefix::Procedural) && word.eq_ignore_ascii_case("begin")
+            {
+                self.active = true;
+                self.blocks.push(ProceduralBlock::Begin);
+                self.statement_start = true;
+            }
+            return;
+        }
+
+        if let Some(block) = self.after_end.take()
+            && terminates_block(word, block)
+        {
+            return;
+        }
+        if word.eq_ignore_ascii_case("end") {
+            self.after_end = self.blocks.pop();
+            self.statement_start = false;
+        } else if word.eq_ignore_ascii_case("case") {
+            self.blocks.push(ProceduralBlock::Case);
+            self.statement_start = false;
+        } else if word.eq_ignore_ascii_case("if") && self.statement_start {
+            self.blocks.push(ProceduralBlock::If);
+            self.statement_start = false;
+        } else if word.eq_ignore_ascii_case("while") {
+            self.blocks.push(ProceduralBlock::While);
+            self.statement_start = false;
+        } else {
+            self.statement_start = word.eq_ignore_ascii_case("then")
+                || word.eq_ignore_ascii_case("else")
+                || word.eq_ignore_ascii_case("elseif")
+                || word.eq_ignore_ascii_case("do");
+        }
+    }
+
+    fn semicolon_is_internal(&mut self) -> bool {
+        if self.active && !self.blocks.is_empty() {
+            self.statement_start = true;
+            self.after_end = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+fn is_routine_keyword(word: &str) -> bool {
+    word.eq_ignore_ascii_case("function")
+        || word.eq_ignore_ascii_case("procedure")
+        || word.eq_ignore_ascii_case("trigger")
+}
+
+fn is_routine_modifier(word: &str) -> bool {
+    word.eq_ignore_ascii_case("aggregate")
+        || word.eq_ignore_ascii_case("filter")
+        || word.eq_ignore_ascii_case("loader")
+        || word.eq_ignore_ascii_case("window")
+}
+
+fn terminates_block(word: &str, block: ProceduralBlock) -> bool {
+    match block {
+        ProceduralBlock::Begin => false,
+        ProceduralBlock::Case => word.eq_ignore_ascii_case("case"),
+        ProceduralBlock::If => word.eq_ignore_ascii_case("if"),
+        ProceduralBlock::While => word.eq_ignore_ascii_case("while"),
+    }
+}
+
 fn scan_query(query: &str) -> Result<QueryScan> {
     let bytes = query.as_bytes();
     let mut state = LexState::Normal;
@@ -238,6 +366,7 @@ fn scan_query(query: &str) -> Result<QueryScan> {
     let mut statement_has_code = false;
     let mut statements = Vec::new();
     let mut slots = Vec::new();
+    let mut procedural = ProceduralScan::new();
     while index < bytes.len() {
         let current = bytes[index];
         let next = bytes.get(index + 1).copied();
@@ -245,11 +374,14 @@ fn scan_query(query: &str) -> Result<QueryScan> {
         match state {
             LexState::Normal => match (current, next, third) {
                 (b';', _, _) => {
-                    if statement_has_code {
-                        statements.push(statement_start..index);
+                    if !procedural.semicolon_is_internal() {
+                        if statement_has_code {
+                            statements.push(statement_start..index);
+                        }
+                        statement_start = index + 1;
+                        statement_has_code = false;
+                        procedural.reset();
                     }
-                    statement_start = index + 1;
-                    statement_has_code = false;
                     index += 1;
                 }
                 (_, _, _) if current.is_ascii_whitespace() => {
@@ -288,6 +420,14 @@ fn scan_query(query: &str) -> Result<QueryScan> {
                     {
                         end += 1;
                     }
+                    if query[end..].chars().next().is_some_and(|character| {
+                        !character.is_ascii() && character.is_alphanumeric()
+                    }) {
+                        return Err(error(
+                            "named parameter identifiers must be ASCII",
+                            Status::InvalidArguments,
+                        ));
+                    }
                     slots.push(ScannedSlot {
                         range: index..end,
                         name: Some(index + 1..end),
@@ -323,6 +463,18 @@ fn scan_query(query: &str) -> Result<QueryScan> {
                     statement_has_code = true;
                     state = LexState::DoubleQuote;
                     index += 1;
+                }
+                (_, _, _) if is_identifier_start(current) => {
+                    statement_has_code = true;
+                    let mut end = index + 1;
+                    while bytes
+                        .get(end)
+                        .is_some_and(|byte| is_identifier_continue(*byte))
+                    {
+                        end += 1;
+                    }
+                    procedural.observe_word(&query[index..end]);
+                    index = end;
                 }
                 _ => {
                     statement_has_code = true;
@@ -991,6 +1143,32 @@ mod tests {
     }
 
     #[test]
+    fn keeps_procedural_ddl_bodies_together() {
+        let function = "CREATE OR REPLACE FUNCTION procedural_f(value INT) RETURNS INT \
+                        BEGIN \
+                          IF value > 0 THEN \
+                            RETURN CASE WHEN value > 1 THEN value ELSE 1 END; \
+                          ELSE RETURN 0; END IF; \
+                          RETURN 2; /* body ; comment */ \
+                        END";
+        assert_eq!(QueryTemplate::parse(function).unwrap().layout().count(), 0);
+        assert_eq!(
+            unbound_statements(&format!("{function}; SELECT ';' AS value"))
+                .unwrap()
+                .len(),
+            2
+        );
+
+        for query in [
+            "CREATE PROCEDURE procedural_p() BEGIN TRUNCATE TABLE t; INSERT INTO t VALUES (1); END",
+            "CREATE TRIGGER procedural_t AFTER INSERT ON t BEGIN ATOMIC \
+             UPDATE t SET value = value; INSERT INTO t VALUES (';'); END",
+        ] {
+            assert_eq!(QueryTemplate::parse(query).unwrap().layout().count(), 0);
+        }
+    }
+
+    #[test]
     fn renders_named_parameters_by_field_name() {
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
@@ -1018,6 +1196,9 @@ mod tests {
         );
         assert!(render_row(query, &batch, 0, false).is_err());
         assert!(parameter_layout("SELECT ?, :named").is_err());
+        let error = parameter_layout("SELECT :naïve").unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert!(error.message.contains("must be ASCII"));
     }
 
     #[test]

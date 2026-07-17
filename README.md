@@ -181,7 +181,7 @@ covering the common SQL-driver baseline.
 | `GetInfo`, `GetObjects`, `GetTableSchema`, and `GetTableTypes` | Supported |
 | TLS and authentication | Certificate file/hash and client certificates are integration-tested; the rustls system-root path is supported |
 | Configurable connect/read/write/operation timeouts and cross-thread cancellation | Supported; timeout/cancel closes the session |
-| SQLSTATE diagnostics and semantic ADBC statuses | Supported |
+| SQLSTATE diagnostics and semantic ADBC statuses | Supported before streaming starts; mid-stream errors retain the server diagnostics in their message, but Arrow stream exceptions cannot expose structured SQLSTATE fields |
 | Python DB-API, Polars URI/connection/cursor paths, pandas, wheels, and source builds | Supported |
 
 These optional or backend-inapplicable surfaces are explicitly outside the release gate. Their

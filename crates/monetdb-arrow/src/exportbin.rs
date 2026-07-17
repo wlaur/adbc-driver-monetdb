@@ -89,13 +89,21 @@ pub fn parse_frame(frame: &[u8]) -> Result<ExportbinFrame<'_>, FrameError> {
         return Err(FrameError::Malformed("table of contents out of bounds"));
     }
 
-    let mut columns = Vec::with_capacity(header.column_count);
+    let mut ranges = Vec::with_capacity(header.column_count);
     for entry in frame[toc_pos..toc_pos + toc_len].chunks_exact(TOC_ENTRY_SIZE) {
         let start = i64::from_le_bytes(entry[..8].try_into().expect("8 bytes"));
         let length = i64::from_le_bytes(entry[8..].try_into().expect("8 bytes"));
-        let range = column_range(start, length, body_start, toc_pos)?;
-        columns.push(&frame[range]);
+        ranges.push(column_range(start, length, body_start, toc_pos)?);
     }
+    let mut occupied = ranges
+        .iter()
+        .filter(|range| !range.is_empty())
+        .collect::<Vec<_>>();
+    occupied.sort_unstable_by_key(|range| range.start);
+    if occupied.windows(2).any(|pair| pair[0].end > pair[1].start) {
+        return Err(FrameError::Malformed("column ranges overlap"));
+    }
+    let columns = ranges.into_iter().map(|range| &frame[range]).collect();
 
     Ok(ExportbinFrame {
         result_id: header.result_id,
@@ -184,7 +192,7 @@ fn find_error_message(frame: &[u8], toc_pos: i64) -> Result<String, FrameError> 
     else {
         return Err(FrameError::Malformed("invalid in-frame error offset"));
     };
-    Ok(read_error_message(frame, offset))
+    Ok(read_error_message(&frame[..frame.len() - 8], offset))
 }
 
 /// Read a `!`-prefixed, NUL-terminated error message starting at `offset`.
@@ -265,6 +273,17 @@ mod tests {
     }
 
     #[test]
+    fn excludes_the_error_offset_from_unterminated_server_text() {
+        let mut frame = b"&6 1 1 0 0\n".to_vec();
+        let error_offset = frame.len() as i64;
+        frame.extend_from_slice(b"!wrong");
+        frame.extend_from_slice(&(-error_offset).to_le_bytes());
+
+        let err = parse_frame(&frame).unwrap_err();
+        assert_eq!(err, FrameError::Server("wrong".into()));
+    }
+
+    #[test]
     fn rejects_in_frame_error_with_invalid_offset() {
         let mut frame = b"&6 1 1 0 0\n!wrong\0".to_vec();
         frame.extend_from_slice(&(-1i64).to_le_bytes());
@@ -287,6 +306,22 @@ mod tests {
         frame[len - 8..].copy_from_slice(&(len as i64).to_le_bytes());
         let err = parse_frame(&frame).unwrap_err();
         assert!(matches!(err, FrameError::Malformed(_)));
+    }
+
+    #[test]
+    fn rejects_overlapping_column_ranges() {
+        let mut frame = build_frame(1, 0, &[b"first", b"second"]);
+        let toc_pos = usize::try_from(i64::from_le_bytes(
+            frame[frame.len() - 8..].try_into().unwrap(),
+        ))
+        .unwrap();
+        let first_start = frame[toc_pos..toc_pos + 8].to_vec();
+        frame[toc_pos + TOC_ENTRY_SIZE..toc_pos + TOC_ENTRY_SIZE + 8].copy_from_slice(&first_start);
+
+        assert_eq!(
+            parse_frame(&frame),
+            Err(FrameError::Malformed("column ranges overlap"))
+        );
     }
 
     #[test]

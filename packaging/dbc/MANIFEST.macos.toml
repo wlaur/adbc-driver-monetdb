@@ -22,10 +22,15 @@ supported = [
     "update queries",
 ]
 unsupported = [
+    "cross-catalog ingestion",
     "incremental queries",
     "partitioned data",
+    "progress reporting",
+    "read-only connections",
+    "setting current catalog",
     "statistics",
     "Substrait",
+    "transaction isolation levels",
 ]
 
 [Driver]

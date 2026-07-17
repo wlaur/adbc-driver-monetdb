@@ -262,6 +262,28 @@ def test_non_binary_type_error_recommends_cast(monetdb_uri: str) -> None:
 
 
 @pytest.mark.integration
+def test_legacy_inet_fails_loudly_with_cast_guidance(monetdb_uri: str) -> None:
+    with dbapi.connect(monetdb_uri, autocommit=True) as conn, conn.cursor() as cursor:
+        try:
+            cursor.execute("CREATE TABLE legacy_inet(i INET)")
+            cursor.execute("INSERT INTO legacy_inet VALUES ('0.0.0.0'), ('192.168.1.0/24'), ('127.0.0.1')")
+            for query in [
+                "SELECT i FROM legacy_inet WHERE i = '0.0.0.0'",
+                "SELECT i FROM legacy_inet WHERE i = '192.168.1.0/24'",
+                "SELECT i FROM legacy_inet ORDER BY i",
+            ]:
+                with pytest.raises(
+                    adbc_driver_manager.DataError,
+                    match=r"INET.*cast the column to VARCHAR",
+                ):
+                    cursor.execute(query)
+            cursor.execute("SELECT CAST(i AS VARCHAR(40)) FROM legacy_inet ORDER BY i")
+            assert cursor.fetchall() == [("0.0.0.0",), ("127.0.0.1",), ("192.168.1.0/24",)]
+        finally:
+            cursor.execute("DROP TABLE IF EXISTS legacy_inet")
+
+
+@pytest.mark.integration
 def test_empty_and_null_results(monetdb_uri: str) -> None:
     with dbapi.connect(monetdb_uri) as conn:
         empty = pl.read_database("SELECT CAST(NULL AS INT) AS value WHERE FALSE", conn)
@@ -543,6 +565,40 @@ def test_parameterized_prepared_statement_requires_binding(monetdb_uri: str) -> 
 
 
 @pytest.mark.integration
+def test_query_replaces_ingest_statement_mode(monetdb_uri: str) -> None:
+    with dbapi.connect(monetdb_uri, autocommit=True) as conn, conn.cursor() as cursor:
+        try:
+            cursor.execute("CREATE TABLE query_after_ingest(value INT)")
+            assert (
+                cursor.adbc_ingest(
+                    "previous_ingest_target",
+                    pa.record_batch({"value": [1]}),
+                    mode="create",
+                )
+                == 1
+            )
+            cursor.executemany("INSERT INTO query_after_ingest VALUES (?)", [(2,), (3,)])
+
+            cursor.execute("SELECT value FROM previous_ingest_target")
+            assert cursor.fetchall() == [(1,)]
+            cursor.execute("SELECT value FROM query_after_ingest ORDER BY value")
+            assert cursor.fetchall() == [(2,), (3,)]
+        finally:
+            cursor.execute("DROP TABLE IF EXISTS previous_ingest_target")
+            cursor.execute("DROP TABLE IF EXISTS query_after_ingest")
+
+
+@pytest.mark.integration
+def test_ingest_rejects_stream_execution(monetdb_uri: str) -> None:
+    with dbapi.connect(monetdb_uri) as conn, conn.cursor() as cursor:
+        cursor.adbc_statement.set_options(**{"adbc.ingest.target_table": "unused"})
+        cursor.adbc_statement.bind(pa.record_batch({"value": [1]}))
+        with pytest.raises(adbc_driver_manager.ProgrammingError, match="ingestion requires ExecuteUpdate") as caught:
+            cursor.adbc_statement.execute_query()
+        assert caught.value.status_code == adbc_driver_manager.AdbcStatusCode.INVALID_STATE
+
+
+@pytest.mark.integration
 def test_multi_statement_queries_are_rejected_and_update_scripts_are_split_safely(
     monetdb_uri: str,
 ) -> None:
@@ -562,10 +618,38 @@ def test_multi_statement_queries_are_rejected_and_update_scripts_are_split_safel
                 "INSERT INTO injection_multi_guard VALUES (3) -- ; in comment\n;"
             )
             assert cursor.adbc_statement.execute_update() == 3
+            cursor.adbc_statement.set_sql_query(
+                "UPDATE injection_multi_guard SET value = value; SELECT value FROM injection_multi_guard ORDER BY value"
+            )
+            assert cursor.adbc_statement.execute_update() == 3
             cursor.execute("SELECT value FROM injection_multi_guard ORDER BY value")
             assert cursor.fetchall() == [(1,), (2,), (3,)]
         finally:
             cursor.execute("DROP TABLE IF EXISTS injection_multi_guard")
+
+
+@pytest.mark.integration
+def test_procedural_ddl_is_one_script_statement(monetdb_uri: str) -> None:
+    function = "adbc_procedural_script"
+    table = "adbc_procedural_result"
+    with dbapi.connect(monetdb_uri, autocommit=True) as conn, conn.cursor() as cursor:
+        try:
+            cursor.execute(f"CREATE TABLE {table}(value INT)")
+            cursor.adbc_statement.set_sql_query(
+                f"""CREATE FUNCTION {function}(value INT) RETURNS INT
+                    BEGIN
+                      IF value > 1 THEN RETURN value + 1;
+                      ELSE RETURN 0;
+                      END IF;
+                    END;
+                    INSERT INTO {table} SELECT {function}(2)"""
+            )
+            assert cursor.adbc_statement.execute_update() == 1
+            cursor.execute(f"SELECT value, {function}(1) FROM {table}")
+            assert cursor.fetchall() == [(3, 0)]
+        finally:
+            cursor.execute(f"DROP FUNCTION IF EXISTS {function}(INT)")
+            cursor.execute(f"DROP TABLE IF EXISTS {table}")
 
 
 @pytest.mark.integration
@@ -876,6 +960,8 @@ def test_empty_parameter_streams_are_successful_noops(monetdb_uri: str) -> None:
             cursor.executemany("INSERT INTO empty_parameters VALUES (?)", [])
             cursor.execute("SELECT ? AS value", pl.DataFrame({"value": pl.Series([], dtype=pl.Int32)}))
             assert cursor.fetchall() == []
+            assert cursor.description is not None
+            assert [column[0] for column in cursor.description] == ["value"]
             cursor.execute("SELECT COUNT(*) FROM empty_parameters")
             assert cursor.fetchone() == (0,)
         finally:
@@ -896,6 +982,16 @@ def test_enabling_autocommit_commits_the_open_transaction(monetdb_uri: str) -> N
     finally:
         with dbapi.connect(monetdb_uri, autocommit=True) as cleanup, cleanup.cursor() as cursor:
             cursor.execute("DROP TABLE IF EXISTS autocommit_transition")
+
+
+@pytest.mark.integration
+def test_autocommit_option_tracks_sql_transaction_control(monetdb_uri: str) -> None:
+    with dbapi.connect(monetdb_uri, autocommit=True) as conn, conn.cursor() as cursor:
+        assert conn.adbc_connection.get_option("adbc.connection.autocommit") == "true"
+        cursor.execute("START TRANSACTION")
+        assert conn.adbc_connection.get_option("adbc.connection.autocommit") == "false"
+        cursor.execute("COMMIT")
+        assert conn.adbc_connection.get_option("adbc.connection.autocommit") == "true"
 
 
 @pytest.mark.integration
