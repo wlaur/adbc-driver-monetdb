@@ -543,6 +543,37 @@ def test_parameterized_prepared_statement_requires_binding(monetdb_uri: str) -> 
 
 
 @pytest.mark.integration
+def test_query_replaces_ingest_statement_mode(monetdb_uri: str) -> None:
+    with dbapi.connect(monetdb_uri, autocommit=True) as conn, conn.cursor() as cursor:
+        try:
+            cursor.execute("CREATE TABLE query_after_ingest(value INT)")
+            assert cursor.adbc_ingest(
+                "previous_ingest_target",
+                pa.record_batch({"value": [1]}),
+                mode="create",
+            ) == 1
+            cursor.executemany("INSERT INTO query_after_ingest VALUES (?)", [(2,), (3,)])
+
+            cursor.execute("SELECT value FROM previous_ingest_target")
+            assert cursor.fetchall() == [(1,)]
+            cursor.execute("SELECT value FROM query_after_ingest ORDER BY value")
+            assert cursor.fetchall() == [(2,), (3,)]
+        finally:
+            cursor.execute("DROP TABLE IF EXISTS previous_ingest_target")
+            cursor.execute("DROP TABLE IF EXISTS query_after_ingest")
+
+
+@pytest.mark.integration
+def test_ingest_rejects_stream_execution(monetdb_uri: str) -> None:
+    with dbapi.connect(monetdb_uri) as conn, conn.cursor() as cursor:
+        cursor.adbc_statement.set_options(**{"adbc.ingest.target_table": "unused"})
+        cursor.adbc_statement.bind(pa.record_batch({"value": [1]}))
+        with pytest.raises(adbc_driver_manager.ProgrammingError, match="ingestion requires ExecuteUpdate") as caught:
+            cursor.adbc_statement.execute_query()
+        assert caught.value.status_code == adbc_driver_manager.AdbcStatusCode.INVALID_STATE
+
+
+@pytest.mark.integration
 def test_multi_statement_queries_are_rejected_and_update_scripts_are_split_safely(
     monetdb_uri: str,
 ) -> None:
@@ -876,6 +907,8 @@ def test_empty_parameter_streams_are_successful_noops(monetdb_uri: str) -> None:
             cursor.executemany("INSERT INTO empty_parameters VALUES (?)", [])
             cursor.execute("SELECT ? AS value", pl.DataFrame({"value": pl.Series([], dtype=pl.Int32)}))
             assert cursor.fetchall() == []
+            assert cursor.description is not None
+            assert [column[0] for column in cursor.description] == ["value"]
             cursor.execute("SELECT COUNT(*) FROM empty_parameters")
             assert cursor.fetchone() == (0,)
         finally:

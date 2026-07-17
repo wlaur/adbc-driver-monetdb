@@ -279,6 +279,10 @@ impl Options {
         self.0.insert(key.as_ref().to_owned(), value);
     }
 
+    fn remove(&mut self, key: impl AsRef<str>) {
+        self.0.remove(key.as_ref());
+    }
+
     fn get(&self, key: impl AsRef<str>) -> Option<&OptionValue> {
         self.0.get(key.as_ref())
     }
@@ -1010,16 +1014,30 @@ impl Statement for MonetdbStatement {
 
     fn execute(&mut self) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
         if self.bound.is_some() {
+            if self
+                .options
+                .optional_string(OptionStatement::TargetTable)
+                .is_some()
+            {
+                return Err(error(
+                    "bulk ingestion requires ExecuteUpdate",
+                    Status::InvalidState,
+                ));
+            }
             if !self.prepared {
                 self.prepare()?;
             }
             let mut queries = self.take_bound_queries()?;
             if queries.is_empty()? {
-                let schema = self
-                    .prepared_result_schema
-                    .clone()
-                    .map(Arc::new)
-                    .unwrap_or_else(|| Arc::new(Schema::empty()));
+                let schema = match self.prepared_result_schema.clone() {
+                    Some(schema) => schema,
+                    None => {
+                        let schema = self.execute_schema()?;
+                        self.prepared_result_schema = Some(schema.clone());
+                        schema
+                    }
+                };
+                let schema = Arc::new(schema);
                 return Ok(Box::new(EmptyReader::new(schema)));
             }
             if self
@@ -1183,6 +1201,15 @@ impl Statement for MonetdbStatement {
 
     fn set_sql_query(&mut self, query: impl AsRef<str>) -> Result<()> {
         self.clear_prepared();
+        for key in [
+            OptionStatement::IngestMode,
+            OptionStatement::TargetCatalog,
+            OptionStatement::TargetDbSchema,
+            OptionStatement::TargetTable,
+            OptionStatement::Temporary,
+        ] {
+            self.options.remove(key);
+        }
         self.query = Some(query.as_ref().to_owned());
         Ok(())
     }
