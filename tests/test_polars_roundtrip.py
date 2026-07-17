@@ -593,6 +593,11 @@ def test_multi_statement_queries_are_rejected_and_update_scripts_are_split_safel
                 "INSERT INTO injection_multi_guard VALUES (3) -- ; in comment\n;"
             )
             assert cursor.adbc_statement.execute_update() == 3
+            cursor.adbc_statement.set_sql_query(
+                "UPDATE injection_multi_guard SET value = value; "
+                "SELECT value FROM injection_multi_guard ORDER BY value"
+            )
+            assert cursor.adbc_statement.execute_update() == 3
             cursor.execute("SELECT value FROM injection_multi_guard ORDER BY value")
             assert cursor.fetchall() == [(1,), (2,), (3,)]
         finally:

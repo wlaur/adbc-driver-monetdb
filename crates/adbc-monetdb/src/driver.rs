@@ -1993,12 +1993,16 @@ fn restore_declared_result_types(
 }
 
 fn prepared_monet_type(code: &str, digits: i32, scale: i32) -> Result<MonetType> {
-    let mut data_type = MonetType::from_mapi_code(code).ok_or_else(|| {
-        error(
-            format!("unknown MonetDB prepared type '{code}'"),
-            Status::InvalidData,
-        )
-    })?;
+    let mut data_type = if code.eq_ignore_ascii_case("clob") {
+        MonetType::Varchar(0)
+    } else {
+        MonetType::from_mapi_code(code).ok_or_else(|| {
+            error(
+                format!("unknown MonetDB prepared type '{code}'"),
+                Status::InvalidData,
+            )
+        })?
+    };
     match &mut data_type {
         MonetType::Decimal(precision, decimal_scale) => {
             *precision = u8::try_from(digits)
@@ -2192,7 +2196,9 @@ fn execute_update(
     let mut cursor = connection.cursor();
     cursor.set_timeouts(timeouts);
     cursor.execute(query).map_err(map_cursor_error)?;
-    let affected_rows = cursor.affected_rows();
+    let affected_rows = (!cursor.has_result_set())
+        .then(|| cursor.affected_rows())
+        .flatten();
     drop(connection);
     Ok(affected_rows)
 }
@@ -2215,7 +2221,9 @@ fn execute_update_script(
     let mut affected_rows = None;
     for statement in statements {
         cursor.execute(statement).map_err(map_cursor_error)?;
-        if let Some(rows) = cursor.affected_rows() {
+        if !cursor.has_result_set()
+            && let Some(rows) = cursor.affected_rows()
+        {
             affected_rows = Some(
                 affected_rows
                     .unwrap_or(0i64)
@@ -2767,5 +2775,13 @@ mod tests {
         let empty = info_batch((11, 55, 7), Some(HashSet::new())).unwrap();
         assert_eq!(empty.schema(), GET_INFO_SCHEMA.clone());
         assert_eq!(empty.num_rows(), 0);
+    }
+
+    #[test]
+    fn maps_legacy_clob_prepare_metadata_to_string() {
+        assert_eq!(
+            prepared_monet_type("clob", 1024, 0).unwrap(),
+            MonetType::Varchar(1024)
+        );
     }
 }

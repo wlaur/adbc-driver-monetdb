@@ -288,6 +288,14 @@ fn scan_query(query: &str) -> Result<QueryScan> {
                     {
                         end += 1;
                     }
+                    if query[end..].chars().next().is_some_and(|character| {
+                        !character.is_ascii() && character.is_alphanumeric()
+                    }) {
+                        return Err(error(
+                            "named parameter identifiers must be ASCII",
+                            Status::InvalidArguments,
+                        ));
+                    }
                     slots.push(ScannedSlot {
                         range: index..end,
                         name: Some(index + 1..end),
@@ -1018,6 +1026,9 @@ mod tests {
         );
         assert!(render_row(query, &batch, 0, false).is_err());
         assert!(parameter_layout("SELECT ?, :named").is_err());
+        let error = parameter_layout("SELECT :naïve").unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert!(error.message.contains("must be ASCII"));
     }
 
     #[test]
