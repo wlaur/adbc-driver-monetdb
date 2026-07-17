@@ -111,12 +111,15 @@ with dbapi.connect(
         DatabaseOptions.CONNECT_TIMEOUT: "10",
         DatabaseOptions.OPERATION_TIMEOUT: "120",
     },
-    conn_kwargs={ConnectionOptions.READ_TIMEOUT: "30"},
+    conn_kwargs={
+        ConnectionOptions.READ_TIMEOUT: "30",
+        ConnectionOptions.WRITE_BATCH_ROWS: "100000",
+    },
 ) as conn:
     with conn.cursor(
         adbc_stmt_kwargs={
             StatementOptions.OPERATION_TIMEOUT: "15",
-            StatementOptions.BATCH_ROWS: "65536",
+            StatementOptions.READ_BATCH_ROWS: "65536",
         }
     ) as cursor:
         frame = pl.read_database("SELECT * FROM trades", cursor)
@@ -128,8 +131,13 @@ cursor; it has no `engine="adbc"` parameter. Polars calls `connection.cursor()` 
 `execute_options` are forwarded to `Cursor.execute`: use a sequence for positional `?` values
 and a dictionary for named `:name` values.
 `adbc_stmt_kwargs` is not an execute option. Polars' `batch_size` does not configure
-`adbc.monetdb.batch_rows`, and `DataFrame.write_database(..., engine_options=...)` supplies
-ingestion arguments rather than connection or timeout options.
+`adbc.monetdb.read_batch_rows`, and `DataFrame.write_database(..., engine_options=...)` supplies
+ingestion arguments rather than connection or timeout options. The read batch default is 131,072
+rows, matching PyArrow Dataset Scanner's default. Ingestion preserves the incoming Arrow stream's
+batches by default; setting `adbc.monetdb.write_batch_rows` to a positive value zero-copy slices
+larger input batches before each COPY, while zero keeps the upstream boundaries. Set it through
+`conn_kwargs` as above when `DataFrame.write_database` creates its own cursor, or through
+`adbc_stmt_kwargs` for a directly managed cursor.
 
 The examples use strings because `adbc-driver-manager` publishes string-valued type hints for
 database and connection option mappings. Statement options also accept native integers through the
@@ -265,12 +273,18 @@ guidance.
 ```sh
 git clone --recurse-submodules https://github.com/wlaur/adbc-driver-monetdb
 uv sync                                # installs deps + builds the extension via maturin
-uv run pytest -m "not integration"     # python tests (no server needed)
+uv run pytest -m "not integration and not local_only"  # python tests (no server needed)
 cargo test --workspace                 # rust tests
 
 # integration tests against a real server:
-docker compose up -d
-MONETDB_TEST_URI=monetdb://monetdb:monetdb@localhost:50000/test uv run pytest -m integration
+docker compose -f compose.yaml up -d
+MONETDB_TEST_URI=monetdb://monetdb:monetdb@localhost:50000/test \
+    uv run pytest -m "integration and not local_only"
+
+# manual ~30 GiB logical float32 ingest (8M rows x 1,000 columns, 100k batches):
+MONETDB_RUN_LOCAL_BENCHMARK=1 \
+MONETDB_TEST_URI=monetdb://monetdb:monetdb@localhost:50000/test \
+    uv run pytest tests/test_local_benchmark.py -m local_only -q -s
 
 # run the reusable ADBC conformance suite:
 MONETDB_TEST_URI=monetdb://monetdb:monetdb@localhost:50000/test \

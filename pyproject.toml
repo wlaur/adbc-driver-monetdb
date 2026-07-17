@@ -70,7 +70,30 @@ test-command = 'python -c "import adbc_driver_monetdb as m; print(m.driver_path(
 
 [tool.cibuildwheel.linux]
 # The manylinux image lacks Rust; install the current stable toolchain for maturin.
-before-all = "curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable"
+before-all = '''
+rustup_machine=$(uname -m)
+case "$rustup_machine" in
+  x86_64)
+    rustup_target=x86_64-unknown-linux-gnu
+    rustup_sha256=20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c
+    ;;
+  aarch64)
+    rustup_target=aarch64-unknown-linux-gnu
+    rustup_sha256=e3853c5a252fca15252d07cb23a1bdd9377a8c6f3efa01531109281ae47f841c
+    ;;
+  *)
+    echo "unsupported rustup architecture: $rustup_machine" >&2
+    exit 1
+    ;;
+esac
+rustup_init=/tmp/rustup-init-1.28.2
+curl --proto '=https' --tlsv1.2 -sSfL \
+  "https://static.rust-lang.org/rustup/archive/1.28.2/$rustup_target/rustup-init" \
+  -o "$rustup_init"
+printf '%s  %s\n' "$rustup_sha256" "$rustup_init" | sha256sum --check --strict
+chmod +x "$rustup_init"
+"$rustup_init" -y --profile minimal --default-toolchain stable --no-modify-path
+'''
 environment = { PATH = "$HOME/.cargo/bin:$PATH" }
 repair-wheel-command = "auditwheel repair -w {dest_dir} {wheel}"
 
@@ -109,7 +132,7 @@ lint.ignore = ["ISC001"]
 max-complexity = 10
 
 [tool.pyright]
-include = ["adbc_driver_monetdb", "tests"]
+include = ["adbc_driver_monetdb", "packaging", "tests"]
 venvPath = "."
 venv = ".venv"
 typeCheckingMode = "strict"
@@ -126,6 +149,7 @@ addopts = "--strict-markers"
 testpaths = ["tests"]
 markers = [
     "integration: requires a running MonetDB server (set MONETDB_TEST_URI)",
+    "local_only: manual benchmark excluded from CI (requires MONETDB_RUN_LOCAL_BENCHMARK=1)",
     "feature: validation test for an ADBC feature",
     "requires_features: validation test gated by advertised driver features",
 ]

@@ -26,13 +26,16 @@ class ConnectionOptions(StrEnum):
     READ_TIMEOUT = "adbc.monetdb.read_timeout_seconds"
     WRITE_TIMEOUT = "adbc.monetdb.write_timeout_seconds"
     OPERATION_TIMEOUT = "adbc.monetdb.operation_timeout_seconds"
+    READ_BATCH_ROWS = "adbc.monetdb.read_batch_rows"
+    WRITE_BATCH_ROWS = "adbc.monetdb.write_batch_rows"
 
 
 class StatementOptions(StrEnum):
     READ_TIMEOUT = "adbc.monetdb.read_timeout_seconds"
     WRITE_TIMEOUT = "adbc.monetdb.write_timeout_seconds"
     OPERATION_TIMEOUT = "adbc.monetdb.operation_timeout_seconds"
-    BATCH_ROWS = "adbc.monetdb.batch_rows"
+    READ_BATCH_ROWS = "adbc.monetdb.read_batch_rows"
+    WRITE_BATCH_ROWS = "adbc.monetdb.write_batch_rows"
 
 
 def driver_path() -> str:

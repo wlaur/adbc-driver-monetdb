@@ -14,6 +14,7 @@ PLATFORMS = {
     "windows_amd64": ("MANIFEST.windows.toml", ".pyd"),
 }
 LICENSE_MEMBERS = {
+    "/licenses/LICENSE": "LICENSE",
     "/licenses/NOTICE": "NOTICE",
     "/licenses/monetdb-rust/LICENSE": "LICENSE.monetdb-rust",
 }
@@ -55,7 +56,10 @@ def build_package(wheel: Path, platform: str, out_dir: Path, license_path: Path)
         ]
         if len(native_members) != 1:
             raise ValueError(f"expected one native driver in {wheel}, found {native_members}")
-        files = {driver_name: wheel_archive.read(native_members[0]), "LICENSE": license_path.read_bytes()}
+        files = {
+            driver_name: wheel_archive.read(native_members[0]),
+            "THIRD_PARTY_LICENSES": license_path.read_bytes(),
+        }
         for suffix, archive_name in LICENSE_MEMBERS.items():
             members = [name for name in wheel_archive.namelist() if name.endswith(suffix)]
             if len(members) != 1:

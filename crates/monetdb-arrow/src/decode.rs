@@ -38,6 +38,7 @@ pub enum DecodeError {
     RowCount { requested: usize, actual: usize },
     ColumnCount { expected: usize, actual: usize },
     Length { expected: usize, actual: usize },
+    InvalidColumn { message: &'static str },
     InvalidValue { row: usize, message: &'static str },
     InvalidUtf8 { row: usize },
     InvalidBackref { row: usize },
@@ -71,6 +72,7 @@ impl fmt::Display for DecodeError {
             Self::Length { expected, actual } => {
                 write!(f, "column has {actual} bytes; expected {expected}")
             }
+            Self::InvalidColumn { message } => write!(f, "invalid column: {message}"),
             Self::InvalidValue { row, message } => {
                 write!(f, "invalid value at row {row}: {message}")
             }
@@ -119,16 +121,14 @@ impl From<monetdb::CursorError> for DecodeError {
 }
 
 fn decimal_scale(scale: u8) -> Result<i8, DecodeError> {
-    i8::try_from(scale).map_err(|_| DecodeError::InvalidValue {
-        row: 0,
+    i8::try_from(scale).map_err(|_| DecodeError::InvalidColumn {
         message: "decimal scale exceeds Arrow's maximum of 127",
     })
 }
 
 fn decimal_data_type(precision: u8, scale: u8) -> Result<DataType, DecodeError> {
     if !(1..=38).contains(&precision) || scale > precision {
-        return Err(DecodeError::InvalidValue {
-            row: 0,
+        return Err(DecodeError::InvalidColumn {
             message: "decimal precision/scale must satisfy 1 <= precision <= 38 and scale <= precision",
         });
     }
@@ -330,16 +330,14 @@ pub fn decode_frame_owned_with_schema(
             .map(|bytes| {
                 frame_bytes = frame_bytes.saturating_add(bytes.len());
                 let start = (bytes.as_ptr() as usize).checked_sub(base).ok_or(
-                    DecodeError::InvalidValue {
-                        row: 0,
+                    DecodeError::InvalidColumn {
                         message: "column pointer precedes its frame allocation",
                     },
                 )?;
                 let end = start
                     .checked_add(bytes.len())
                     .filter(|end| *end <= frame.len())
-                    .ok_or(DecodeError::InvalidValue {
-                        row: 0,
+                    .ok_or(DecodeError::InvalidColumn {
                         message: "column range exceeds its frame allocation",
                     })?;
                 Ok(start..end)
@@ -728,8 +726,7 @@ fn null_wire_value(data_type: &MonetType) -> Result<Vec<u8>, DecodeError> {
             10..=18 => i64::MIN.to_le_bytes().to_vec(),
             19..=38 => i128::MIN.to_le_bytes().to_vec(),
             _ => {
-                return Err(DecodeError::InvalidValue {
-                    row: 0,
+                return Err(DecodeError::InvalidColumn {
                     message: "decimal precision must be between 1 and 38",
                 });
             }
@@ -769,8 +766,7 @@ fn decimal_wire_value(value: i128, precision: u8) -> Result<Vec<u8>, DecodeError
         10..=18 => narrow!(i64),
         19..=38 => value.to_le_bytes().to_vec(),
         _ => {
-            return Err(DecodeError::InvalidValue {
-                row: 0,
+            return Err(DecodeError::InvalidColumn {
                 message: "decimal precision must be between 1 and 38",
             });
         }
@@ -1034,8 +1030,7 @@ pub fn decode_column(
 }
 
 fn expect_fixed(bytes: &[u8], rows: usize, width: usize) -> Result<(), DecodeError> {
-    let expected = rows.checked_mul(width).ok_or(DecodeError::InvalidValue {
-        row: 0,
+    let expected = rows.checked_mul(width).ok_or(DecodeError::InvalidColumn {
         message: "column length overflows",
     })?;
     if bytes.len() != expected {
@@ -1098,8 +1093,7 @@ fn decode_decimal(
     hugeint: bool,
 ) -> Result<Decimal128Array, DecodeError> {
     if !(1..=38).contains(&precision) || scale < 0 || scale > precision as i8 {
-        return Err(DecodeError::InvalidValue {
-            row: 0,
+        return Err(DecodeError::InvalidColumn {
             message: "decimal precision/scale must satisfy 1 <= precision <= 38 and 0 <= scale <= precision",
         });
     }
@@ -1164,15 +1158,13 @@ fn decode_decimal(
 
 pub(crate) fn decode_strings(bytes: &[u8], rows: usize) -> Result<StringArray, DecodeError> {
     if rows > bytes.len() {
-        return Err(DecodeError::InvalidValue {
-            row: 0,
+        return Err(DecodeError::InvalidColumn {
             message: "string column contains fewer encoded bytes than declared rows",
         });
     }
     if bytes.len() > i32::MAX as usize {
-        return Err(DecodeError::InvalidValue {
-            row: 0,
-            message: "UTF-8 column exceeds Arrow's 32-bit offset limit; lower adbc.monetdb.batch_rows",
+        return Err(DecodeError::InvalidColumn {
+            message: "UTF-8 column exceeds Arrow's 32-bit offset limit; lower adbc.monetdb.read_batch_rows",
         });
     }
     if let Some(array) = decode_strings_without_backrefs(bytes, rows)? {
@@ -1223,7 +1215,7 @@ fn decode_strings_without_backrefs(
         if value_bytes > i32::MAX as usize {
             return Err(DecodeError::InvalidValue {
                 row,
-                message: "UTF-8 column exceeds Arrow's 32-bit offset limit; lower adbc.monetdb.batch_rows",
+                message: "UTF-8 column exceeds Arrow's 32-bit offset limit; lower adbc.monetdb.read_batch_rows",
             });
         }
         builder.append_value(value);
@@ -1343,8 +1335,7 @@ fn long_backref(bytes: &[u8], row: usize) -> Result<(usize, usize), DecodeError>
 }
 
 fn decode_blob(bytes: &[u8], rows: usize) -> Result<BinaryArray, DecodeError> {
-    let minimum = rows.checked_mul(8).ok_or(DecodeError::InvalidValue {
-        row: 0,
+    let minimum = rows.checked_mul(8).ok_or(DecodeError::InvalidColumn {
         message: "BLOB header length overflows",
     })?;
     if minimum > bytes.len() {
@@ -1354,8 +1345,7 @@ fn decode_blob(bytes: &[u8], rows: usize) -> Result<BinaryArray, DecodeError> {
         });
     }
     if bytes.len().saturating_sub(minimum) > i32::MAX as usize {
-        return Err(DecodeError::InvalidValue {
-            row: 0,
+        return Err(DecodeError::InvalidColumn {
             message: "BLOB column exceeds Arrow's 32-bit offset limit",
         });
     }
@@ -1549,8 +1539,7 @@ fn decode_inet(bytes: &[u8], rows: usize) -> Result<StringArray, DecodeError> {
     } else if bytes.len() == rows.saturating_mul(16) {
         16
     } else {
-        return Err(DecodeError::InvalidValue {
-            row: 0,
+        return Err(DecodeError::InvalidColumn {
             message: "INET column length is neither 4 nor 16 bytes per row",
         });
     };
@@ -1935,11 +1924,11 @@ mod tests {
     fn rejects_hostile_variable_width_metadata_without_allocating() {
         assert!(matches!(
             decode_strings(b"\0", usize::MAX),
-            Err(DecodeError::InvalidValue { .. })
+            Err(DecodeError::InvalidColumn { .. })
         ));
         assert!(matches!(
             decode_blob(&[0; 8], usize::MAX),
-            Err(DecodeError::InvalidValue { .. })
+            Err(DecodeError::InvalidColumn { .. })
         ));
     }
 
@@ -1959,16 +1948,16 @@ mod tests {
     fn rejects_decimal_scale_outside_arrow_range() {
         assert!(matches!(
             data_type_for_monet_type(&MonetType::Decimal(38, 128)),
-            Err(DecodeError::InvalidValue { .. })
+            Err(DecodeError::InvalidColumn { .. })
         ));
         assert!(matches!(
             decode_column(&MonetType::Decimal(38, 128), &[0; 16], 1),
-            Err(DecodeError::InvalidValue { .. })
+            Err(DecodeError::InvalidColumn { .. })
         ));
         for data_type in [MonetType::Decimal(0, 0), MonetType::Decimal(38, 39)] {
             assert!(matches!(
                 data_type_for_monet_type(&data_type),
-                Err(DecodeError::InvalidValue { .. })
+                Err(DecodeError::InvalidColumn { .. })
             ));
         }
     }
@@ -2185,7 +2174,7 @@ mod tests {
         ));
         assert!(matches!(
             decode_inet(&[1, 2, 3, 4, 5], 1),
-            Err(DecodeError::InvalidValue { row: 0, .. })
+            Err(DecodeError::InvalidColumn { .. })
         ));
         let ipv6_nil = decode_inet(&[0; 16], 1).unwrap();
         assert!(ipv6_nil.is_null(0));
