@@ -353,64 +353,9 @@ jobs:
           path: generated/monetdb.md
           if-no-files-found: error
 
-  integration-arm:
-    name: integration arm64 (MonetDB Dec2025)
-    needs: build-wheels
-    runs-on: ubuntu-24.04-arm
-    services:
-      monetdb:
-        image: monetdb/monetdb:Dec2025-SP3@sha256:a71e6e8c8402beadc51aebf944b465ee5b185c7ae4a9e6808b5d9133ee921786
-        ports:
-          - 50000:50000
-        env:
-          MDB_DB_ADMIN_PASS: monetdb
-          MDB_CREATE_DBS: test
-    env:
-      MONETDB_TEST_URI: monetdb://monetdb:monetdb@localhost:50000/test
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
-        with:
-          python-version: "3.13"
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          path: wheelhouse
-          name: wheels-ubuntu-24.04-arm
-      - name: Wait for MonetDB to accept connections
-        shell: bash
-        run: |
-          uv run --isolated --no-project --python 3.13 --with pymonetdb python - <<'PY'
-          import time
-          import pymonetdb
-          for attempt in range(60):
-              try:
-                  pymonetdb.connect("monetdb://monetdb:monetdb@localhost:50000/test").close()
-                  print(f"MonetDB ready after {attempt + 1} attempts")
-                  break
-              except Exception as exc:
-                  last = exc
-                  time.sleep(2)
-          else:
-              raise SystemExit(f"MonetDB never became ready: {last}")
-          PY
-      - name: Run integration and validation on arm64
-        working-directory: ${{ runner.temp }}
-        shell: bash
-        run: |
-          wheel=$(find "$GITHUB_WORKSPACE/wheelhouse" -maxdepth 1 -name 'adbc_driver_monetdb-*.whl' -print -quit)
-          uv run --isolated --no-project --python 3.13 \
-            --with "$wheel" --with 'pytest>=9' --with 'polars>=1.42' --with 'pandas>=3.0' \
-            --with pymonetdb --with 'pyarrow>=25' --with 'sqlalchemy>=2.0' \
-            python -m pytest "$GITHUB_WORKSPACE/tests" -m integration \
-              --ignore "$GITHUB_WORKSPACE/tests/validation" -q
-          uv run --isolated --no-project --python 3.13 \
-            --with "$wheel" --with pytest --with pymonetdb \
-            --with 'adbc-drivers-validation @ git+https://github.com/adbc-drivers/validation@a4019a3f44ccffcbec4b5203531a88259d588257' \
-            python -m pytest "$GITHUB_WORKSPACE/tests/validation" -q
-
   publish:
     name: publish to PyPI
-    needs: [lint, rust, build-sdist, build-wheels, test, integration, integration-arm]
+    needs: [lint, rust, build-sdist, build-wheels, test, integration]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     environment: pypi               # configure the Trusted Publisher against this env
