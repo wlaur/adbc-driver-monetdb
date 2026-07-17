@@ -136,7 +136,6 @@ pub fn sql_type_for_field(field: &Field) -> Result<String, EncodeError> {
         MonetType::Json => "JSON".into(),
         MonetType::Uuid => "UUID".into(),
         MonetType::Geometry => "GEOMETRY".into(),
-        MonetType::GeometryA => "GEOMETRYA".into(),
         MonetType::Xml => "XML".into(),
     })
 }
@@ -300,7 +299,6 @@ fn fixed_wire_width(field: &Field, data_type: &DataType) -> Result<Option<usize>
         | MonetType::Inet
         | MonetType::Json
         | MonetType::Geometry
-        | MonetType::GeometryA
         | MonetType::Xml => None,
     })
 }
