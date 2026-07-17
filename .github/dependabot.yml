@@ -8,6 +8,16 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    groups:
+      arrow:
+        patterns: ["arrow-*"]
+      adbc:
+        patterns: ["adbc_*"]
+    ignore:
+      # adbc_core 0.23 pins arrow <59. Remove this when adbc_core allows the next
+      # Arrow major, then bump adbc_core/adbc_ffi/arrow together in one PR.
+      - dependency-name: "arrow-*"
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: uv
     directory: /
     schedule:

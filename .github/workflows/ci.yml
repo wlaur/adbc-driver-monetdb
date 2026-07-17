@@ -3,6 +3,7 @@ name: CI/release
 # lint          -> ruff check + format, pyright (strict)
 # rust          -> cargo fmt, clippy (-D warnings), workspace tests
 # build-sdist   -> sdist, then rebuild and smoke-test a wheel from that sdist
+# license-report-> dependency license roll-up used by every dbc package
 # build-wheels  -> one abi3 (cp313) wheel per platform via cibuildwheel + maturin
 # test          -> install each prebuilt wheel + run the python suite, every OS x py
 # integration   -> wheel against a dockerized MonetDB (Dec2025-SP3)
@@ -60,6 +61,8 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo test --locked --workspace
+      - run: cargo test --locked --all-features
+        working-directory: monetdb-rust
       - name: Audit Rust dependencies
         run: |
           cargo install cargo-audit --version 0.22.2 --locked
@@ -71,6 +74,30 @@ jobs:
         run: |
           revision=$(git submodule status monetdb-rust | awk '{print $1}' | sed 's/^[+-]//')
           grep -F "monetdb-rust/tree/$revision" NOTICE
+
+  license-report:
+    name: dependency license report
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: true
+      - name: Install current stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Generate and validate the dependency license roll-up
+        run: |
+          cargo install cargo-about --version 0.9.1 --locked --features cli
+          cargo about generate --all-features --fail --locked \
+            --target aarch64-apple-darwin,aarch64-unknown-linux-gnu,x86_64-pc-windows-msvc,x86_64-unknown-linux-gnu \
+            license.tpl > THIRD_PARTY_LICENSES
+          test -s THIRD_PARTY_LICENSES
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dependency-licenses
+          path: THIRD_PARTY_LICENSES
+          if-no-files-found: error
 
   build-sdist:
     name: build sdist
@@ -104,6 +131,7 @@ jobs:
 
   build-wheels:
     name: build ${{ matrix.os }}
+    needs: license-report
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -141,7 +169,14 @@ jobs:
           assert len(wheels) == 1, wheels
           with ZipFile(wheels[0]) as wheel:
               names = set(wheel.namelist())
-          for suffix in (".dist-info/licenses/LICENSE", ".dist-info/licenses/NOTICE", ".dist-info/licenses/monetdb-rust/LICENSE"):
+          for suffix in (
+              ".dist-info/licenses/LICENSE",
+              ".dist-info/licenses/NOTICE",
+              ".dist-info/licenses/monetdb-rust/LICENSE",
+              "adbc_driver_monetdb/_native.pyi",
+              "adbc_driver_monetdb/dbapi.pyi",
+              "adbc_driver_monetdb/py.typed",
+          ):
               assert any(name.endswith(suffix) for name in names), suffix
           PY
       - name: Audit Linux wheel dependencies
@@ -172,12 +207,16 @@ jobs:
           if (-not ($headers -match "machine \(x64\)")) { throw "extension is not x86-64 PE" }
           $forbidden = $imports | Select-String -Pattern '(?i)\b(?:MSVCP|CONCRT)[^\s]*\.dll\b'
           if ($forbidden) { throw "extension unexpectedly depends on the C++ runtime: $forbidden" }
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dependency-licenses
       - name: Build and load the dbc package
         shell: bash
         run: |
           wheel=$(find wheelhouse -maxdepth 1 -name 'adbc_driver_monetdb-*.whl' -print -quit)
           python packaging/dbc/build_package.py \
-            --wheel "$wheel" --platform '${{ matrix.dbc_platform }}' --out-dir dbc-dist
+            --wheel "$wheel" --platform '${{ matrix.dbc_platform }}' --out-dir dbc-dist \
+            --license THIRD_PARTY_LICENSES
           driver_path="$RUNNER_TEMP/adbc-drivers"
           mkdir -p "$driver_path"
           ADBC_DRIVER_PATH="$driver_path" uvx --from 'dbc==0.3.0' \
@@ -290,10 +329,81 @@ jobs:
           uv run --isolated --no-project --python 3.13 \
             --with "$wheel" --with pytest --with pymonetdb \
             --with 'adbc-drivers-validation @ git+https://github.com/adbc-drivers/validation@a4019a3f44ccffcbec4b5203531a88259d588257' \
+            python -m pytest "$GITHUB_WORKSPACE/tests/validation" -q \
+              -o junit_family=xunit1 -o junit_suite_name=validation \
+              --junit-xml="$RUNNER_TEMP/validation-report.xml"
+      - name: Generate the validation documentation page
+        shell: bash
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          PYTHONPATH="$GITHUB_WORKSPACE/tests" uv run --isolated --no-project --python 3.13 \
+            --with 'adbc-drivers-validation @ git+https://github.com/adbc-drivers/validation@a4019a3f44ccffcbec4b5203531a88259d588257' \
+            python -m validation.generate_documentation \
+              --report "$RUNNER_TEMP/validation-report.xml" --output generated
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: documentation
+          path: generated/monetdb.md
+          if-no-files-found: error
+
+  integration-arm:
+    name: integration arm64 (MonetDB Dec2025)
+    needs: build-wheels
+    runs-on: ubuntu-24.04-arm
+    services:
+      monetdb:
+        image: monetdb/monetdb:Dec2025-SP3@sha256:a71e6e8c8402beadc51aebf944b465ee5b185c7ae4a9e6808b5d9133ee921786
+        ports:
+          - 50000:50000
+        env:
+          MDB_DB_ADMIN_PASS: monetdb
+          MDB_CREATE_DBS: test
+    env:
+      MONETDB_TEST_URI: monetdb://monetdb:monetdb@localhost:50000/test
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          python-version: "3.13"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: wheelhouse
+          name: wheels-ubuntu-24.04-arm
+      - name: Wait for MonetDB to accept connections
+        shell: bash
+        run: |
+          uv run --isolated --no-project --python 3.13 --with pymonetdb python - <<'PY'
+          import time
+          import pymonetdb
+          for attempt in range(60):
+              try:
+                  pymonetdb.connect("monetdb://monetdb:monetdb@localhost:50000/test").close()
+                  print(f"MonetDB ready after {attempt + 1} attempts")
+                  break
+              except Exception as exc:
+                  last = exc
+                  time.sleep(2)
+          else:
+              raise SystemExit(f"MonetDB never became ready: {last}")
+          PY
+      - name: Run integration and validation on arm64
+        working-directory: ${{ runner.temp }}
+        shell: bash
+        run: |
+          wheel=$(find "$GITHUB_WORKSPACE/wheelhouse" -maxdepth 1 -name 'adbc_driver_monetdb-*.whl' -print -quit)
+          uv run --isolated --no-project --python 3.13 \
+            --with "$wheel" --with 'pytest>=9' --with 'polars>=1.42' --with 'pandas>=3.0' \
+            --with pymonetdb --with 'pyarrow>=25' --with 'sqlalchemy>=2.0' \
+            python -m pytest "$GITHUB_WORKSPACE/tests" -m integration \
+              --ignore "$GITHUB_WORKSPACE/tests/validation" -q
+          uv run --isolated --no-project --python 3.13 \
+            --with "$wheel" --with pytest --with pymonetdb \
+            --with 'adbc-drivers-validation @ git+https://github.com/adbc-drivers/validation@a4019a3f44ccffcbec4b5203531a88259d588257' \
             python -m pytest "$GITHUB_WORKSPACE/tests/validation" -q
+
   publish:
     name: publish to PyPI
-    needs: [lint, rust, build-sdist, build-wheels, test, integration]
+    needs: [lint, rust, build-sdist, build-wheels, test, integration, integration-arm]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     environment: pypi               # configure the Trusted Publisher against this env
@@ -304,12 +414,28 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Verify the tag matches the pyproject version
         run: |
-          version=$(grep -m1 '^version' pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/')
-          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
-            echo "::error::tag $GITHUB_REF_NAME does not match pyproject version $version (expected v$version)"
-            exit 1
-          fi
-          echo "tag $GITHUB_REF_NAME matches pyproject version $version"
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import tomllib
+
+          root = Path.cwd()
+          project = tomllib.loads((root / "pyproject.toml").read_text())["project"]["version"]
+          cargo = tomllib.loads((root / "Cargo.toml").read_text())["workspace"]["package"]["version"]
+          manifests = {
+              path.name: tomllib.loads(path.read_text())["version"]
+              for path in (root / "packaging" / "dbc").glob("MANIFEST.*.toml")
+          }
+          versions = {"pyproject.toml": project, "Cargo.toml": cargo, **manifests}
+          mismatches = {name: value for name, value in versions.items() if value != project}
+          expected_tag = f"v{project}"
+          if mismatches or os.environ["GITHUB_REF_NAME"] != expected_tag:
+              raise SystemExit(
+                  f"release versions/tag disagree: versions={versions}, "
+                  f"tag={os.environ['GITHUB_REF_NAME']!r}, expected={expected_tag!r}"
+              )
+          print(f"tag {expected_tag} matches every release version")
+          PY
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
@@ -328,7 +454,28 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: release/wheels
+          pattern: wheels-*
+          merge-multiple: true
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: release/sdist
+          name: sdist
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: release/dbc
+          pattern: dbc-*
+          merge-multiple: true
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: release/docs
+          name: documentation
       - name: Create the GitHub Release with auto-generated notes
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
+        run: |
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --verify-tag --generate-notes \
+            release/wheels/*.whl release/sdist/*.tar.gz release/dbc/*.tar.gz release/docs/monetdb.md
