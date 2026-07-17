@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt,
     num::NonZeroUsize,
+    ops::Range,
     os::raw::c_char,
     sync::{
         Arc, Mutex, MutexGuard,
@@ -34,9 +35,10 @@ use parameters::{
     unbound_statements,
 };
 
-const DEFAULT_BATCH_ROWS: usize = 131_072;
+const DEFAULT_READ_BATCH_ROWS: usize = 131_072;
 const METADATA_REPLY_ROWS: usize = 1024;
-const BATCH_ROWS_OPTION: &str = "adbc.monetdb.batch_rows";
+const READ_BATCH_ROWS_OPTION: &str = "adbc.monetdb.read_batch_rows";
+const WRITE_BATCH_ROWS_OPTION: &str = "adbc.monetdb.write_batch_rows";
 const BIND_BY_NAME_OPTION: &str = "adbc.statement.bind_by_name";
 const CONNECT_TIMEOUT_OPTION: &str = "adbc.monetdb.connect_timeout_seconds";
 const READ_TIMEOUT_OPTION: &str = "adbc.monetdb.read_timeout_seconds";
@@ -102,6 +104,27 @@ fn integer_option(key: &str, value: &OptionValue) -> Result<i64> {
         }
     };
     Ok(value)
+}
+
+fn read_batch_rows_option(value: &OptionValue) -> Result<usize> {
+    let rows = integer_option(READ_BATCH_ROWS_OPTION, value)?;
+    usize::try_from(rows)
+        .ok()
+        .filter(|rows| *rows > 0)
+        .ok_or_else(|| error("read_batch_rows must be positive", Status::InvalidArguments))
+}
+
+fn write_batch_rows_option(value: &OptionValue) -> Result<Option<usize>> {
+    let rows = integer_option(WRITE_BATCH_ROWS_OPTION, value)?;
+    if rows == 0 {
+        return Ok(None);
+    }
+    usize::try_from(rows).map(Some).map_err(|_| {
+        error(
+            "write_batch_rows must be non-negative",
+            Status::InvalidArguments,
+        )
+    })
 }
 
 fn apply_parameter_timeout(
@@ -597,6 +620,8 @@ impl Database for MonetdbDatabase {
             inner,
             cancel,
             timeouts,
+            read_batch_rows: DEFAULT_READ_BATCH_ROWS,
+            write_batch_rows: None,
             options,
             version,
             catalog,
@@ -631,6 +656,8 @@ pub struct MonetdbConnection {
     inner: Arc<Mutex<monetdb::Connection>>,
     cancel: CancelHandle,
     timeouts: Timeouts,
+    read_batch_rows: usize,
+    write_batch_rows: Option<usize>,
     options: Options,
     version: (u16, u16, u16),
     catalog: String,
@@ -644,6 +671,16 @@ impl Optionable for MonetdbConnection {
             && let Some(timeout) = TimeoutOption::from_key(name)
         {
             set_runtime_timeout(&mut self.timeouts, timeout, name, &value)?;
+            self.options.set(key, value);
+            return Ok(());
+        }
+        if key.as_ref() == READ_BATCH_ROWS_OPTION {
+            self.read_batch_rows = read_batch_rows_option(&value)?;
+            self.options.set(key, value);
+            return Ok(());
+        }
+        if key.as_ref() == WRITE_BATCH_ROWS_OPTION {
+            self.write_batch_rows = write_batch_rows_option(&value)?;
             self.options.set(key, value);
             return Ok(());
         }
@@ -722,6 +759,18 @@ impl Optionable for MonetdbConnection {
     }
 
     fn get_option_int(&self, key: Self::Option) -> Result<i64> {
+        if key.as_ref() == READ_BATCH_ROWS_OPTION {
+            return i64::try_from(self.read_batch_rows)
+                .map_err(|_| error("read_batch_rows exceeds i64", Status::Internal));
+        }
+        if key.as_ref() == WRITE_BATCH_ROWS_OPTION {
+            return self
+                .write_batch_rows
+                .map(i64::try_from)
+                .transpose()
+                .map_err(|_| error("write_batch_rows exceeds i64", Status::Internal))
+                .map(|rows| rows.unwrap_or(0));
+        }
         self.options.get_int(key)
     }
 
@@ -740,7 +789,8 @@ impl Connection for MonetdbConnection {
             timeouts: self.timeouts,
             options: Options::default(),
             query: None,
-            batch_rows: DEFAULT_BATCH_ROWS,
+            read_batch_rows: self.read_batch_rows,
+            write_batch_rows: self.write_batch_rows,
             bound: None,
             prepared: false,
             prepared_id: None,
@@ -892,7 +942,8 @@ pub struct MonetdbStatement {
     timeouts: Timeouts,
     options: Options,
     query: Option<String>,
-    batch_rows: usize,
+    read_batch_rows: usize,
+    write_batch_rows: Option<usize>,
     bound: Option<Box<dyn RecordBatchReader + Send>>,
     prepared: bool,
     prepared_id: Option<u64>,
@@ -910,12 +961,13 @@ impl Optionable for MonetdbStatement {
             self.options.set(key, value);
             return Ok(());
         }
-        if key.as_ref() == BATCH_ROWS_OPTION {
-            let rows = integer_option(BATCH_ROWS_OPTION, &value)?;
-            self.batch_rows = usize::try_from(rows)
-                .ok()
-                .filter(|rows| *rows > 0)
-                .ok_or_else(|| error("batch_rows must be positive", Status::InvalidArguments))?;
+        if key.as_ref() == READ_BATCH_ROWS_OPTION {
+            self.read_batch_rows = read_batch_rows_option(&value)?;
+            self.options.set(key, value);
+            return Ok(());
+        }
+        if key.as_ref() == WRITE_BATCH_ROWS_OPTION {
+            self.write_batch_rows = write_batch_rows_option(&value)?;
             self.options.set(key, value);
             return Ok(());
         }
@@ -1006,9 +1058,17 @@ impl Optionable for MonetdbStatement {
     }
 
     fn get_option_int(&self, key: Self::Option) -> Result<i64> {
-        if key.as_ref() == BATCH_ROWS_OPTION {
-            return i64::try_from(self.batch_rows)
-                .map_err(|_| error("batch_rows exceeds i64", Status::Internal));
+        if key.as_ref() == READ_BATCH_ROWS_OPTION {
+            return i64::try_from(self.read_batch_rows)
+                .map_err(|_| error("read_batch_rows exceeds i64", Status::Internal));
+        }
+        if key.as_ref() == WRITE_BATCH_ROWS_OPTION {
+            return self
+                .write_batch_rows
+                .map(i64::try_from)
+                .transpose()
+                .map_err(|_| error("write_batch_rows exceeds i64", Status::Internal))
+                .map(|rows| rows.unwrap_or(0));
         }
         self.options.get_int(key)
     }
@@ -1083,7 +1143,7 @@ impl Statement for MonetdbStatement {
             return parameter_query_reader(
                 &self.connection,
                 queries,
-                self.batch_rows,
+                self.read_batch_rows,
                 self.timeouts,
             );
         }
@@ -1092,15 +1152,7 @@ impl Statement for MonetdbStatement {
             .as_deref()
             .ok_or_else(|| error("SQL query is not set", Status::InvalidState))?;
         validate_unbound_query(query)?;
-        if let Some(id) = self.prepared_id {
-            return query_reader_with_timeouts(
-                &self.connection,
-                &format!("EXECUTE {id}()"),
-                self.batch_rows,
-                self.timeouts,
-            );
-        }
-        query_reader_with_timeouts(&self.connection, query, self.batch_rows, self.timeouts)
+        query_reader_with_timeouts(&self.connection, query, self.read_batch_rows, self.timeouts)
     }
 
     fn execute_update(&mut self) -> Result<Option<i64>> {
@@ -1120,10 +1172,6 @@ impl Statement for MonetdbStatement {
             .query
             .as_deref()
             .ok_or_else(|| error("SQL query is not set", Status::InvalidState))?;
-        if let Some(id) = self.prepared_id {
-            validate_unbound_query(query)?;
-            return execute_update(&self.connection, &format!("EXECUTE {id}()"), self.timeouts);
-        }
         execute_update_script(&self.connection, query, self.timeouts)
     }
 
@@ -1481,43 +1529,47 @@ impl MonetdbStatement {
                 if batch.num_rows() == 0 {
                     continue;
                 }
-                cursor
-                    .execute_with_binary_uploads_lazy(&copy, |filename| {
-                        let index = filename
-                            .strip_prefix('c')
-                            .and_then(|value| value.parse::<usize>().ok())
-                            .filter(|index| *index < schema.fields().len())
-                            .ok_or_else(|| {
-                                CursorError::FileTransfer(format!(
-                                    "server requested unknown file {filename:?}"
-                                ))
-                            })?;
-                        monetdb_arrow::encode_column(
-                            &schema.fields()[index],
-                            batch.column(index).as_ref(),
+                let write_batch_rows = self.write_batch_rows.unwrap_or(batch.num_rows());
+                for range in batch_ranges(batch.num_rows(), write_batch_rows) {
+                    let batch = batch.slice(range.start, range.len());
+                    cursor
+                        .execute_with_binary_uploads_lazy(&copy, |filename| {
+                            let index = filename
+                                .strip_prefix('c')
+                                .and_then(|value| value.parse::<usize>().ok())
+                                .filter(|index| *index < schema.fields().len())
+                                .ok_or_else(|| {
+                                    CursorError::FileTransfer(format!(
+                                        "server requested unknown file {filename:?}"
+                                    ))
+                                })?;
+                            monetdb_arrow::encode_column(
+                                &schema.fields()[index],
+                                batch.column(index).as_ref(),
+                            )
+                            .map_err(|value| CursorError::FileTransfer(value.to_string()))
+                        })
+                        .map_err(map_cursor_error)?;
+                    let server_rows = cursor.affected_rows().ok_or_else(|| {
+                        error(
+                            "MonetDB did not report the COPY row count",
+                            Status::InvalidData,
                         )
-                        .map_err(|value| CursorError::FileTransfer(value.to_string()))
-                    })
-                    .map_err(map_cursor_error)?;
-                let server_rows = cursor.affected_rows().ok_or_else(|| {
-                    error(
-                        "MonetDB did not report the COPY row count",
-                        Status::InvalidData,
-                    )
-                })?;
-                let expected_rows = i64::try_from(batch.num_rows())
-                    .map_err(|_| error("batch row count exceeds i64", Status::Internal))?;
-                if server_rows != expected_rows {
-                    return Err(error(
-                        format!(
-                            "MonetDB copied {server_rows} rows from a batch containing {expected_rows} rows"
-                        ),
-                        Status::InvalidData,
-                    ));
+                    })?;
+                    let expected_rows = i64::try_from(batch.num_rows())
+                        .map_err(|_| error("batch row count exceeds i64", Status::Internal))?;
+                    if server_rows != expected_rows {
+                        return Err(error(
+                            format!(
+                                "MonetDB copied {server_rows} rows from a batch containing {expected_rows} rows"
+                            ),
+                            Status::InvalidData,
+                        ));
+                    }
+                    rows = rows.checked_add(server_rows).ok_or_else(|| {
+                        error("ingested row count overflows i64", Status::Internal)
+                    })?;
                 }
-                rows = rows
-                    .checked_add(server_rows)
-                    .ok_or_else(|| error("ingested row count overflows i64", Status::Internal))?;
             }
             Ok(rows)
         })();
@@ -1530,6 +1582,14 @@ impl MonetdbStatement {
         )
         .map(Some)
     }
+}
+
+fn batch_ranges(rows: usize, batch_rows: usize) -> impl Iterator<Item = Range<usize>> {
+    debug_assert!(batch_rows > 0);
+    (0..rows).step_by(batch_rows).map(move |start| {
+        let len = (rows - start).min(batch_rows);
+        start..start + len
+    })
 }
 
 fn validate_append_schema(
@@ -2728,6 +2788,55 @@ mod tests {
     }
 
     #[test]
+    fn validates_separate_read_and_write_batch_options() {
+        assert_eq!(
+            read_batch_rows_option(&OptionValue::String("131072".into())).unwrap(),
+            DEFAULT_READ_BATCH_ROWS
+        );
+        assert_eq!(write_batch_rows_option(&OptionValue::Int(0)).unwrap(), None);
+        assert_eq!(
+            write_batch_rows_option(&OptionValue::Int(100_000)).unwrap(),
+            Some(100_000)
+        );
+        for value in [OptionValue::Int(0), OptionValue::Int(-1)] {
+            assert!(read_batch_rows_option(&value).is_err());
+        }
+        assert!(write_batch_rows_option(&OptionValue::Int(-1)).is_err());
+        assert!(write_batch_rows_option(&OptionValue::Double(1.0)).is_err());
+    }
+
+    #[test]
+    fn timeout_options_follow_uri_database_connection_statement_precedence() {
+        let mut parameters =
+            Parameters::from_url("monetdb://localhost/test?read_timeout=7").unwrap();
+        apply_parameter_timeout(
+            &mut parameters,
+            TimeoutOption::Read,
+            READ_TIMEOUT_OPTION,
+            &OptionValue::String("6".into()),
+        )
+        .unwrap();
+        apply_parameter_timeout(
+            &mut parameters,
+            TimeoutOption::Read,
+            READ_TIMEOUT_OPTION,
+            &OptionValue::String("5".into()),
+        )
+        .unwrap();
+        let (_, mut timeouts) = configured_timeouts(&parameters).unwrap();
+        assert_eq!(timeouts.read, Some(Duration::from_secs(5)));
+
+        set_runtime_timeout(
+            &mut timeouts,
+            TimeoutOption::Read,
+            READ_TIMEOUT_OPTION,
+            &OptionValue::String("4".into()),
+        )
+        .unwrap();
+        assert_eq!(timeouts.read, Some(Duration::from_secs(4)));
+    }
+
+    #[test]
     fn quotes_identifiers() {
         assert_eq!(quote_identifier("a\"b").unwrap(), "\"a\"\"b\"");
         assert!(quote_identifier("a\0b").is_err());
@@ -2814,5 +2923,14 @@ mod tests {
             prepared_monet_type("clob", 1024, 0).unwrap(),
             MonetType::Varchar(1024)
         );
+    }
+
+    #[test]
+    fn ingest_ranges_bound_each_copy_batch() {
+        assert_eq!(
+            batch_ranges(250_001, 100_000).collect::<Vec<_>>(),
+            [0..100_000, 100_000..200_000, 200_000..250_001]
+        );
+        assert!(batch_ranges(0, 100_000).next().is_none());
     }
 }

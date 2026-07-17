@@ -185,14 +185,15 @@ fn column_range(
 /// `documentation/source/binary-resultset.rst` defines the negated value as
 /// the byte offset from the start of the response.
 fn find_error_message(frame: &[u8], toc_pos: i64) -> Result<String, FrameError> {
+    let message_end = frame.len() - 8;
     let Some(offset) = toc_pos
         .checked_neg()
         .and_then(|offset| usize::try_from(offset).ok())
-        .filter(|&offset| frame.get(offset) == Some(&b'!'))
+        .filter(|&offset| offset < message_end && frame.get(offset) == Some(&b'!'))
     else {
         return Err(FrameError::Malformed("invalid in-frame error offset"));
     };
-    Ok(read_error_message(&frame[..frame.len() - 8], offset))
+    Ok(read_error_message(&frame[..message_end], offset))
 }
 
 /// Read a `!`-prefixed, NUL-terminated error message starting at `offset`.
@@ -287,6 +288,18 @@ mod tests {
     fn rejects_in_frame_error_with_invalid_offset() {
         let mut frame = b"&6 1 1 0 0\n!wrong\0".to_vec();
         frame.extend_from_slice(&(-1i64).to_le_bytes());
+
+        let err = parse_frame(&frame).unwrap_err();
+        assert_eq!(err, FrameError::Malformed("invalid in-frame error offset"));
+    }
+
+    #[test]
+    fn rejects_in_frame_error_offset_into_trailer() {
+        let error_offset = 223i64;
+        let mut frame = b"&6 1 1 0 0\n".to_vec();
+        frame.resize(error_offset as usize, 0);
+        frame.extend_from_slice(&(-error_offset).to_le_bytes());
+        assert_eq!(frame[error_offset as usize], b'!');
 
         let err = parse_frame(&frame).unwrap_err();
         assert_eq!(err, FrameError::Malformed("invalid in-frame error offset"));

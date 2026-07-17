@@ -123,7 +123,7 @@ pub(super) fn load_objects(
     "#
     );
     let mut reader =
-        query_reader_with_timeouts(connection, &query, super::DEFAULT_BATCH_ROWS, timeouts)?;
+        query_reader_with_timeouts(connection, &query, super::DEFAULT_READ_BATCH_ROWS, timeouts)?;
     let mut schemas = Vec::<ObjectSchema>::new();
     for batch in &mut reader {
         let batch = batch.map_err(Error::from)?;
@@ -219,7 +219,7 @@ fn load_schemas(
         .unwrap_or_default();
     let query = format!("SELECT name FROM sys.schemas {predicate} ORDER BY name");
     let mut reader =
-        query_reader_with_timeouts(connection, &query, super::DEFAULT_BATCH_ROWS, timeouts)?;
+        query_reader_with_timeouts(connection, &query, super::DEFAULT_READ_BATCH_ROWS, timeouts)?;
     let mut schemas = Vec::new();
     for batch in &mut reader {
         let batch = batch.map_err(Error::from)?;
@@ -264,7 +264,7 @@ fn load_tables(
          {schema_where} ORDER BY s.name, t.name"
     );
     let mut reader =
-        query_reader_with_timeouts(connection, &query, super::DEFAULT_BATCH_ROWS, timeouts)?;
+        query_reader_with_timeouts(connection, &query, super::DEFAULT_READ_BATCH_ROWS, timeouts)?;
     let mut schemas = Vec::<ObjectSchema>::new();
     for batch in &mut reader {
         let batch = batch.map_err(Error::from)?;
@@ -315,7 +315,7 @@ pub(super) fn table_schema(
         raw_string_literal(table_name)?,
     );
     let mut reader =
-        query_reader_with_timeouts(connection, &query, super::DEFAULT_BATCH_ROWS, timeouts)?;
+        query_reader_with_timeouts(connection, &query, super::DEFAULT_READ_BATCH_ROWS, timeouts)?;
     let mut fields = Vec::new();
     for batch in &mut reader {
         let batch = batch.map_err(Error::from)?;
@@ -404,7 +404,7 @@ fn load_constraints(
     "#
     );
     let mut reader =
-        query_reader_with_timeouts(connection, &query, super::DEFAULT_BATCH_ROWS, timeouts)?;
+        query_reader_with_timeouts(connection, &query, super::DEFAULT_READ_BATCH_ROWS, timeouts)?;
     for batch in &mut reader {
         let batch = batch.map_err(Error::from)?;
         let schema_names = array_as::<StringArray>(&batch, 0)?;

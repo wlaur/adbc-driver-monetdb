@@ -100,7 +100,7 @@ def test_polars_uri_resolution_and_streaming_batches(monetdb_uri: str) -> None:
 @pytest.mark.integration
 def test_polars_preconfigured_cursor_and_execute_options(monetdb_uri: str) -> None:
     with dbapi.connect(monetdb_uri) as connection:
-        with connection.cursor(adbc_stmt_kwargs={StatementOptions.BATCH_ROWS: "2"}) as cursor:
+        with connection.cursor(adbc_stmt_kwargs={StatementOptions.READ_BATCH_ROWS: "2"}) as cursor:
             batches = list(
                 pl.read_database(
                     "SELECT value FROM sys.generate_series(1, 6)",

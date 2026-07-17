@@ -57,6 +57,7 @@ def test_builds_flat_dbc_archive(
         assert archive.getnames() == [
             "MANIFEST",
             driver_name,
+            "THIRD_PARTY_LICENSES",
             "LICENSE",
             "NOTICE",
             "LICENSE.monetdb-rust",
@@ -66,7 +67,10 @@ def test_builds_flat_dbc_archive(
         manifest = tomllib.loads(manifest_file.read().decode())
         license_file = archive.extractfile("LICENSE")
         assert license_file is not None
-        assert license_file.read() == b"dependency licenses"
+        assert license_file.read() == b"MIT"
+        dependency_licenses = archive.extractfile("THIRD_PARTY_LICENSES")
+        assert dependency_licenses is not None
+        assert dependency_licenses.read() == b"dependency licenses"
     assert manifest["description"] == "ADBC driver for MonetDB: Arrow-native reads and writes"
     assert manifest["url"] == "https://github.com/wlaur/adbc-driver-monetdb"
     assert manifest["Driver"]["entrypoint"] == "AdbcDriverMonetdbInit"

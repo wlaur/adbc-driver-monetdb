@@ -7,7 +7,7 @@ import pytest
 def monetdb_uri() -> str:
     """URI of a running MonetDB server for integration tests.
 
-    Start one with: docker compose up -d
+    Start one with: docker compose -f compose.yaml up -d
     """
     uri = os.environ.get("MONETDB_TEST_URI")
     if uri is None:

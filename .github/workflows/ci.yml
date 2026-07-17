@@ -271,7 +271,7 @@ jobs:
           uv run --isolated --no-project --python '${{ matrix.python }}' \
             --with "$wheel" --with 'pytest>=9' --with 'polars>=1.42' --with 'pandas>=3.0' \
             --with 'pyarrow>=25' --with 'sqlalchemy>=2.0' \
-            python -m pytest "$GITHUB_WORKSPACE/tests" -m 'not integration' \
+            python -m pytest "$GITHUB_WORKSPACE/tests" -m 'not integration and not local_only' \
               --ignore "$GITHUB_WORKSPACE/tests/validation" -q
 
   integration:
@@ -336,7 +336,7 @@ jobs:
           uv run --isolated --no-project --python 3.13 \
             --with "$wheel" --with 'pytest>=9' --with 'polars>=1.42' --with 'pandas>=3.0' \
             --with pymonetdb --with 'pyarrow>=25' --with 'sqlalchemy>=2.0' \
-            python -m pytest "$GITHUB_WORKSPACE/tests" -m integration \
+            python -m pytest "$GITHUB_WORKSPACE/tests" -m 'integration and not local_only' \
               --ignore "$GITHUB_WORKSPACE/tests/validation" -q
           uv run --isolated --no-project --python 3.13 \
             --with "$wheel" --with pytest --with pymonetdb \
@@ -428,7 +428,7 @@ jobs:
           uv run --isolated --no-project --python 3.13 \
             --with "$wheel" --with 'pytest>=9' --with 'polars>=1.42' --with 'pandas>=3.0' \
             --with pymonetdb --with 'pyarrow>=25' --with 'sqlalchemy>=2.0' \
-            python -m pytest "$GITHUB_WORKSPACE/tests" -m integration \
+            python -m pytest "$GITHUB_WORKSPACE/tests" -m 'integration and not local_only' \
               --ignore "$GITHUB_WORKSPACE/tests/validation" -q
       - name: Run the validation suite against the installed ARM64 wheel
         working-directory: ${{ runner.temp }}
@@ -485,6 +485,8 @@ jobs:
           path: dist
           name: sdist
       - uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
+        with:
+          skip-existing: true
 
   github-release:
     name: create GitHub release

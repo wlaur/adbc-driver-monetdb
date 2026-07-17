@@ -1029,6 +1029,19 @@ mod tests {
     }
 
     #[test]
+    fn rejects_integer_null_sentinel_collision() {
+        let field = Field::new("i", DataType::Int64, true);
+        let array = Int64Array::from(vec![Some(i64::MIN)]);
+        assert!(matches!(
+            encode_column(&field, &array),
+            Err(EncodeError::InvalidValue {
+                row: 0,
+                message: "value collides with MonetDB's NULL sentinel"
+            })
+        ));
+    }
+
+    #[test]
     fn encodes_unsigned_values_using_wider_wire_types() {
         let field = Field::new("u", DataType::UInt8, true);
         let array = UInt8Array::from(vec![Some(255), None]);

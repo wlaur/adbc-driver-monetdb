@@ -209,7 +209,7 @@ def _select_42(uri: str) -> tuple[object, ...] | None:
 
 
 @pytest.mark.integration
-def test_tls_verification_and_client_certificates(monetdb_uri: str, tmp_path: Path) -> None:
+def test_tls_system_roots_custom_ca_and_client_certificates(monetdb_uri: str, tmp_path: Path) -> None:
     parsed = urlsplit(monetdb_uri)
     assert parsed.hostname is not None
     ca, server, server_key, client, fingerprint = _certificates(tmp_path)
