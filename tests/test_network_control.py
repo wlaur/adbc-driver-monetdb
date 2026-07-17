@@ -187,12 +187,12 @@ def test_statement_read_timeout_closes_black_holed_connection() -> None:
     ):
         started = monotonic()
         with pytest.raises(adbc_driver_manager.OperationalError) as caught:
-            cursor.execute("SELECT 1")  # pyright: ignore[reportUnknownMemberType]
+            cursor.execute("SELECT 1")
         assert caught.value.status_code == adbc_driver_manager.AdbcStatusCode.TIMEOUT
         assert monotonic() - started < 5
         assert server.query_received.is_set()
         with pytest.raises(adbc_driver_manager.ProgrammingError):
-            cursor.execute("SELECT 2")  # pyright: ignore[reportUnknownMemberType]
+            cursor.execute("SELECT 2")
 
 
 def test_statement_cancel_interrupts_black_holed_query() -> None:
@@ -205,7 +205,7 @@ def test_statement_cancel_interrupts_black_holed_query() -> None:
 
         def execute() -> None:
             try:
-                cursor.execute("SELECT 1")  # pyright: ignore[reportUnknownMemberType]
+                cursor.execute("SELECT 1")
             except BaseException as error:
                 outcome.put(error)
             else:
@@ -221,7 +221,7 @@ def test_statement_cancel_interrupts_black_holed_query() -> None:
         assert isinstance(result, adbc_driver_manager.OperationalError)
         assert result.status_code == adbc_driver_manager.AdbcStatusCode.CANCELLED
         with pytest.raises(adbc_driver_manager.ProgrammingError):
-            cursor.execute("SELECT 2")  # pyright: ignore[reportUnknownMemberType]
+            cursor.execute("SELECT 2")
 
 
 def test_query_disconnect_is_io_and_closes_connection() -> None:
@@ -231,10 +231,10 @@ def test_query_disconnect_is_io_and_closes_connection() -> None:
         connection.cursor() as cursor,
     ):
         with pytest.raises(adbc_driver_manager.OperationalError) as disconnected:
-            cursor.execute("SELECT value")  # pyright: ignore[reportUnknownMemberType]
+            cursor.execute("SELECT value")
         assert disconnected.value.status_code == adbc_driver_manager.AdbcStatusCode.IO
         with pytest.raises(adbc_driver_manager.ProgrammingError):
-            cursor.execute("SELECT value")  # pyright: ignore[reportUnknownMemberType]
+            cursor.execute("SELECT value")
 
 
 def test_midstream_error_preserves_sqlstate_and_all_diagnostics() -> None:
@@ -243,7 +243,7 @@ def test_midstream_error_preserves_sqlstate_and_all_diagnostics() -> None:
         dbapi.connect(server.uri, autocommit=True) as connection,
         connection.cursor() as cursor,
     ):
-        cursor.execute("SELECT value")  # pyright: ignore[reportUnknownMemberType]
+        cursor.execute("SELECT value")
         with pytest.raises(ValueError, match="42000!mid-stream failure") as failed:
-            cursor.fetchall()  # pyright: ignore[reportUnknownMemberType]
+            cursor.fetchall()
         assert "second diagnostic" in str(failed.value)
