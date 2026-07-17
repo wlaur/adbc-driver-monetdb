@@ -127,7 +127,7 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
       - name: Build wheels
-        uses: pypa/cibuildwheel@a0a973acdc9e7b7f8b04ac5c80e6883a5a102615 # v4.1.0
+        uses: pypa/cibuildwheel@294735312765b09d24a2fbec22660ce817587d55 # v4.1.0
         with:
           package-dir: .
           output-dir: wheelhouse
