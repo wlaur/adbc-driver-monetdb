@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use adbc_core::error::{Error, Result, Status};
 use adbc_core::options::ObjectDepth;
@@ -9,8 +12,9 @@ use arrow_array::builder::{
 };
 use arrow_array::{Array, BooleanArray, Int32Array, RecordBatch, StringArray};
 use arrow_schema::Schema;
+use monetdb::Timeouts;
 
-use super::{error, prepared_arrow_field, prepared_monet_type, query_reader};
+use super::{error, prepared_arrow_field, prepared_monet_type, query_reader_with_timeouts};
 
 #[derive(Debug)]
 pub(super) struct ObjectSchema {
@@ -55,11 +59,25 @@ struct ConstraintUsage {
 
 pub(super) fn load_objects(
     connection: &Arc<Mutex<monetdb::Connection>>,
+    depth: ObjectDepth,
     schema_filter: Option<&str>,
     table_filter: Option<&str>,
     table_types: Option<&[&str]>,
     column_filter: Option<&str>,
+    timeouts: Timeouts,
 ) -> Result<Vec<ObjectSchema>> {
+    if depth == ObjectDepth::Schemas {
+        return load_schemas(connection, schema_filter, timeouts);
+    }
+    if depth == ObjectDepth::Tables {
+        return load_tables(
+            connection,
+            schema_filter,
+            table_filter,
+            table_types,
+            timeouts,
+        );
+    }
     let schema_predicate = like_predicate("s.name", schema_filter)?;
     let table_predicate = like_predicate("t.name", table_filter)?;
     let column_predicate = like_predicate("c.name", column_filter)?;
@@ -104,7 +122,8 @@ pub(super) fn load_objects(
          ORDER BY s.name, t.name, c.number
     "#
     );
-    let mut reader = query_reader(connection, &query, super::DEFAULT_BATCH_ROWS)?;
+    let mut reader =
+        query_reader_with_timeouts(connection, &query, super::DEFAULT_BATCH_ROWS, timeouts)?;
     let mut schemas = Vec::<ObjectSchema>::new();
     for batch in &mut reader {
         let batch = batch.map_err(Error::from)?;
@@ -185,7 +204,95 @@ pub(super) fn load_objects(
         schema_filter,
         table_filter,
         table_types,
+        timeouts,
     )?;
+    Ok(schemas)
+}
+
+fn load_schemas(
+    connection: &Arc<Mutex<monetdb::Connection>>,
+    schema_filter: Option<&str>,
+    timeouts: Timeouts,
+) -> Result<Vec<ObjectSchema>> {
+    let predicate = like_predicate("name", schema_filter)?
+        .map(|predicate| format!("WHERE {predicate}"))
+        .unwrap_or_default();
+    let query = format!("SELECT name FROM sys.schemas {predicate} ORDER BY name");
+    let mut reader =
+        query_reader_with_timeouts(connection, &query, super::DEFAULT_BATCH_ROWS, timeouts)?;
+    let mut schemas = Vec::new();
+    for batch in &mut reader {
+        let batch = batch.map_err(Error::from)?;
+        let names = array_as::<StringArray>(&batch, 0)?;
+        for row in 0..batch.num_rows() {
+            schemas.push(ObjectSchema {
+                name: names.value(row).to_owned(),
+                tables: Vec::new(),
+            });
+        }
+    }
+    Ok(schemas)
+}
+
+fn load_tables(
+    connection: &Arc<Mutex<monetdb::Connection>>,
+    schema_filter: Option<&str>,
+    table_filter: Option<&str>,
+    table_types: Option<&[&str]>,
+    timeouts: Timeouts,
+) -> Result<Vec<ObjectSchema>> {
+    let schema_where = like_predicate("s.name", schema_filter)?
+        .map(|predicate| format!("WHERE {predicate}"))
+        .unwrap_or_default();
+    let table_join_filters = [
+        like_predicate("t.name", table_filter)?,
+        in_predicate("tt.table_type_name", table_types)?,
+    ]
+    .into_iter()
+    .flatten()
+    .map(|predicate| format!(" AND {predicate}"))
+    .collect::<String>();
+    let query = format!(
+        "SELECT s.name, t.name, t.table_type_name \
+         FROM sys.schemas AS s \
+         LEFT OUTER JOIN (\
+             SELECT t.*, tt.table_type_name \
+             FROM sys.tables AS t \
+             JOIN sys.table_types AS tt ON tt.table_type_id = t.type \
+             WHERE TRUE {table_join_filters}\
+         ) AS t ON t.schema_id = s.id \
+         {schema_where} ORDER BY s.name, t.name"
+    );
+    let mut reader =
+        query_reader_with_timeouts(connection, &query, super::DEFAULT_BATCH_ROWS, timeouts)?;
+    let mut schemas = Vec::<ObjectSchema>::new();
+    for batch in &mut reader {
+        let batch = batch.map_err(Error::from)?;
+        let schema_names = array_as::<StringArray>(&batch, 0)?;
+        let table_names = array_as::<StringArray>(&batch, 1)?;
+        let table_type_names = array_as::<StringArray>(&batch, 2)?;
+        for row in 0..batch.num_rows() {
+            let schema_name = schema_names.value(row);
+            if schemas.last().map(|schema| schema.name.as_str()) != Some(schema_name) {
+                schemas.push(ObjectSchema {
+                    name: schema_name.to_owned(),
+                    tables: Vec::new(),
+                });
+            }
+            if !table_names.is_null(row) {
+                schemas
+                    .last_mut()
+                    .expect("schema was just inserted")
+                    .tables
+                    .push(ObjectTable {
+                        name: table_names.value(row).to_owned(),
+                        table_type: table_type_names.value(row).to_owned(),
+                        columns: Vec::new(),
+                        constraints: Vec::new(),
+                    });
+            }
+        }
+    }
     Ok(schemas)
 }
 
@@ -193,6 +300,7 @@ pub(super) fn table_schema(
     connection: &Arc<Mutex<monetdb::Connection>>,
     schema_name: &str,
     table_name: &str,
+    timeouts: Timeouts,
 ) -> Result<Schema> {
     let query = format!(
         r#"
@@ -206,7 +314,8 @@ pub(super) fn table_schema(
         raw_string_literal(schema_name)?,
         raw_string_literal(table_name)?,
     );
-    let mut reader = query_reader(connection, &query, super::DEFAULT_BATCH_ROWS)?;
+    let mut reader =
+        query_reader_with_timeouts(connection, &query, super::DEFAULT_BATCH_ROWS, timeouts)?;
     let mut fields = Vec::new();
     for batch in &mut reader {
         let batch = batch.map_err(Error::from)?;
@@ -239,7 +348,24 @@ fn load_constraints(
     schema_filter: Option<&str>,
     table_filter: Option<&str>,
     table_types: Option<&[&str]>,
+    timeouts: Timeouts,
 ) -> Result<()> {
+    let table_indices = schemas
+        .iter()
+        .enumerate()
+        .flat_map(|(schema_index, schema)| {
+            schema
+                .tables
+                .iter()
+                .enumerate()
+                .map(move |(table_index, table)| {
+                    (
+                        (schema.name.clone(), table.name.clone()),
+                        (schema_index, table_index),
+                    )
+                })
+        })
+        .collect::<HashMap<_, _>>();
     let predicates = [
         like_predicate("s.name", schema_filter)?,
         like_predicate("t.name", table_filter)?,
@@ -277,7 +403,8 @@ fn load_constraints(
          ORDER BY s.name, t.name, k.name, kc.nr
     "#
     );
-    let mut reader = query_reader(connection, &query, super::DEFAULT_BATCH_ROWS)?;
+    let mut reader =
+        query_reader_with_timeouts(connection, &query, super::DEFAULT_BATCH_ROWS, timeouts)?;
     for batch in &mut reader {
         let batch = batch.map_err(Error::from)?;
         let schema_names = array_as::<StringArray>(&batch, 0)?;
@@ -289,19 +416,13 @@ fn load_constraints(
         let usage_tables = array_as::<StringArray>(&batch, 7)?;
         let usage_columns = array_as::<StringArray>(&batch, 8)?;
         for row in 0..batch.num_rows() {
-            let Some(schema) = schemas
-                .iter_mut()
-                .find(|schema| schema.name == schema_names.value(row))
-            else {
+            let Some(&(schema_index, table_index)) = table_indices.get(&(
+                schema_names.value(row).to_owned(),
+                table_names.value(row).to_owned(),
+            )) else {
                 continue;
             };
-            let Some(table) = schema
-                .tables
-                .iter_mut()
-                .find(|table| table.name == table_names.value(row))
-            else {
-                continue;
-            };
+            let table = &mut schemas[schema_index].tables[table_index];
             let name =
                 (!constraint_names.is_null(row)).then(|| constraint_names.value(row).to_owned());
             let constraint_type = constraint_type_name(constraint_types.value(row));
