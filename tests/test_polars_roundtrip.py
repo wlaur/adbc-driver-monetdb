@@ -547,11 +547,14 @@ def test_query_replaces_ingest_statement_mode(monetdb_uri: str) -> None:
     with dbapi.connect(monetdb_uri, autocommit=True) as conn, conn.cursor() as cursor:
         try:
             cursor.execute("CREATE TABLE query_after_ingest(value INT)")
-            assert cursor.adbc_ingest(
-                "previous_ingest_target",
-                pa.record_batch({"value": [1]}),
-                mode="create",
-            ) == 1
+            assert (
+                cursor.adbc_ingest(
+                    "previous_ingest_target",
+                    pa.record_batch({"value": [1]}),
+                    mode="create",
+                )
+                == 1
+            )
             cursor.executemany("INSERT INTO query_after_ingest VALUES (?)", [(2,), (3,)])
 
             cursor.execute("SELECT value FROM previous_ingest_target")
@@ -594,14 +597,37 @@ def test_multi_statement_queries_are_rejected_and_update_scripts_are_split_safel
             )
             assert cursor.adbc_statement.execute_update() == 3
             cursor.adbc_statement.set_sql_query(
-                "UPDATE injection_multi_guard SET value = value; "
-                "SELECT value FROM injection_multi_guard ORDER BY value"
+                "UPDATE injection_multi_guard SET value = value; SELECT value FROM injection_multi_guard ORDER BY value"
             )
             assert cursor.adbc_statement.execute_update() == 3
             cursor.execute("SELECT value FROM injection_multi_guard ORDER BY value")
             assert cursor.fetchall() == [(1,), (2,), (3,)]
         finally:
             cursor.execute("DROP TABLE IF EXISTS injection_multi_guard")
+
+
+@pytest.mark.integration
+def test_procedural_ddl_is_one_script_statement(monetdb_uri: str) -> None:
+    function = "adbc_procedural_script"
+    table = "adbc_procedural_result"
+    with dbapi.connect(monetdb_uri, autocommit=True) as conn, conn.cursor() as cursor:
+        try:
+            cursor.execute(f"CREATE TABLE {table}(value INT)")
+            cursor.adbc_statement.set_sql_query(
+                f"""CREATE FUNCTION {function}(value INT) RETURNS INT
+                    BEGIN
+                      IF value > 1 THEN RETURN value + 1;
+                      ELSE RETURN 0;
+                      END IF;
+                    END;
+                    INSERT INTO {table} SELECT {function}(2)"""
+            )
+            assert cursor.adbc_statement.execute_update() == 1
+            cursor.execute(f"SELECT value, {function}(1) FROM {table}")
+            assert cursor.fetchall() == [(3, 0)]
+        finally:
+            cursor.execute(f"DROP FUNCTION IF EXISTS {function}(INT)")
+            cursor.execute(f"DROP TABLE IF EXISTS {table}")
 
 
 @pytest.mark.integration
