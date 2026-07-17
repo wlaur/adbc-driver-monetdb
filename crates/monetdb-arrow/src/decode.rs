@@ -80,7 +80,7 @@ impl fmt::Display for DecodeError {
             Self::Unsupported(data_type) => {
                 if matches!(
                     data_type,
-                    MonetType::Geometry | MonetType::GeometryA | MonetType::Oid | MonetType::Xml
+                    MonetType::Geometry | MonetType::Oid | MonetType::Xml
                 ) {
                     write!(
                         f,
@@ -227,7 +227,6 @@ pub fn owned_frame_capacity(columns: &[ResultColumn], rows: usize) -> Option<usi
             | MonetType::Inet
             | MonetType::Json
             | MonetType::Geometry
-            | MonetType::GeometryA
             | MonetType::Xml => return None,
         };
         capacity = capacity
@@ -271,7 +270,6 @@ fn prefers_owned_types(types: impl IntoIterator<Item = MonetType>) -> bool {
             | MonetType::Inet
             | MonetType::Json
             | MonetType::Geometry
-            | MonetType::GeometryA
             | MonetType::Xml => return false,
         };
         frame_bytes = frame_bytes.saturating_add(width);
@@ -676,7 +674,7 @@ fn inline_wire_value(
             IpAddr::V4(value) => value.octets().to_vec(),
             IpAddr::V6(value) => value.octets().to_vec(),
         },
-        MonetType::Geometry | MonetType::GeometryA | MonetType::Xml => {
+        MonetType::Geometry | MonetType::Xml => {
             return Err(DecodeError::Unsupported(*data_type));
         }
     })
@@ -733,7 +731,7 @@ fn null_wire_value(data_type: &MonetType) -> Result<Vec<u8>, DecodeError> {
         MonetType::Blob => (-1i64).to_le_bytes().to_vec(),
         MonetType::Uuid => vec![0; 16],
         MonetType::Inet => vec![0; 4],
-        MonetType::Geometry | MonetType::GeometryA | MonetType::Xml => {
+        MonetType::Geometry | MonetType::Xml => {
             return Err(DecodeError::Unsupported(*data_type));
         }
     })
@@ -926,7 +924,7 @@ pub fn data_type_for_monet_type(data_type: &MonetType) -> Result<DataType, Decod
         MonetType::TimestampTz => DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
         MonetType::Blob => DataType::Binary,
         MonetType::Uuid => DataType::FixedSizeBinary(16),
-        MonetType::Geometry | MonetType::GeometryA | MonetType::Xml => {
+        MonetType::Geometry | MonetType::Xml => {
             return Err(DecodeError::Unsupported(*data_type));
         }
     })
@@ -1013,7 +1011,7 @@ pub fn decode_column(
         MonetType::Blob => Arc::new(decode_blob(bytes, row_count)?),
         MonetType::Uuid => Arc::new(decode_uuid(bytes, row_count)?),
         MonetType::Inet => Arc::new(decode_inet(bytes, row_count)?),
-        MonetType::Geometry | MonetType::GeometryA | MonetType::Xml => {
+        MonetType::Geometry | MonetType::Xml => {
             return Err(DecodeError::Unsupported(*data_type));
         }
     })
