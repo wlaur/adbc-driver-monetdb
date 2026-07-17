@@ -65,6 +65,8 @@ class _BlackHoleServer:
         self._version = version
         self._listener = socket.socket()
         self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if behavior == "write_stall":
+            self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
         self._listener.bind(("127.0.0.1", 0))
         self._listener.listen(1)
         self._listener.settimeout(5)
