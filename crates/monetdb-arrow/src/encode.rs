@@ -81,6 +81,8 @@ pub fn monet_type_for_field(field: &Field) -> Result<MonetType, EncodeError> {
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => match extension {
             Some("arrow.json") => MonetType::Json,
             Some("monetdb.inet") => MonetType::Inet,
+            Some("monetdb.inet4") => MonetType::Inet4,
+            Some("monetdb.inet6") => MonetType::Inet6,
             Some("monetdb.url") => MonetType::Url,
             _ => MonetType::Varchar(0),
         },
@@ -133,6 +135,8 @@ pub fn sql_type_for_field(field: &Field) -> Result<String, EncodeError> {
         MonetType::Blob => "BLOB".into(),
         MonetType::Url => "URL".into(),
         MonetType::Inet => "INET".into(),
+        MonetType::Inet4 => "INET4".into(),
+        MonetType::Inet6 => "INET6".into(),
         MonetType::Json => "JSON".into(),
         MonetType::Uuid => "UUID".into(),
         MonetType::Geometry => "GEOMETRY".into(),
@@ -145,6 +149,15 @@ pub fn sql_type_for_field(field: &Field) -> Result<String, EncodeError> {
 /// `field.data_type()` and `array.data_type()` must describe the same logical
 /// type; extension metadata on `field` selects MonetDB-specific wire types.
 pub fn encode_column(field: &Field, array: &dyn Array) -> Result<Vec<u8>, EncodeError> {
+    if matches!(
+        array.data_type(),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+    ) && matches!(
+        monet_type_for_field(field)?,
+        MonetType::Inet | MonetType::Inet4 | MonetType::Inet6
+    ) {
+        return Err(EncodeError::Unsupported(array.data_type().clone()));
+    }
     let mut out = Vec::new();
     if let Some(width) = fixed_wire_width(field, array.data_type())? {
         let bytes = array
@@ -211,9 +224,6 @@ pub fn encode_column(field: &Field, array: &dyn Array) -> Result<Vec<u8>, Encode
                 enforce_precision,
                 &mut out,
             )?
-        }
-        DataType::Utf8 if monet_type_for_field(field)? == MonetType::Inet => {
-            return Err(EncodeError::Unsupported(DataType::Utf8));
         }
         DataType::Utf8 => {
             let values = downcast::<StringArray>(array, DataType::Utf8)?;
@@ -297,6 +307,8 @@ fn fixed_wire_width(field: &Field, data_type: &DataType) -> Result<Option<usize>
         | MonetType::Blob
         | MonetType::Url
         | MonetType::Inet
+        | MonetType::Inet4
+        | MonetType::Inet6
         | MonetType::Json
         | MonetType::Geometry
         | MonetType::Xml => None,
@@ -1139,6 +1151,32 @@ mod tests {
         assert!(matches!(
             encode_column(&inet, &StringArray::from(vec!["127.0.0.1"])),
             Err(EncodeError::Unsupported(DataType::Utf8))
+        ));
+
+        let inet4 = Field::new("inet4", DataType::LargeUtf8, true).with_metadata(
+            [(
+                "ARROW:extension:name".to_owned(),
+                "monetdb.inet4".to_owned(),
+            )]
+            .into(),
+        );
+        assert_eq!(monet_type_for_field(&inet4).unwrap(), MonetType::Inet4);
+        assert!(matches!(
+            encode_column(&inet4, &LargeStringArray::from(vec!["127.0.0.1"])),
+            Err(EncodeError::Unsupported(DataType::LargeUtf8))
+        ));
+
+        let inet6 = Field::new("inet6", DataType::Utf8View, true).with_metadata(
+            [(
+                "ARROW:extension:name".to_owned(),
+                "monetdb.inet6".to_owned(),
+            )]
+            .into(),
+        );
+        assert_eq!(monet_type_for_field(&inet6).unwrap(), MonetType::Inet6);
+        assert!(matches!(
+            encode_column(&inet6, &StringViewArray::from(vec!["::1"])),
+            Err(EncodeError::Unsupported(DataType::Utf8View))
         ));
     }
 

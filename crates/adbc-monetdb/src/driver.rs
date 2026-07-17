@@ -1366,6 +1366,14 @@ impl MonetdbStatement {
                     "COPY BINARY ingestion for OID columns is not supported by MonetDB",
                 ));
             }
+            if matches!(
+                data_type,
+                MonetType::Inet | MonetType::Inet4 | MonetType::Inet6
+            ) {
+                return Err(not_implemented(
+                    "COPY BINARY ingestion for INET columns is not supported by MonetDB",
+                ));
+            }
         }
 
         let columns = schema

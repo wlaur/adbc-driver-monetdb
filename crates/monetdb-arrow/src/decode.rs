@@ -80,7 +80,7 @@ impl fmt::Display for DecodeError {
             Self::Unsupported(data_type) => {
                 if matches!(
                     data_type,
-                    MonetType::Geometry | MonetType::Oid | MonetType::Xml
+                    MonetType::Geometry | MonetType::Inet | MonetType::Xml
                 ) {
                     write!(
                         f,
@@ -225,6 +225,8 @@ pub fn owned_frame_capacity(columns: &[ResultColumn], rows: usize) -> Option<usi
             | MonetType::Blob
             | MonetType::Url
             | MonetType::Inet
+            | MonetType::Inet4
+            | MonetType::Inet6
             | MonetType::Json
             | MonetType::Geometry
             | MonetType::Xml => return None,
@@ -268,6 +270,8 @@ fn prefers_owned_types(types: impl IntoIterator<Item = MonetType>) -> bool {
             | MonetType::Blob
             | MonetType::Url
             | MonetType::Inet
+            | MonetType::Inet4
+            | MonetType::Inet6
             | MonetType::Json
             | MonetType::Geometry
             | MonetType::Xml => return false,
@@ -665,15 +669,23 @@ fn inline_wire_value(
             })?
             .into_bytes()
             .to_vec(),
-        MonetType::Inet => match required(cursor.get_str(index)?)?
-            .parse::<IpAddr>()
+        MonetType::Inet => return Err(DecodeError::Unsupported(*data_type)),
+        MonetType::Inet4 => required(cursor.get_str(index)?)?
+            .parse::<std::net::Ipv4Addr>()
             .map_err(|_| DecodeError::InvalidValue {
                 row: 0,
-                message: "invalid INET address",
-            })? {
-            IpAddr::V4(value) => value.octets().to_vec(),
-            IpAddr::V6(value) => value.octets().to_vec(),
-        },
+                message: "invalid INET4 address",
+            })?
+            .octets()
+            .to_vec(),
+        MonetType::Inet6 => required(cursor.get_str(index)?)?
+            .parse::<std::net::Ipv6Addr>()
+            .map_err(|_| DecodeError::InvalidValue {
+                row: 0,
+                message: "invalid INET6 address",
+            })?
+            .octets()
+            .to_vec(),
         MonetType::Geometry | MonetType::Xml => {
             return Err(DecodeError::Unsupported(*data_type));
         }
@@ -730,8 +742,9 @@ fn null_wire_value(data_type: &MonetType) -> Result<Vec<u8>, DecodeError> {
         MonetType::Timestamp | MonetType::TimestampTz => vec![0xff; 12],
         MonetType::Blob => (-1i64).to_le_bytes().to_vec(),
         MonetType::Uuid => vec![0; 16],
-        MonetType::Inet => vec![0; 4],
-        MonetType::Geometry | MonetType::Xml => {
+        MonetType::Inet4 => vec![0; 4],
+        MonetType::Inet6 => vec![0; 16],
+        MonetType::Geometry | MonetType::Inet | MonetType::Xml => {
             return Err(DecodeError::Unsupported(*data_type));
         }
     })
@@ -886,7 +899,8 @@ pub fn field_for_monet_type(
         MonetType::Uuid => Some("arrow.uuid"),
         MonetType::HugeInt => Some("monetdb.hugeint"),
         MonetType::Oid => Some("monetdb.oid"),
-        MonetType::Inet => Some("monetdb.inet"),
+        MonetType::Inet4 => Some("monetdb.inet4"),
+        MonetType::Inet6 => Some("monetdb.inet6"),
         MonetType::Url => Some("monetdb.url"),
         MonetType::MonthInterval => Some("monetdb.interval_month"),
         MonetType::DayInterval => Some("monetdb.interval_day"),
@@ -909,9 +923,11 @@ pub fn data_type_for_monet_type(data_type: &MonetType) -> Result<DataType, Decod
         MonetType::HugeInt => DataType::Decimal128(38, 0),
         MonetType::Oid => DataType::UInt64,
         MonetType::Decimal(precision, scale) => decimal_data_type(precision, scale)?,
-        MonetType::Varchar(_) | MonetType::Url | MonetType::Json | MonetType::Inet => {
-            DataType::Utf8
-        }
+        MonetType::Varchar(_)
+        | MonetType::Url
+        | MonetType::Json
+        | MonetType::Inet4
+        | MonetType::Inet6 => DataType::Utf8,
         MonetType::Real => DataType::Float32,
         MonetType::Double => DataType::Float64,
         MonetType::MonthInterval => DataType::Int32,
@@ -924,7 +940,7 @@ pub fn data_type_for_monet_type(data_type: &MonetType) -> Result<DataType, Decod
         MonetType::TimestampTz => DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
         MonetType::Blob => DataType::Binary,
         MonetType::Uuid => DataType::FixedSizeBinary(16),
-        MonetType::Geometry | MonetType::Xml => {
+        MonetType::Geometry | MonetType::Inet | MonetType::Xml => {
             return Err(DecodeError::Unsupported(*data_type));
         }
     })
@@ -1010,8 +1026,8 @@ pub fn decode_column(
         MonetType::TimestampTz => Arc::new(decode_timestamp(bytes, row_count, true)?),
         MonetType::Blob => Arc::new(decode_blob(bytes, row_count)?),
         MonetType::Uuid => Arc::new(decode_uuid(bytes, row_count)?),
-        MonetType::Inet => Arc::new(decode_inet(bytes, row_count)?),
-        MonetType::Geometry | MonetType::Xml => {
+        MonetType::Inet4 | MonetType::Inet6 => Arc::new(decode_inet(bytes, row_count)?),
+        MonetType::Geometry | MonetType::Inet | MonetType::Xml => {
             return Err(DecodeError::Unsupported(*data_type));
         }
     })
@@ -1597,8 +1613,8 @@ mod tests {
             MonetType::DayInterval,
             MonetType::SecInterval,
             MonetType::Uuid,
-            MonetType::Inet,
-            MonetType::Inet,
+            MonetType::Inet4,
+            MonetType::Inet6,
             MonetType::Json,
             MonetType::Url,
         ];
@@ -2173,6 +2189,12 @@ mod tests {
                 .unwrap_err()
                 .to_string(),
             "MonetDB type GEOMETRY is not available through Xexportbin; cast the column to VARCHAR in SQL"
+        );
+        assert_eq!(
+            data_type_for_monet_type(&MonetType::Inet)
+                .unwrap_err()
+                .to_string(),
+            "MonetDB type INET is not available through Xexportbin; cast the column to VARCHAR in SQL"
         );
     }
 }

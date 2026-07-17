@@ -262,6 +262,28 @@ def test_non_binary_type_error_recommends_cast(monetdb_uri: str) -> None:
 
 
 @pytest.mark.integration
+def test_legacy_inet_fails_loudly_with_cast_guidance(monetdb_uri: str) -> None:
+    with dbapi.connect(monetdb_uri, autocommit=True) as conn, conn.cursor() as cursor:
+        try:
+            cursor.execute("CREATE TABLE legacy_inet(i INET)")
+            cursor.execute("INSERT INTO legacy_inet VALUES ('0.0.0.0'), ('192.168.1.0/24'), ('127.0.0.1')")
+            for query in [
+                "SELECT i FROM legacy_inet WHERE i = '0.0.0.0'",
+                "SELECT i FROM legacy_inet WHERE i = '192.168.1.0/24'",
+                "SELECT i FROM legacy_inet ORDER BY i",
+            ]:
+                with pytest.raises(
+                    adbc_driver_manager.DataError,
+                    match=r"INET.*cast the column to VARCHAR",
+                ):
+                    cursor.execute(query)
+            cursor.execute("SELECT CAST(i AS VARCHAR(40)) FROM legacy_inet ORDER BY i")
+            assert cursor.fetchall() == [("0.0.0.0",), ("127.0.0.1",), ("192.168.1.0/24",)]
+        finally:
+            cursor.execute("DROP TABLE IF EXISTS legacy_inet")
+
+
+@pytest.mark.integration
 def test_empty_and_null_results(monetdb_uri: str) -> None:
     with dbapi.connect(monetdb_uri) as conn:
         empty = pl.read_database("SELECT CAST(NULL AS INT) AS value WHERE FALSE", conn)
