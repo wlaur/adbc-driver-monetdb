@@ -364,6 +364,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
     services:
       monetdb:
+        # Native ARM64 image recipe: https://github.com/wlaur/monetdb-container
         image: wlaur/monetdb-container:11.55.7-2@sha256:22dd41bd10fd7136ca1ef6afaec5cf0c1670f16a84b80785a5fee12aac480eb4
         ports:
           - 50000:50000

@@ -26,6 +26,13 @@ def test_waived_connection_options_are_not_implemented(monetdb_uri: str, key: st
 
 
 @pytest.mark.integration
+def test_read_only_false_is_accepted(monetdb_uri: str) -> None:
+    with dbapi.connect(monetdb_uri) as connection:
+        connection.adbc_connection.set_options(**{"adbc.connection.readonly": "false"})
+        assert connection.adbc_connection.get_option("adbc.connection.readonly") == "false"
+
+
+@pytest.mark.integration
 def test_cross_catalog_ingest_is_not_implemented(monetdb_uri: str) -> None:
     batch = pa.record_batch({"value": [1]})
     with dbapi.connect(monetdb_uri) as connection, connection.cursor() as cursor:
