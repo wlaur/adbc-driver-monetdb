@@ -2,6 +2,9 @@ from collections.abc import Mapping
 from typing import Literal, Self
 
 import pyarrow as pa
+from adbc_driver_manager import AdbcConnection as _ManagerAdbcConnection
+from adbc_driver_manager import AdbcDatabase as _ManagerAdbcDatabase
+from adbc_driver_manager import AdbcStatement as _ManagerAdbcStatement
 from adbc_driver_manager.dbapi import (
     BINARY as BINARY,
     DATETIME as DATETIME,
@@ -27,12 +30,21 @@ from adbc_driver_manager.dbapi import (
 )
 from adbc_driver_manager.dbapi import Connection as _ManagerConnection
 from adbc_driver_manager.dbapi import Cursor as _ManagerCursor
-from adbc_driver_manager._lib import AdbcConnection as _ManagerAdbcConnection
-from adbc_driver_manager._lib import AdbcStatement as _ManagerAdbcStatement
 
 apilevel: str
 threadsafety: int
 paramstyle: Literal["qmark"]
+
+# These stub-only subclasses narrow methods used by this driver. Runtime exports remain the
+# manager's plain DB-API classes so Polars can identify the connection as ADBC.
+class _AdbcDatabase(_ManagerAdbcDatabase):
+    def get_option(
+        self,
+        key: bytes | str,
+        *,
+        encoding: str = "utf-8",
+        errors: str = "strict",
+    ) -> str: ...
 
 class _AdbcConnection(_ManagerAdbcConnection):
     def get_option(
@@ -87,6 +99,8 @@ class Cursor(_ManagerCursor):
     def adbc_prepare(self, operation: bytes | str) -> pa.Schema | None: ...
 
 class Connection(_ManagerConnection):
+    @property
+    def adbc_database(self) -> _AdbcDatabase: ...
     @property
     def adbc_connection(self) -> _AdbcConnection: ...
     def cursor(self, *, adbc_stmt_kwargs: Mapping[str, object] | None = None) -> Cursor: ...

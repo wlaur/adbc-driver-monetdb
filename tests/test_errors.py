@@ -4,7 +4,7 @@ from uuid import uuid4
 import adbc_driver_manager
 import pytest
 
-from adbc_driver_monetdb import dbapi
+from adbc_driver_monetdb import DatabaseOptions, dbapi
 
 
 def _uri_with_credentials(uri: str, username: str, password: str) -> str:
@@ -17,6 +17,17 @@ def _uri_with_credentials(uri: str, username: str, password: str) -> str:
     port = f":{parsed.port}" if parsed.port is not None else ""
     credentials = f"{quote(username, safe='')}:{quote(password, safe='')}@"
     return urlunsplit((parsed.scheme, f"{credentials}{hostname}{port}", parsed.path, parsed.query, parsed.fragment))
+
+
+def _uri_without_credentials(uri: str) -> str:
+    parsed = urlsplit(uri)
+    hostname = parsed.hostname
+    if hostname is None:
+        raise ValueError("integration URI has no hostname")
+    if ":" in hostname:
+        hostname = f"[{hostname}]"
+    port = f":{parsed.port}" if parsed.port is not None else ""
+    return urlunsplit((parsed.scheme, f"{hostname}{port}", parsed.path, parsed.query, parsed.fragment))
 
 
 @pytest.mark.integration
@@ -70,3 +81,29 @@ def test_dbapi_classifies_permission_denial(monetdb_uri: str) -> None:
         with dbapi.connect(monetdb_uri, autocommit=True) as admin:
             admin.execute(f"DROP USER IF EXISTS {username}")
             admin.execute(f"DROP TABLE IF EXISTS {table}")
+
+
+@pytest.mark.integration
+def test_authentication_channels_and_password_readback(monetdb_uri: str) -> None:
+    suffix = uuid4().hex
+    username = f"adbc_auth_{suffix}"
+    password = f"adbc-{suffix}:@/%?#[]"
+    bare_uri = _uri_without_credentials(monetdb_uri)
+    userinfo_uri = _uri_with_credentials(bare_uri, username, password)
+    wrong_userinfo_uri = _uri_with_credentials(bare_uri, "wrong-user", "wrong-password")
+    credentials = {"username": username, "password": password}
+
+    with dbapi.connect(monetdb_uri, autocommit=True) as admin:
+        admin.execute(f"CREATE USER {username} WITH PASSWORD '{password}' NAME 'ADBC auth test' SCHEMA sys")
+    try:
+        with dbapi.connect(userinfo_uri, autocommit=True) as connection:
+            assert connection.execute("SELECT current_user").fetchone() == (username,)
+        with dbapi.connect(bare_uri, autocommit=True, db_kwargs=credentials) as connection:
+            assert connection.execute("SELECT current_user").fetchone() == (username,)
+            with pytest.raises(adbc_driver_manager.NotSupportedError, match="cannot be read back"):
+                connection.adbc_database.get_option(DatabaseOptions.PASSWORD)
+        with dbapi.connect(wrong_userinfo_uri, autocommit=True, db_kwargs=credentials) as connection:
+            assert connection.execute("SELECT current_user").fetchone() == (username,)
+    finally:
+        with dbapi.connect(monetdb_uri, autocommit=True) as admin:
+            admin.execute(f"DROP USER IF EXISTS {username}")
