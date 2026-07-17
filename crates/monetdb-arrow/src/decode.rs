@@ -1208,9 +1208,9 @@ fn decode_strings_without_backrefs(
             return Ok(None);
         }
         let tail = &bytes[pos..];
-        let end = memchr::memchr(0, tail).ok_or(DecodeError::Length {
-            expected: bytes.len() + 1,
-            actual: bytes.len(),
+        let end = memchr::memchr(0, tail).ok_or(DecodeError::InvalidValue {
+            row,
+            message: "string is not NUL-terminated",
         })?;
         let value =
             std::str::from_utf8(&tail[..end]).map_err(|_| DecodeError::InvalidUtf8 { row })?;
@@ -1277,9 +1277,9 @@ fn decode_strings_with_backrefs(bytes: &[u8], rows: usize) -> Result<StringArray
                 .ok_or(DecodeError::InvalidBackref { row })?
         } else {
             let tail = &bytes[pos..];
-            let end = memchr::memchr(0, tail).ok_or(DecodeError::Length {
-                expected: bytes.len() + 1,
-                actual: bytes.len(),
+            let end = memchr::memchr(0, tail).ok_or(DecodeError::InvalidValue {
+                row,
+                message: "string is not NUL-terminated",
             })?;
             let string =
                 std::str::from_utf8(&tail[..end]).map_err(|_| DecodeError::InvalidUtf8 { row })?;
@@ -1448,7 +1448,14 @@ fn date_value(value: &[u8], row: usize, epoch: NaiveDate) -> Result<Option<i32>,
     let day = value[0];
     let month = value[1];
     if month == u8::MAX {
-        return Ok(None);
+        return if value.iter().all(|byte| *byte == u8::MAX) {
+            Ok(None)
+        } else {
+            Err(DecodeError::InvalidValue {
+                row,
+                message: "date has a partial NULL sentinel",
+            })
+        };
     }
     let year = i16::from_le_bytes(value[2..4].try_into().expect("date year is 2 bytes"));
     let date = naive_date(RawDate { day, month, year }, row)?;
@@ -1479,7 +1486,14 @@ fn time_value(value: &[u8], row: usize) -> Result<Option<i64>, DecodeError> {
     // The C field is named `ms`, but contains microseconds.
     let micros = u32::from_le_bytes(value[..4].try_into().expect("time fraction is 4 bytes"));
     if micros == u32::MAX {
-        return Ok(None);
+        return if value.iter().all(|byte| *byte == u8::MAX) {
+            Ok(None)
+        } else {
+            Err(DecodeError::InvalidValue {
+                row,
+                message: "time has a partial NULL sentinel",
+            })
+        };
     }
     let second = value[4];
     let minute = value[5];
@@ -2020,7 +2034,10 @@ mod tests {
     fn rejects_invalid_string_data() {
         assert!(matches!(
             decode_strings(b"unterminated", 1),
-            Err(DecodeError::Length { .. })
+            Err(DecodeError::InvalidValue {
+                row: 0,
+                message: "string is not NUL-terminated"
+            })
         ));
         assert!(matches!(
             decode_strings(&[0x81], 1),
@@ -2172,6 +2189,14 @@ mod tests {
         ));
         let ipv6_nil = decode_inet(&[0; 16], 1).unwrap();
         assert!(ipv6_nil.is_null(0));
+        assert!(matches!(
+            date_value(&[1, u8::MAX, u8::MAX, u8::MAX], 0, unix_epoch()),
+            Err(DecodeError::InvalidValue { row: 0, .. })
+        ));
+        assert!(matches!(
+            time_value(&[u8::MAX, u8::MAX, u8::MAX, u8::MAX, 0, 0, 0, 0], 0),
+            Err(DecodeError::InvalidValue { row: 0, .. })
+        ));
     }
 
     #[test]
