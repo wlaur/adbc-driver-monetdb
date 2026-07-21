@@ -1,4 +1,5 @@
 from decimal import Decimal
+from typing import cast
 from urllib.parse import parse_qs, urlsplit
 
 import adbc_driver_manager
@@ -6,6 +7,78 @@ import polars as pl
 import pytest
 
 from adbc_driver_monetdb import ConnectionOptions, DatabaseOptions, StatementOptions, dbapi
+
+
+@pytest.mark.integration
+def test_connection_context_exit_rolls_back_uncommitted_work(monetdb_uri: str) -> None:
+    with dbapi.connect(monetdb_uri, autocommit=True) as setup:
+        setup.execute("DROP TABLE IF EXISTS review_close_rollback")
+        setup.execute("CREATE TABLE review_close_rollback(value INT)")
+    try:
+        with dbapi.connect(monetdb_uri) as connection:
+            connection.execute("INSERT INTO review_close_rollback VALUES (42)")
+        with dbapi.connect(monetdb_uri, autocommit=True) as audit:
+            assert audit.execute("SELECT COUNT(*) FROM review_close_rollback").fetchone() == (0,)
+    finally:
+        with dbapi.connect(monetdb_uri, autocommit=True) as cleanup:
+            cleanup.execute("DROP TABLE IF EXISTS review_close_rollback")
+
+
+@pytest.mark.integration
+def test_get_objects_uses_canonical_monetdb_xdbc_metadata(monetdb_uri: str) -> None:
+    with dbapi.connect(monetdb_uri, autocommit=True) as connection:
+        try:
+            connection.execute("DROP TABLE IF EXISTS review_xdbc")
+            connection.execute(
+                "CREATE TABLE review_xdbc("
+                "i INT, d DECIMAL(12,3), r REAL, f DOUBLE, h HUGEINT, "
+                "t TIME(4), ts TIMESTAMP(2), ym INTERVAL YEAR TO MONTH, "
+                "ds INTERVAL DAY TO SECOND, v VARCHAR(9), b BLOB, u UUID, j JSON)"
+            )
+            rows = cast(
+                list[dict[str, object]],
+                connection.adbc_get_objects(
+                    depth="all",
+                    db_schema_filter="sys",
+                    table_name_filter="review_xdbc",
+                )
+                .read_all()
+                .to_pylist(),
+            )
+        finally:
+            connection.execute("DROP TABLE IF EXISTS review_xdbc")
+
+    schemas = cast(list[dict[str, object]], rows[0]["catalog_db_schemas"])
+    tables = cast(list[dict[str, object]], schemas[0]["db_schema_tables"])
+    columns = cast(list[dict[str, object]], tables[0]["table_columns"])
+    by_name = {cast(str, column["column_name"]): column for column in columns}
+    fields = (
+        "xdbc_data_type",
+        "xdbc_column_size",
+        "xdbc_decimal_digits",
+        "xdbc_num_prec_radix",
+        "xdbc_sql_data_type",
+        "xdbc_datetime_sub",
+        "xdbc_char_octet_length",
+    )
+    expected = {
+        "i": (4, 31, 0, 2, 4, None, None),
+        "d": (3, 12, 3, 10, 3, None, None),
+        "r": (7, 24, 7, 2, 7, None, None),
+        "f": (8, 53, 15, 2, 8, None, None),
+        "h": (16_384, 127, 0, 2, 16_384, None, None),
+        "t": (92, 12, 4, None, 9, 2, None),
+        "ts": (93, 23, 2, None, 9, 3, None),
+        "ym": (107, 38, 0, None, 10, 7, None),
+        "ds": (110, 47, 0, None, 10, 10, None),
+        "v": (-9, 9, None, None, -9, None, 36),
+        "u": (None, 36, None, None, -11, None, None),
+    }
+    for name, values in expected.items():
+        assert tuple(by_name[name][field] for field in fields) == values
+    assert by_name["b"]["xdbc_data_type"] == -4
+    assert by_name["b"]["xdbc_char_octet_length"] == by_name["b"]["xdbc_column_size"]
+    assert all(by_name["j"][field] is None for field in fields)
 
 
 @pytest.mark.integration

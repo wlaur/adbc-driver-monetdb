@@ -31,5 +31,8 @@ url.workspace = true
 [build-dependencies]
 cargo-lock = "11"
 
+[dev-dependencies]
+libloading = "0.9"
+
 [lints]
 workspace = true

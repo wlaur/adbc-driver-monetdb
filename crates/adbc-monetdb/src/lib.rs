@@ -1,6 +1,6 @@
 //! ADBC driver for MonetDB.
 //!
-//! The driver speaks MAPI (via the vendored `monetdb` crate) and converts
+//! The driver speaks MAPI (via the forked `monetdb` submodule) and converts
 //! between MonetDB's binary wire formats and Arrow via `monetdb-arrow`.
 //! Supported servers: MonetDB Dec2025 (11.55) and newer, little-endian only.
 

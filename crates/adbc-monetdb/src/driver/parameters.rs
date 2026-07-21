@@ -1052,6 +1052,15 @@ fn dictionary_value<K: ArrowDictionaryKeyType>(
 ) -> Result<String> {
     match array.key(row) {
         Some(key) => {
+            if key >= array.values().len() {
+                return Err(error(
+                    format!(
+                        "dictionary parameter key {key} is outside the values array of length {}",
+                        array.values().len()
+                    ),
+                    Status::InvalidData,
+                ));
+            }
             let value_field = Field::new("", array.values().data_type().clone(), true)
                 .with_metadata(field.metadata().clone());
             literal(&value_field, array.values().as_ref(), key)
@@ -1318,5 +1327,25 @@ mod tests {
         let dictionary = DictionaryArray::<Int8Type>::try_new(keys, values).unwrap();
         let field = Field::new("d", dictionary.data_type().clone(), false);
         assert_eq!(literal(&field, &dictionary, 0).unwrap(), "20");
+    }
+
+    #[test]
+    fn rejects_unvalidated_dictionary_keys_without_panicking() {
+        let values = Arc::new(StringArray::from(vec!["only"]));
+        for key in [-1, 1] {
+            // SAFETY: The invalid dictionary is constructed deliberately to
+            // model unvalidated Arrow C data. The test only passes it through
+            // the guarded parameter-rendering path and never indexes it directly.
+            let dictionary = unsafe {
+                DictionaryArray::<Int8Type>::new_unchecked(
+                    Int8Array::from(vec![key]),
+                    values.clone(),
+                )
+            };
+            let field = Field::new("d", dictionary.data_type().clone(), false);
+            let rejected = literal(&field, &dictionary, 0).unwrap_err();
+            assert_eq!(rejected.status, Status::InvalidData);
+            assert!(rejected.message.contains("outside the values array"));
+        }
     }
 }

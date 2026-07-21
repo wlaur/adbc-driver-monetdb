@@ -2,30 +2,31 @@ from __future__ import annotations
 
 import argparse
 import io
+import struct
 import tarfile
 import tomllib
 from pathlib import Path
-from zipfile import ZipFile
 
 PLATFORMS = {
-    "linux_amd64": ("MANIFEST.linux.toml", ".so"),
-    "linux_arm64": ("MANIFEST.linux.toml", ".so"),
-    "macos_arm64": ("MANIFEST.macos.toml", ".so"),
-    "windows_amd64": ("MANIFEST.windows.toml", ".pyd"),
+    "linux_amd64": ("MANIFEST.linux.toml", ".so", "elf", 62),
+    "linux_arm64": ("MANIFEST.linux.toml", ".so", "elf", 183),
+    "macos_arm64": ("MANIFEST.macos.toml", ".dylib", "macho", 0x0100000C),
+    "windows_amd64": ("MANIFEST.windows.toml", ".dll", "pe", 0x8664),
 }
-LICENSE_MEMBERS = {
-    "/licenses/LICENSE": "LICENSE",
-    "/licenses/NOTICE": "NOTICE",
-    "/licenses/monetdb-rust/LICENSE": "LICENSE.monetdb-rust",
+LICENSE_FILES = {
+    "LICENSE": "LICENSE",
+    "NOTICE": "NOTICE",
+    "monetdb-rust/LICENSE": "LICENSE.monetdb-rust",
 }
 
 
 def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build a dbc-installable MonetDB ADBC driver archive")
-    parser.add_argument("--wheel", type=Path, required=True)
+    parser.add_argument("--library", type=Path, required=True)
     parser.add_argument("--platform", choices=PLATFORMS, required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--license", type=Path, required=True)
+    parser.add_argument("--source-root", type=Path)
     return parser.parse_args()
 
 
@@ -36,36 +37,53 @@ def _add_bytes(archive: tarfile.TarFile, name: str, content: bytes) -> None:
     archive.addfile(info, io.BytesIO(content))
 
 
-def build_package(wheel: Path, platform: str, out_dir: Path, license_path: Path) -> Path:
-    template_name, native_suffix = PLATFORMS[platform]
+def _machine(binary: bytes, kind: str) -> int:
+    if kind == "elf":
+        if len(binary) < 20 or binary[:6] != b"\x7fELF\x02\x01":
+            raise ValueError("standalone library is not a little-endian 64-bit ELF binary")
+        return struct.unpack_from("<H", binary, 18)[0]
+    if kind == "macho":
+        if len(binary) < 8 or binary[:4] != b"\xcf\xfa\xed\xfe":
+            raise ValueError("standalone library is not a little-endian 64-bit Mach-O binary")
+        return struct.unpack_from("<I", binary, 4)[0]
+    if len(binary) < 64 or binary[:2] != b"MZ":
+        raise ValueError("standalone library is not a PE binary")
+    header = struct.unpack_from("<I", binary, 0x3C)[0]
+    if header + 6 > len(binary) or binary[header : header + 4] != b"PE\0\0":
+        raise ValueError("standalone library has an invalid PE header")
+    return struct.unpack_from("<H", binary, header + 4)[0]
+
+
+def build_package(
+    library: Path,
+    platform: str,
+    out_dir: Path,
+    license_path: Path,
+    source_root: Path | None = None,
+) -> Path:
+    template_name, native_suffix, binary_kind, expected_machine = PLATFORMS[platform]
+    if library.suffix.lower() != native_suffix:
+        raise ValueError(f"{platform} requires a {native_suffix} standalone library, got {library.name}")
+    library_bytes = library.read_bytes()
+    machine = _machine(library_bytes, binary_kind)
+    if machine != expected_machine:
+        raise ValueError(f"standalone library machine {machine:#x} does not match {platform} ({expected_machine:#x})")
+
     template_path = Path(__file__).with_name(template_name)
     manifest_bytes = template_path.read_bytes()
     manifest = tomllib.loads(manifest_bytes.decode())
     version = manifest["version"]
     driver_name = manifest["Files"]["driver"]
-    project_path = Path(__file__).parents[2] / "pyproject.toml"
-    project_version = tomllib.loads(project_path.read_text())["project"]["version"]
+    root = Path(__file__).parents[2] if source_root is None else source_root
+    project_version = tomllib.loads((root / "pyproject.toml").read_text())["project"]["version"]
     if version != project_version:
         raise ValueError(f"manifest version {version} does not match project version {project_version}")
 
-    with ZipFile(wheel) as wheel_archive:
-        native_members = [
-            name
-            for name in wheel_archive.namelist()
-            if name.startswith("adbc_driver_monetdb/_native") and name.endswith(native_suffix)
-        ]
-        if len(native_members) != 1:
-            raise ValueError(f"expected one native driver in {wheel}, found {native_members}")
-        files = {
-            driver_name: wheel_archive.read(native_members[0]),
-            "THIRD_PARTY_LICENSES": license_path.read_bytes(),
-        }
-        for suffix, archive_name in LICENSE_MEMBERS.items():
-            members = [name for name in wheel_archive.namelist() if name.endswith(suffix)]
-            if len(members) != 1:
-                raise ValueError(f"expected one {suffix} in {wheel}, found {members}")
-            files[archive_name] = wheel_archive.read(members[0])
-
+    files = {
+        driver_name: library_bytes,
+        "THIRD_PARTY_LICENSES": license_path.read_bytes(),
+        **{archive_name: (root / source).read_bytes() for source, archive_name in LICENSE_FILES.items()},
+    }
     out_dir.mkdir(parents=True, exist_ok=True)
     output = out_dir / f"monetdb_{platform}_v{version}.tar.gz"
     with tarfile.open(output, "w:gz") as archive:
@@ -77,7 +95,7 @@ def build_package(wheel: Path, platform: str, out_dir: Path, license_path: Path)
 
 def main() -> None:
     args = _arguments()
-    print(build_package(args.wheel, args.platform, args.out_dir, args.license))
+    print(build_package(args.library, args.platform, args.out_dir, args.license, args.source_root))
 
 
 if __name__ == "__main__":

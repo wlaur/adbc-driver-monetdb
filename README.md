@@ -19,10 +19,13 @@ with dbapi.connect("monetdb://user:password@localhost:50000/db") as conn:
 
 # or resolved from the URI scheme:
 df = pl.read_database_uri("SELECT 1", "monetdb://localhost:50000/db", engine="adbc")
+# TLS URIs resolve through the bundled adbc_driver_monetdbs shim:
+secure_df = pl.read_database_uri("SELECT 1", "monetdbs://localhost:50000/db", engine="adbc")
 ```
 
 The DB-API connection starts with autocommit disabled, as required by PEP 249. Call
-`conn.commit()`, use the connection context manager, or pass `autocommit=True` explicitly.
+`conn.commit()` to persist a transaction, or pass `autocommit=True` explicitly. Closing a
+connection, including by leaving its context manager, rolls back uncommitted work.
 Consume or close a query's result stream before executing another statement or changing
 transaction state on the same connection. Use independent connections for parallel queries;
 ADBC permits drivers to block or reject concurrent statements on one connection, and MonetDB's
@@ -213,9 +216,22 @@ HUGEINT and TIMETZ remain round-trippable when loaded as extension types. The
 −(10^38−1) through 10^38−1; wider values in MonetDB's signed 128-bit domain return a bounded
 conversion error instead of silently changing the public Arrow type.
 
+Backend-specific type boundaries are explicit:
+
+| MonetDB type | Query results | Parameter binding | Bulk ingest |
+|---|---|---|---|
+| GEOMETRY | Cast to `VARCHAR` in SQL | Not implemented | Not implemented |
+| Legacy INET | Cast to `VARCHAR` in SQL | Not implemented | `NotImplemented` |
+| INET4 / INET6 | UTF-8 Arrow extension values | Supported | `NotImplemented` |
+| OID | One-row results; multi-row results require a `VARCHAR` cast | Supported as bounded `UInt64` | `NotImplemented` |
+
+MonetDB does not expose compatible `Xexportbin` or `COPY BINARY` representations for the waived
+paths. The driver returns bounded errors instead of adding a lossy text-protocol fallback.
+
 ## dbc packages and driver-manager loading
 
-Each platform wheel can also be converted to a flat `dbc` package. Installing that archive makes
+Each release target also builds a standalone, non-Python `cdylib` for a flat `dbc` package.
+Installing that archive makes
 the driver discoverable as `monetdb` by C/C++, Go, R, Ruby, Rust, Python, and other ADBC driver
 managers. `dbc` writes the installed ADBC TOML manifest with an absolute shared-library path; a
 relative `Driver.shared` path is not portable.
@@ -225,10 +241,10 @@ cargo about generate --all-features --fail --locked \
     --target aarch64-apple-darwin,aarch64-unknown-linux-gnu,x86_64-pc-windows-msvc,x86_64-unknown-linux-gnu \
     license.tpl > THIRD_PARTY_LICENSES
 uv run python packaging/dbc/build_package.py \
-    --wheel dist/adbc_driver_monetdb-0.8.0-cp313-abi3-macosx_11_0_arm64.whl \
+    --library target/release/libadbc_monetdb.dylib \
     --platform macos_arm64 --out-dir dist/dbc --license THIRD_PARTY_LICENSES
 ADBC_DRIVER_PATH="$PWD/.adbc-drivers" \
-    uvx --from dbc dbc install --no-verify dist/dbc/monetdb_macos_arm64_v0.8.0.tar.gz
+    uvx --from dbc dbc install --no-verify dist/dbc/monetdb_macos_arm64_v*.tar.gz
 ```
 
 The repository packages are unsigned development artifacts, hence `--no-verify`. A registry
@@ -251,9 +267,11 @@ with dbapi.connect(
 ```
 
 The URI-string conveniences `pl.read_database_uri(..., engine="adbc")` and
-`DataFrame.write_database(..., connection="monetdb://...")` still import
-`adbc_driver_monetdb` by scheme and therefore require the PyPI package. Both distribution channels
-are intentional and ship the same native driver.
+`DataFrame.write_database(..., connection="monetdb://...")` import the driver package by URI
+scheme and therefore require the Python distribution. The wheel includes both
+`adbc_driver_monetdb` and the TLS alias `adbc_driver_monetdbs`, so both `monetdb://` and
+`monetdbs://` work through those conveniences. Both distribution channels are intentional and
+ship the same native driver.
 
 ## Repository layout
 
@@ -267,7 +285,7 @@ are intentional and ship the same native driver.
 
 ## Development
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for bug, security, feature-request, and contribution
+See [CONTRIBUTING.md](https://github.com/wlaur/adbc-driver-monetdb/blob/main/CONTRIBUTING.md) for bug, security, feature-request, and contribution
 guidance.
 
 ```sh

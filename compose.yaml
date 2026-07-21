@@ -1,6 +1,7 @@
 services:
   monetdb:
     image: monetdb/monetdb:Dec2025-SP3@sha256:a71e6e8c8402beadc51aebf944b465ee5b185c7ae4a9e6808b5d9133ee921786
+    platform: linux/amd64
     ports:
       - "50000:50000"
     environment:

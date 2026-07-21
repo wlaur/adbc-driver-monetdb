@@ -196,7 +196,14 @@ pub fn encode_column(field: &Field, array: &dyn Array) -> Result<Vec<u8>, Encode
     match array.data_type() {
         DataType::Null => {
             let values = downcast::<NullArray>(array, DataType::Null)?;
-            out.resize(values.len() * 2, 0);
+            let encoded_len = values
+                .len()
+                .checked_mul(2)
+                .ok_or(EncodeError::InvalidValue {
+                    row: 0,
+                    message: "NULL column is too large to encode",
+                })?;
+            out.resize(encoded_len, 0);
             for pair in out.chunks_exact_mut(2) {
                 pair[0] = 0x80;
             }
