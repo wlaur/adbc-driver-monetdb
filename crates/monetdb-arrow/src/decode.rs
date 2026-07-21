@@ -555,36 +555,42 @@ where
     Ok(Some(Arc::new(array)))
 }
 
-/// Decode the current inline text row of a MAPI result through the same
+/// Decode the current inline text rows of a MAPI result through the same
 /// validated wire-to-Arrow path used by `Xexportbin`.
-pub fn decode_inline_row(
+pub fn decode_inline_rows(
     cursor: &mut Cursor,
     columns: &[ResultColumn],
+    expected_rows: usize,
 ) -> Result<RecordBatch, DecodeError> {
-    if !cursor.next_row()? {
-        return Err(DecodeError::InvalidValue {
-            row: 0,
-            message: "inline result did not contain a row",
-        });
-    }
     let fields = columns
         .iter()
         .map(field_for_column)
         .collect::<Result<Vec<_>, _>>()?;
+    let mut buffers = columns.iter().map(|_| Vec::new()).collect::<Vec<_>>();
+    let mut rows = 0;
+    while cursor.next_row()? {
+        if rows >= expected_rows {
+            return Err(DecodeError::InvalidValue {
+                row: rows,
+                message: "inline result contained more rows than reported",
+            });
+        }
+        for (index, column) in columns.iter().enumerate() {
+            buffers[index].extend(inline_wire_value(cursor, index, column.sql_type())?);
+        }
+        rows += 1;
+    }
+    if rows != expected_rows {
+        return Err(DecodeError::RowCount {
+            requested: expected_rows,
+            actual: rows,
+        });
+    }
     let arrays = columns
         .iter()
         .enumerate()
-        .map(|(index, column)| {
-            let bytes = inline_wire_value(cursor, index, column.sql_type())?;
-            decode_column(column.sql_type(), &bytes, 1)
-        })
+        .map(|(index, column)| decode_column(column.sql_type(), &buffers[index], rows))
         .collect::<Result<Vec<_>, _>>()?;
-    if cursor.next_row()? {
-        return Err(DecodeError::InvalidValue {
-            row: 1,
-            message: "inline scalar result contained more than one row",
-        });
-    }
     Ok(RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)?)
 }
 
