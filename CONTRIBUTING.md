@@ -45,3 +45,10 @@ MONETDB_TEST_URI=monetdb://monetdb:monetdb@localhost:50000/test uv run pytest -m
 
 Changes are accepted under the repository's MIT and MPL-2.0 license boundary described in
 `AGENTS.md` and `NOTICE`.
+
+## Release recovery
+
+Release uploads fail if any filename already exists on PyPI. If publishing succeeds but a later
+job fails, rerun only the failed jobs in GitHub Actions; do not rerun the complete workflow or
+delete and recreate the tag. This preserves the protected-main provenance check and prevents a
+partial or conflicting upload from being reported as successful.

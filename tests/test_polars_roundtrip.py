@@ -1083,7 +1083,8 @@ def test_dtype_matrix_roundtrip(monetdb_uri: str) -> None:
             back = pl.read_database("SELECT * FROM dtype_matrix", conn)
             assert back.equals(expected)
         finally:
-            conn.cursor().execute("DROP TABLE IF EXISTS dtype_matrix")
+            with conn.cursor() as cursor:
+                cursor.execute("DROP TABLE IF EXISTS dtype_matrix")
 
 
 @pytest.mark.integration

@@ -827,44 +827,104 @@ struct XdbcType {
 
 fn xdbc_type(column: &ObjectColumn) -> XdbcType {
     let name = column.type_name.to_ascii_lowercase();
+    // These values mirror MonetDB's canonical ODBC metadata definitions in
+    // `clients/odbc/driver/ODBCQueries.h` (DATA_TYPE, COLUMN_SIZE,
+    // DECIMAL_DIGITS, NUM_PREC_RADIX, SQL_DATA_TYPE, SQL_DATETIME_SUB, and
+    // CHAR_OCTET_LENGTH).
     let (data_type, sql_data_type, datetime_sub) = match name.as_str() {
         "boolean" => (Some(16), Some(16), None),
         "tinyint" => (Some(-6), Some(-6), None),
         "smallint" => (Some(5), Some(5), None),
         "int" | "integer" => (Some(4), Some(4), None),
         "bigint" => (Some(-5), Some(-5), None),
-        "hugeint" | "decimal" => (Some(3), Some(3), None),
+        "hugeint" => (Some(16_384), Some(16_384), None),
+        "decimal" => (Some(3), Some(3), None),
         "real" => (Some(7), Some(7), None),
         "double" => (Some(8), Some(8), None),
         "date" => (Some(91), Some(9), Some(1)),
         "time" | "timetz" => (Some(92), Some(9), Some(2)),
         "timestamp" | "timestamptz" => (Some(93), Some(9), Some(3)),
         "blob" => (Some(-4), Some(-4), None),
-        "char" => (Some(1), Some(1), None),
-        "varchar" | "json" | "url" | "inet" => (Some(12), Some(12), None),
-        "uuid" => (Some(-11), Some(-11), None),
-        _ if name.contains("month_interval") || name.contains("month interval") => {
-            (Some(107), Some(10), Some(107))
-        }
-        _ if name.contains("interval") => (Some(110), Some(10), Some(110)),
+        "char" => (Some(-8), Some(-8), None),
+        "clob" => (Some(-10), Some(-10), None),
+        "varchar" => (Some(-9), Some(-9), None),
+        "uuid" => (None, Some(-11), None),
+        "day_interval" => (None, Some(10), Some(3)),
+        "month_interval" => match column.digits {
+            1 => (Some(101), Some(10), Some(1)),
+            2 => (Some(107), Some(10), Some(7)),
+            3 => (Some(102), Some(10), Some(2)),
+            _ => (None, Some(10), None),
+        },
+        "sec_interval" => match column.digits {
+            4 => (Some(103), Some(10), Some(3)),
+            5 => (Some(108), Some(10), Some(8)),
+            6 => (Some(109), Some(10), Some(9)),
+            7 => (Some(110), Some(10), Some(10)),
+            8 => (Some(104), Some(10), Some(4)),
+            9 => (Some(111), Some(10), Some(11)),
+            10 => (Some(112), Some(10), Some(12)),
+            11 => (Some(105), Some(10), Some(5)),
+            12 => (Some(113), Some(10), Some(13)),
+            13 => (Some(106), Some(10), Some(6)),
+            _ => (None, Some(10), None),
+        },
         _ => (None, None, None),
     };
-    let size = if name == "hugeint" {
-        Some(38)
-    } else {
-        (column.digits > 0).then_some(column.digits)
+    let size = match name.as_str() {
+        "date" => Some(10),
+        "day_interval" => Some(25),
+        "month_interval" => match column.digits {
+            1 => Some(26),
+            2 => Some(38),
+            3 => Some(27),
+            _ => None,
+        },
+        "sec_interval" => match column.digits {
+            4 => Some(25),
+            5 => Some(36),
+            6 => Some(41),
+            7 => Some(47),
+            8 => Some(26),
+            9 => Some(39),
+            10 => Some(45),
+            11 => Some(28),
+            12 => Some(44),
+            13 => Some(30),
+            _ => None,
+        },
+        "time" | "timetz" => Some(12),
+        "timestamp" | "timestamptz" => Some(23),
+        "uuid" => Some(36),
+        _ => (column.digits > 0).then_some(column.digits),
     };
-    let decimal_digits = (name == "decimal")
-        .then(|| i16::try_from(column.scale).ok())
-        .flatten();
-    let radix = matches!(
-        name.as_str(),
-        "tinyint" | "smallint" | "int" | "integer" | "bigint" | "hugeint" | "decimal"
-    )
-    .then_some(10);
-    let char_length = matches!(name.as_str(), "char" | "varchar" | "json" | "url" | "inet")
-        .then_some(column.digits)
-        .filter(|length| *length > 0);
+    let decimal_digits = match name.as_str() {
+        "tinyint" | "smallint" | "int" | "integer" | "bigint" | "hugeint" | "day_interval"
+        | "month_interval" | "sec_interval" => Some(0),
+        "decimal" => i16::try_from(column.scale).ok(),
+        "real" if column.digits == 24 && column.scale == 0 => Some(7),
+        "double" if column.digits == 53 && column.scale == 0 => Some(15),
+        "real" | "double" => i16::try_from(column.digits).ok(),
+        "time" | "timetz" | "timestamp" | "timestamptz" => column
+            .digits
+            .checked_sub(1)
+            .and_then(|value| i16::try_from(value).ok()),
+        _ => None,
+    };
+    let radix = match name.as_str() {
+        "tinyint" | "smallint" | "int" | "integer" | "bigint" | "hugeint" => Some(2),
+        "decimal" => Some(10),
+        "real" if column.digits == 24 && column.scale == 0 => Some(2),
+        "double" if column.digits == 53 && column.scale == 0 => Some(2),
+        "real" | "double" => Some(10),
+        _ => None,
+    };
+    let char_length = match name.as_str() {
+        "char" | "varchar" | "clob" | "json" | "url" | "xml" => column.digits.checked_mul(4),
+        "blob" => Some(column.digits),
+        _ => None,
+    }
+    .filter(|length| *length > 0);
     XdbcType {
         data_type,
         sql_data_type,
@@ -925,29 +985,68 @@ mod tests {
     }
 
     #[test]
-    fn maps_xdbc_types_without_losing_hugeint_or_datetime_subtypes() {
-        let column = |type_name: &str, digits: i32| ObjectColumn {
+    fn maps_canonical_monetdb_xdbc_metadata() {
+        let column = |type_name: &str, digits: i32, scale: i32| ObjectColumn {
             name: "x".into(),
             ordinal: 1,
             remarks: None,
             type_name: type_name.into(),
             digits,
-            scale: 0,
+            scale,
             nullable: true,
             default_value: None,
         };
-        assert_eq!(xdbc_type(&column("char", 8)).data_type, Some(1));
-        let hugeint = xdbc_type(&column("hugeint", 128));
-        assert_eq!((hugeint.data_type, hugeint.size), (Some(3), Some(38)));
-        let timestamp = xdbc_type(&column("timestamp", 6));
+        let int = xdbc_type(&column("int", 31, 0));
+        assert_eq!(
+            (int.size, int.decimal_digits, int.radix),
+            (Some(31), Some(0), Some(2))
+        );
+        let decimal = xdbc_type(&column("decimal", 12, 3));
+        assert_eq!(
+            (decimal.size, decimal.decimal_digits, decimal.radix),
+            (Some(12), Some(3), Some(10))
+        );
+        let real = xdbc_type(&column("real", 24, 0));
+        assert_eq!((real.decimal_digits, real.radix), (Some(7), Some(2)));
+        let double = xdbc_type(&column("double", 53, 0));
+        assert_eq!((double.decimal_digits, double.radix), (Some(15), Some(2)));
+        let varchar = xdbc_type(&column("varchar", 9, 0));
+        assert_eq!(
+            (varchar.data_type, varchar.size, varchar.char_length),
+            (Some(-9), Some(9), Some(36))
+        );
+        let blob = xdbc_type(&column("blob", 32, 0));
+        assert_eq!((blob.data_type, blob.char_length), (Some(-4), Some(32)));
+        let uuid = xdbc_type(&column("uuid", 0, 0));
+        assert_eq!(
+            (uuid.data_type, uuid.sql_data_type, uuid.size),
+            (None, Some(-11), Some(36))
+        );
+        let timestamp = xdbc_type(&column("timestamp", 3, 0));
         assert_eq!(
             (
                 timestamp.data_type,
                 timestamp.sql_data_type,
-                timestamp.datetime_sub
+                timestamp.datetime_sub,
+                timestamp.size,
+                timestamp.decimal_digits,
             ),
-            (Some(93), Some(9), Some(3))
+            (Some(93), Some(9), Some(3), Some(23), Some(2))
         );
-        assert_eq!(xdbc_type(&column("month_interval", 0)).data_type, Some(107));
+        let interval = xdbc_type(&column("sec_interval", 12, 0));
+        assert_eq!(
+            (
+                interval.data_type,
+                interval.sql_data_type,
+                interval.datetime_sub,
+                interval.size
+            ),
+            (Some(113), Some(10), Some(13), Some(44))
+        );
+        let extension = xdbc_type(&column("json", 64, 0));
+        assert_eq!(
+            (extension.data_type, extension.char_length),
+            (None, Some(256))
+        );
     }
 }

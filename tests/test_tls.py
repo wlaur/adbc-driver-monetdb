@@ -1,16 +1,20 @@
-import hashlib
-import re
+import ipaddress
 import socket
 import ssl
-import subprocess
 from contextlib import suppress
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Event, Thread
 from types import TracebackType
 from urllib.parse import quote, urlencode, urlsplit
 
 import adbc_driver_manager
+import polars as pl
 import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 from adbc_driver_monetdb import dbapi
 
@@ -86,99 +90,97 @@ class _TlsProxy:
             destination.shutdown(socket.SHUT_WR)
 
 
-def _openssl(directory: Path, *arguments: str) -> None:
-    subprocess.run(
-        ["openssl", *arguments],
-        cwd=directory,
-        check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-    )
-
-
 def _certificates(directory: Path) -> tuple[Path, Path, Path, Path, str]:
-    try:
-        version = subprocess.run(
-            ["openssl", "version"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        pytest.skip("OpenSSL 3 CLI is required for TLS certificate tests")
-    match = re.match(r"OpenSSL\s+(\d+)", version)
-    if match is None or int(match.group(1)) < 3:
-        pytest.skip("OpenSSL 3 CLI is required for -copy_extensions")
-
     ca = directory / "ca.crt"
     server = directory / "server.crt"
     client = directory / "client.crt"
-    _openssl(
-        directory,
-        "req",
-        "-x509",
-        "-newkey",
-        "rsa:2048",
-        "-nodes",
-        "-keyout",
-        "ca.key",
-        "-out",
-        ca.name,
-        "-subj",
-        "/CN=ADBC Test CA",
-        "-addext",
-        "basicConstraints=critical,CA:TRUE",
-        "-addext",
-        "keyUsage=critical,keyCertSign,cRLSign",
-        "-days",
-        "1",
-    )
-    for name, common_name, usage in [
-        ("server", "localhost", "serverAuth"),
-        ("client", "ADBC Client", "clientAuth"),
-    ]:
-        arguments = [
-            "req",
-            "-new",
-            "-newkey",
-            "rsa:2048",
-            "-nodes",
-            "-keyout",
-            f"{name}.key",
-            "-out",
-            f"{name}.csr",
-            "-subj",
-            f"/CN={common_name}",
-            "-addext",
-            "basicConstraints=critical,CA:FALSE",
-            "-addext",
-            "keyUsage=critical,digitalSignature,keyEncipherment",
-            "-addext",
-            f"extendedKeyUsage={usage}",
-        ]
-        if name == "server":
-            arguments.extend(["-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1"])
-        _openssl(directory, *arguments)
-        _openssl(
-            directory,
-            "x509",
-            "-req",
-            "-in",
-            f"{name}.csr",
-            "-CA",
-            ca.name,
-            "-CAkey",
-            "ca.key",
-            "-CAcreateserial",
-            "-out",
-            f"{name}.crt",
-            "-days",
-            "1",
-            "-copy_extensions",
-            "copy",
+    now = datetime.now(UTC)
+    ca_key = rsa.generate_private_key(public_exponent=65_537, key_size=2048)
+    ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "ADBC Test CA")])
+    ca_cert = (
+        x509.CertificateBuilder()
+        .subject_name(ca_name)
+        .issuer_name(ca_name)
+        .public_key(ca_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=1))
+        .not_valid_after(now + timedelta(days=1))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=False,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=True,
+                crl_sign=True,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
         )
-    der = ssl.PEM_cert_to_DER_cert(server.read_text())
-    fingerprint = hashlib.sha256(der).hexdigest()
+        .sign(ca_key, hashes.SHA256())
+    )
+    ca.write_bytes(ca_cert.public_bytes(serialization.Encoding.PEM))
+    (directory / "ca.key").write_bytes(
+        ca_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+
+    leaf_certificates: dict[str, x509.Certificate] = {}
+    for name, common_name, usage in [
+        ("server", "localhost", ExtendedKeyUsageOID.SERVER_AUTH),
+        ("client", "ADBC Client", ExtendedKeyUsageOID.CLIENT_AUTH),
+    ]:
+        key = rsa.generate_private_key(public_exponent=65_537, key_size=2048)
+        subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
+        builder = (
+            x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(ca_name)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - timedelta(minutes=1))
+            .not_valid_after(now + timedelta(days=1))
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .add_extension(
+                x509.KeyUsage(
+                    digital_signature=True,
+                    content_commitment=False,
+                    key_encipherment=True,
+                    data_encipherment=False,
+                    key_agreement=False,
+                    key_cert_sign=False,
+                    crl_sign=False,
+                    encipher_only=False,
+                    decipher_only=False,
+                ),
+                critical=True,
+            )
+            .add_extension(x509.ExtendedKeyUsage([usage]), critical=False)
+        )
+        if name == "server":
+            builder = builder.add_extension(
+                x509.SubjectAlternativeName(
+                    [x509.DNSName("localhost"), x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]
+                ),
+                critical=False,
+            )
+        certificate = builder.sign(ca_key, hashes.SHA256())
+        leaf_certificates[name] = certificate
+        (directory / f"{name}.crt").write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+        (directory / f"{name}.key").write_bytes(
+            key.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.PKCS8,
+                serialization.NoEncryption(),
+            )
+        )
+    fingerprint = leaf_certificates["server"].fingerprint(hashes.SHA256()).hex()
     return ca, server, directory / "server.key", client, fingerprint
 
 
@@ -215,10 +217,14 @@ def test_tls_system_roots_custom_ca_and_client_certificates(monetdb_uri: str, tm
     ca, server, server_key, client, fingerprint = _certificates(tmp_path)
 
     with _TlsProxy(_server_context(server, server_key), parsed.hostname, parsed.port or 50000) as proxy:
-        assert _select_42(_tls_uri(monetdb_uri, proxy.port, certhash=f"sha256:{fingerprint[:17]}")) == (42,)
-        assert _select_42(_tls_uri(monetdb_uri, proxy.port, cert=str(ca))) == (42,)
+        hash_uri = _tls_uri(monetdb_uri, proxy.port, certhash=f"sha256:{fingerprint[:17]}")
+        ca_uri = _tls_uri(monetdb_uri, proxy.port, cert=str(ca))
+        assert _select_42(hash_uri) == (42,)
+        assert _select_42(ca_uri) == (42,)
+        assert pl.read_database_uri("SELECT 42 AS value", hash_uri, engine="adbc").item() == 42
+        assert pl.read_database_uri("SELECT 42 AS value", ca_uri, engine="adbc").item() == 42
         with pytest.raises(adbc_driver_manager.OperationalError):
-            dbapi.connect(_tls_uri(monetdb_uri, proxy.port, certhash="sha256:deadbeef"))
+            dbapi.connect(_tls_uri(monetdb_uri, proxy.port, certhash="sha256:deadbeefdeadbeef"))
         with pytest.raises(adbc_driver_manager.OperationalError):
             dbapi.connect(_tls_uri(monetdb_uri, proxy.port))
 

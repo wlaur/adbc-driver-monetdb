@@ -626,15 +626,8 @@ impl Database for MonetdbDatabase {
                 Status::Internal,
             )
         })?;
-        let connection = connection_result.map_err(|value| {
-            let status = match value {
-                monetdb::ConnectError::Rejected(_) => Status::Unauthenticated,
-                monetdb::ConnectError::Timeout => Status::Timeout,
-                monetdb::ConnectError::IO(_) => Status::IO,
-                _ => Status::InvalidArguments,
-            };
-            map_display(value, status)
-        })?;
+        let connection =
+            connection_result.map_err(|value| map_display(&value, connect_error_status(&value)))?;
         let server_info = connection.server_info().map_err(map_cursor_error)?;
         if server_info.endian != Endian::Lit {
             return Err(error(
@@ -690,6 +683,16 @@ impl Database for MonetdbDatabase {
             result.set_option(key, value)?;
         }
         Ok(result)
+    }
+}
+
+fn connect_error_status(value: &monetdb::ConnectError) -> Status {
+    match value {
+        monetdb::ConnectError::Rejected(_) => Status::Unauthenticated,
+        monetdb::ConnectError::Timeout => Status::Timeout,
+        monetdb::ConnectError::IO(_) => Status::IO,
+        monetdb::ConnectError::SocketAttempts { tcp, .. } => connect_error_status(tcp),
+        _ => Status::InvalidArguments,
     }
 }
 
@@ -1695,7 +1698,7 @@ fn validate_append_schema(
         if field.name() != column.name() {
             return Err(error(
                 format!(
-                    "append column {index} is named {:?}, but destination column is named {:?}",
+                    "append column {index} is named {:?}, but destination column is named {:?}; append schemas are positional and column order must match",
                     field.name(),
                     column.name()
                 ),
@@ -2233,9 +2236,6 @@ fn query_reader_with_timeouts(
         return Err(not_implemented(
             "multi-row OID results are unavailable through Xexportbin; cast OID columns to VARCHAR in SQL",
         ));
-    }
-    if total_rows >= 16_384 && result.columns.len() > 1 {
-        monetdb_arrow::initialize_parallel_decoder();
     }
     if !result.is_server_resident() {
         let rows = usize::try_from(total_rows).map_err(|_| {

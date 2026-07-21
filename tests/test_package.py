@@ -8,6 +8,8 @@ import adbc_driver_manager.dbapi as manager_dbapi
 import pytest
 
 import adbc_driver_monetdb
+import adbc_driver_monetdbs
+import adbc_driver_monetdbs.dbapi as secure_dbapi
 from adbc_driver_monetdb import dbapi
 
 
@@ -28,6 +30,9 @@ def test_dbapi_module_surface() -> None:
     assert dbapi.threadsafety == 1
     assert dbapi.Connection is manager_dbapi.Connection
     assert dbapi.Error is manager_dbapi.Error
+    assert adbc_driver_monetdbs.ENTRYPOINT == adbc_driver_monetdb.ENTRYPOINT
+    assert adbc_driver_monetdbs.driver_path is adbc_driver_monetdb.driver_path
+    assert secure_dbapi.connect is dbapi.connect
 
 
 def test_connect_rejects_invalid_uri() -> None:
@@ -43,6 +48,15 @@ def test_connect_rejects_unreachable_tcp_without_poisoning_driver() -> None:
             dbapi.connect(f"monetdb://127.0.0.1:{port}/test?connect_timeout=1")
     with pytest.raises(adbc_driver_manager.ProgrammingError):
         dbapi.connect("still-not-a-uri")
+
+
+def test_connect_rejects_unreachable_localhost_as_io() -> None:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    with pytest.raises(adbc_driver_manager.OperationalError) as caught:
+        dbapi.connect(f"monetdb://localhost:{port}/test?connect_timeout=2")
+    assert caught.value.status_code == adbc_driver_manager.AdbcStatusCode.IO
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Unix sockets are not available on Windows")

@@ -120,15 +120,40 @@ jobs:
         with:
           name: dependency-licenses
       - run: uv build --sdist --out-dir dist
+      - name: Verify the sdist license roll-up
+        shell: bash
+        run: |
+          python - <<'PY'
+          import tarfile
+          from glob import glob
+          sdists = glob("dist/*.tar.gz")
+          assert len(sdists) == 1, sdists
+          with tarfile.open(sdists[0]) as archive:
+              names = archive.getnames()
+          assert any(name.endswith("/THIRD_PARTY_LICENSES") for name in names), names
+          PY
       - name: Rebuild and smoke-test from the sdist
         shell: bash
         run: |
           uv build dist/*.tar.gz --wheel --out-dir sdist-wheel
           wheel=$(find sdist-wheel -maxdepth 1 -name 'adbc_driver_monetdb-*.whl' -print -quit)
+          python - "$wheel" <<'PY'
+          import sys
+          from zipfile import ZipFile
+          with ZipFile(sys.argv[1]) as archive:
+              names = archive.namelist()
+          for suffix in (
+              ".dist-info/licenses/LICENSE",
+              ".dist-info/licenses/NOTICE",
+              ".dist-info/licenses/THIRD_PARTY_LICENSES",
+              ".dist-info/licenses/monetdb-rust/LICENSE",
+          ):
+              assert any(name.endswith(suffix) for name in names), suffix
+          PY
           wheel=$(realpath "$wheel")
           cd "$RUNNER_TEMP"
           uv run --isolated --no-project --python 3.13 --with "$wheel" \
-            python -c "import adbc_driver_monetdb as m; assert m.__version__; print(m.driver_path())"
+            python -c "import adbc_driver_monetdb as m; import adbc_driver_monetdbs.dbapi; assert m.__version__; print(m.driver_path())"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sdist
@@ -186,17 +211,39 @@ jobs:
               "adbc_driver_monetdb/_native.pyi",
               "adbc_driver_monetdb/dbapi.pyi",
               "adbc_driver_monetdb/py.typed",
+              "adbc_driver_monetdbs/__init__.py",
+              "adbc_driver_monetdbs/dbapi.py",
+              "adbc_driver_monetdbs/py.typed",
           ):
               assert any(name.endswith(suffix) for name in names), suffix
           PY
+      - name: Build the standalone dbc driver without Python
+        run: cargo build --locked --release -p adbc-monetdb --no-default-features
       - name: Audit Linux wheel dependencies
         if: runner.os == 'Linux'
         shell: bash
-        run: uvx --from auditwheel auditwheel show wheelhouse/*.whl
+        run: |
+          uvx --from auditwheel auditwheel show wheelhouse/*.whl
+          library=target/release/libadbc_monetdb.so
+          readelf -h -d "$library"
+          ldd "$library"
+          nm -D --defined-only "$library" | grep -F AdbcDriverMonetdbInit
+          if nm -D --undefined-only "$library" | grep -E '(^|[[:space:]])_?Py[A-Za-z0-9_]*$'; then
+            echo "standalone dbc driver imports Python runtime symbols" >&2
+            exit 1
+          fi
       - name: Audit macOS wheel dependencies
         if: runner.os == 'macOS'
         shell: bash
-        run: uvx --from delocate delocate-listdeps wheelhouse/*.whl
+        run: |
+          uvx --from delocate delocate-listdeps wheelhouse/*.whl
+          library=target/release/libadbc_monetdb.dylib
+          otool -hv -L "$library"
+          nm -gU "$library" | grep -F AdbcDriverMonetdbInit
+          if nm -u "$library" | grep -E '(^|[[:space:]])_?Py[A-Za-z0-9_]*$'; then
+            echo "standalone dbc driver imports Python runtime symbols" >&2
+            exit 1
+          fi
       - name: Audit Windows architecture and runtime dependencies
         if: runner.os == 'Windows'
         shell: pwsh
@@ -212,18 +259,33 @@ jobs:
           if (-not $dumpbin) { throw "dumpbin.exe was not found" }
           $headers = & $dumpbin.FullName /headers $native.FullName
           $imports = & $dumpbin.FullName /dependents $native.FullName
+          $dbc = Resolve-Path target\release\adbc_monetdb.dll
+          $dbcHeaders = & $dumpbin.FullName /headers $dbc
+          $dbcImports = & $dumpbin.FullName /dependents $dbc
+          $dbcExports = & $dumpbin.FullName /exports $dbc
           $headers | Write-Output
           $imports | Write-Output
+          $dbcHeaders | Write-Output
+          $dbcImports | Write-Output
+          $dbcExports | Write-Output
           if (-not ($headers -match "machine \(x64\)")) { throw "extension is not x86-64 PE" }
+          if (-not ($dbcHeaders -match "machine \(x64\)")) { throw "dbc driver is not x86-64 PE" }
+          if (-not ($dbcExports -match "AdbcDriverMonetdbInit")) { throw "dbc driver has no ADBC entrypoint" }
+          if ($dbcImports -match '(?i)python3[0-9]*\.dll') { throw "dbc driver imports the Python runtime" }
           $forbidden = $imports | Select-String -Pattern '(?i)\b(?:MSVCP|CONCRT)[^\s]*\.dll\b'
           if ($forbidden) { throw "extension unexpectedly depends on the C++ runtime: $forbidden" }
       - name: Build and load the dbc package
         shell: bash
         run: |
-          wheel=$(find wheelhouse -maxdepth 1 -name 'adbc_driver_monetdb-*.whl' -print -quit)
+          case '${{ runner.os }}' in
+            Linux) library=target/release/libadbc_monetdb.so ;;
+            macOS) library=target/release/libadbc_monetdb.dylib ;;
+            Windows) library=target/release/adbc_monetdb.dll ;;
+          esac
           python packaging/dbc/build_package.py \
-            --wheel "$wheel" --platform '${{ matrix.dbc_platform }}' --out-dir dbc-dist \
+            --library "$library" --platform '${{ matrix.dbc_platform }}' --out-dir dbc-dist \
             --license THIRD_PARTY_LICENSES
+          cargo run --locked -p adbc-monetdb --example dbc_smoke -- "$library"
           driver_path="$RUNNER_TEMP/adbc-drivers"
           mkdir -p "$driver_path"
           ADBC_DRIVER_PATH="$driver_path" uvx --from 'dbc==0.3.0' \
@@ -270,7 +332,7 @@ jobs:
           wheel=$(find "$GITHUB_WORKSPACE/wheelhouse" -maxdepth 1 -name 'adbc_driver_monetdb-*.whl' -print -quit)
           uv run --isolated --no-project --python '${{ matrix.python }}' \
             --with "$wheel" --with 'pytest>=9' --with 'polars>=1.42' --with 'pandas>=3.0' \
-            --with 'pyarrow>=25' --with 'sqlalchemy>=2.0' \
+            --with 'pyarrow>=25' --with 'sqlalchemy>=2.0' --with cryptography \
             python -m pytest "$GITHUB_WORKSPACE/tests" -m 'not integration and not local_only' \
               --ignore "$GITHUB_WORKSPACE/tests/validation" -q
 
@@ -335,7 +397,7 @@ jobs:
           wheel=$(find "$GITHUB_WORKSPACE/wheelhouse" -maxdepth 1 -name 'adbc_driver_monetdb-*.whl' -print -quit)
           uv run --isolated --no-project --python 3.13 \
             --with "$wheel" --with 'pytest>=9' --with 'polars>=1.42' --with 'pandas>=3.0' \
-            --with pymonetdb --with 'pyarrow>=25' --with 'sqlalchemy>=2.0' \
+            --with pymonetdb --with 'pyarrow>=25' --with 'sqlalchemy>=2.0' --with cryptography \
             python -m pytest "$GITHUB_WORKSPACE/tests" -m 'integration and not local_only' \
               --ignore "$GITHUB_WORKSPACE/tests/validation" -q
           uv run --isolated --no-project --python 3.13 \
@@ -357,6 +419,71 @@ jobs:
           name: documentation
           path: generated/monetdb.md
           if-no-files-found: error
+
+  integration-minimum:
+    name: integration minimum (MonetDB 11.55.1)
+    needs: build-wheels
+    runs-on: ubuntu-latest
+    services:
+      monetdb:
+        image: monetdb/monetdb:Dec2025@sha256:2d85475cd9324de70a5f6f14326918d39aa924862e9719d3ca87978cd8dd44ef
+        ports:
+          - 50000:50000
+        env:
+          MDB_DB_ADMIN_PASS: monetdb
+          MDB_CREATE_DBS: test
+    env:
+      MONETDB_TEST_URI: monetdb://monetdb:monetdb@localhost:50000/test
+      MONETDB_EXPECTED_SERVER_VERSION: 11.55.1
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: true
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          python-version: "3.13"
+      - name: Install current stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: wheelhouse
+          name: wheels-ubuntu-latest
+      - name: Wait for MonetDB to accept connections
+        run: |
+          uv run --isolated --no-project --python 3.13 --with pymonetdb python - <<'PY'
+          import time
+          import pymonetdb
+          for attempt in range(60):
+              try:
+                  pymonetdb.connect("monetdb://monetdb:monetdb@localhost:50000/test").close()
+                  print(f"MonetDB ready after {attempt + 1} attempts")
+                  break
+              except Exception as exc:
+                  last = exc
+                  time.sleep(2)
+          else:
+              raise SystemExit(f"MonetDB never became ready: {last}")
+          PY
+      - name: Run the monetdb-rust integration suite
+        working-directory: monetdb-rust
+        env:
+          CI_SERVER_URL: "monetdb://localhost:50000/test?user=monetdb&password=monetdb"
+        run: cargo test --all-features --test ci
+      - name: Run the suites against the installed minimum-version wheel
+        working-directory: ${{ runner.temp }}
+        run: |
+          wheel=$(find "$GITHUB_WORKSPACE/wheelhouse" -maxdepth 1 -name 'adbc_driver_monetdb-*.whl' -print -quit)
+          uv run --isolated --no-project --python 3.13 \
+            --with "$wheel" --with 'pytest>=9' --with 'polars>=1.42' --with 'pandas>=3.0' \
+            --with pymonetdb --with 'pyarrow>=25' --with 'sqlalchemy>=2.0' --with cryptography \
+            python -m pytest "$GITHUB_WORKSPACE/tests" -m 'integration and not local_only' \
+              --ignore "$GITHUB_WORKSPACE/tests/validation" -q
+          uv run --isolated --no-project --python 3.13 \
+            --with "$wheel" --with pytest --with pymonetdb \
+            --with 'adbc-drivers-validation @ git+https://github.com/adbc-drivers/validation@a4019a3f44ccffcbec4b5203531a88259d588257' \
+            python -m pytest "$GITHUB_WORKSPACE/tests/validation" -q
 
   integration-arm:
     name: integration arm64 (MonetDB Dec2025)
@@ -427,7 +554,7 @@ jobs:
           wheel=$(find "$GITHUB_WORKSPACE/wheelhouse" -maxdepth 1 -name 'adbc_driver_monetdb-*.whl' -print -quit)
           uv run --isolated --no-project --python 3.13 \
             --with "$wheel" --with 'pytest>=9' --with 'polars>=1.42' --with 'pandas>=3.0' \
-            --with pymonetdb --with 'pyarrow>=25' --with 'sqlalchemy>=2.0' \
+            --with pymonetdb --with 'pyarrow>=25' --with 'sqlalchemy>=2.0' --with cryptography \
             python -m pytest "$GITHUB_WORKSPACE/tests" -m 'integration and not local_only' \
               --ignore "$GITHUB_WORKSPACE/tests/validation" -q
       - name: Run the validation suite against the installed ARM64 wheel
@@ -442,7 +569,7 @@ jobs:
 
   publish:
     name: publish to PyPI
-    needs: [lint, rust, build-sdist, build-wheels, test, integration, integration-arm]
+    needs: [lint, rust, build-sdist, build-wheels, test, integration, integration-minimum, integration-arm]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     environment: pypi               # configure the Trusted Publisher against this env
@@ -451,30 +578,13 @@ jobs:
       contents: read                # checkout below reads pyproject.toml to guard the tag
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - name: Verify the tag matches the pyproject version
+        with:
+          fetch-depth: 0
+      - name: Verify protected-main provenance and release versions
         run: |
-          python - <<'PY'
-          import os
-          from pathlib import Path
-          import tomllib
-
-          root = Path.cwd()
-          project = tomllib.loads((root / "pyproject.toml").read_text())["project"]["version"]
-          cargo = tomllib.loads((root / "Cargo.toml").read_text())["workspace"]["package"]["version"]
-          manifests = {
-              path.name: tomllib.loads(path.read_text())["version"]
-              for path in (root / "packaging" / "dbc").glob("MANIFEST.*.toml")
-          }
-          versions = {"pyproject.toml": project, "Cargo.toml": cargo, **manifests}
-          mismatches = {name: value for name, value in versions.items() if value != project}
-          expected_tag = f"v{project}"
-          if mismatches or os.environ["GITHUB_REF_NAME"] != expected_tag:
-              raise SystemExit(
-                  f"release versions/tag disagree: versions={versions}, "
-                  f"tag={os.environ['GITHUB_REF_NAME']!r}, expected={expected_tag!r}"
-              )
-          print(f"tag {expected_tag} matches every release version")
-          PY
+          git fetch origin main --no-tags
+          python packaging/release_checks.py provenance \
+            --tag "$GITHUB_REF_NAME" --commit "$GITHUB_SHA" --main-ref origin/main
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
@@ -484,9 +594,9 @@ jobs:
         with:
           path: dist
           name: sdist
+      - name: Verify the complete PyPI artifact set
+        run: python packaging/release_checks.py publish-artifacts dist
       - uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247 # release/v1
-        with:
-          skip-existing: true
 
   github-release:
     name: create GitHub release
@@ -495,14 +605,15 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          path: release/wheels
+          path: release/python
           pattern: wheels-*
           merge-multiple: true
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          path: release/sdist
+          path: release/python
           name: sdist
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -517,6 +628,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          python packaging/release_checks.py github-artifacts release
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
             --verify-tag --generate-notes \
-            release/wheels/*.whl release/sdist/*.tar.gz release/dbc/*.tar.gz release/docs/monetdb.md
+            release/python/*.whl release/python/*.tar.gz release/dbc/*.tar.gz release/docs/monetdb.md

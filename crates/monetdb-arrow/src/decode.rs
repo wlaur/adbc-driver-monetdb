@@ -755,22 +755,34 @@ fn null_wire_value(data_type: &MonetType) -> Result<Vec<u8>, DecodeError> {
 
 fn decimal_wire_value(value: i128, precision: u8) -> Result<Vec<u8>, DecodeError> {
     macro_rules! narrow {
-        ($type:ty) => {
-            <$type>::try_from(value)
-                .map_err(|_| DecodeError::InvalidValue {
+        ($type:ty) => {{
+            let narrowed = <$type>::try_from(value).map_err(|_| DecodeError::InvalidValue {
+                row: 0,
+                message: "decimal value does not fit its backing integer",
+            })?;
+            if narrowed == <$type>::MIN {
+                return Err(DecodeError::InvalidValue {
                     row: 0,
-                    message: "decimal value does not fit its backing integer",
-                })?
-                .to_le_bytes()
-                .to_vec()
-        };
+                    message: "decimal value collides with the wire NULL sentinel",
+                });
+            }
+            narrowed.to_le_bytes().to_vec()
+        }};
     }
     Ok(match precision {
         1..=2 => narrow!(i8),
         3..=4 => narrow!(i16),
         5..=9 => narrow!(i32),
         10..=18 => narrow!(i64),
-        19..=38 => value.to_le_bytes().to_vec(),
+        19..=38 => {
+            if value == i128::MIN {
+                return Err(DecodeError::InvalidValue {
+                    row: 0,
+                    message: "decimal value collides with the wire NULL sentinel",
+                });
+            }
+            value.to_le_bytes().to_vec()
+        }
         _ => {
             return Err(DecodeError::InvalidColumn {
                 message: "decimal precision must be between 1 and 38",
@@ -1903,6 +1915,20 @@ mod tests {
         let array = decode_column(&MonetType::Double, &infinities, 2).unwrap();
         let array = array.as_any().downcast_ref::<Float64Array>().unwrap();
         assert_eq!(array.values(), &[f64::INFINITY, f64::NEG_INFINITY]);
+    }
+
+    #[test]
+    fn inline_decimal_rejects_null_sentinel_collisions() {
+        for (value, precision) in [
+            (i128::from(i8::MIN), 2),
+            (i128::from(i16::MIN), 4),
+            (i128::from(i32::MIN), 9),
+            (i128::from(i64::MIN), 18),
+            (i128::MIN, 38),
+        ] {
+            let error = decimal_wire_value(value, precision).unwrap_err();
+            assert!(error.to_string().contains("NULL sentinel"));
+        }
     }
 
     #[test]
