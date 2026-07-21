@@ -47,6 +47,26 @@ const OPERATION_TIMEOUT_OPTION: &str = "adbc.monetdb.operation_timeout_seconds";
 const MINIMUM_VERSION: (u16, u16, u16) = (11, 55, 0);
 static SAVEPOINT_ID: AtomicU64 = AtomicU64::new(0);
 
+const URI_QUERY_KEYS: &[&str] = &[
+    "user",
+    "password",
+    "cert",
+    "certhash",
+    "clientcert",
+    "clientkey",
+    "schema",
+    "sock",
+    "sockdir",
+    "connect_timeout",
+    "read_timeout",
+    "write_timeout",
+    "operation_timeout",
+    "client_info",
+    "client_application",
+    "client_remark",
+    "max_response_size",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TimeoutOption {
     Connect,
@@ -63,6 +83,15 @@ impl TimeoutOption {
             WRITE_TIMEOUT_OPTION => Some(Self::Write),
             OPERATION_TIMEOUT_OPTION => Some(Self::Operation),
             _ => None,
+        }
+    }
+
+    fn uri_key(self) -> &'static str {
+        match self {
+            Self::Connect => "connect_timeout",
+            Self::Read => "read_timeout",
+            Self::Write => "write_timeout",
+            Self::Operation => "operation_timeout",
         }
     }
 }
@@ -177,6 +206,17 @@ fn configured_timeouts(parameters: &Parameters) -> Result<(Option<Duration>, Tim
             operation: validated.operation_timeout,
         },
     ))
+}
+
+fn store_runtime_timeouts(options: &mut Options, timeouts: Timeouts) {
+    for (key, timeout) in [
+        (READ_TIMEOUT_OPTION, timeouts.read),
+        (WRITE_TIMEOUT_OPTION, timeouts.write),
+        (OPERATION_TIMEOUT_OPTION, timeouts.operation),
+    ] {
+        let seconds = timeout.map_or(0, |timeout| timeout.as_secs());
+        options.set(key, seconds.to_string().into());
+    }
 }
 
 fn initialization_timeouts(timeouts: Timeouts, deadline: Option<Instant>) -> Result<Timeouts> {
@@ -405,6 +445,12 @@ impl Optionable for MonetdbDatabase {
                 Status::InvalidArguments,
             ));
         }
+        if key == OptionDatabase::Uri {
+            let OptionValue::String(uri) = &value else {
+                unreachable!("the standard URI type was validated above");
+            };
+            parse_driver_uri(uri)?;
+        }
         if let OptionDatabase::Other(name) = &key {
             if TimeoutOption::from_key(name).is_none() {
                 return Err(not_implemented(key.as_ref()));
@@ -421,6 +467,20 @@ impl Optionable for MonetdbDatabase {
                 "password credentials cannot be read back",
                 Status::NotImplemented,
             ));
+        }
+        if let OptionDatabase::Other(name) = &key
+            && let Some(timeout) = TimeoutOption::from_key(name)
+            && self.options.get(&key).is_none()
+            && let Some(uri) = self.options.optional_string(OptionDatabase::Uri)
+        {
+            let parsed = parse_driver_uri(uri)?;
+            if let Some((_, value)) = parsed
+                .query_pairs()
+                .filter(|(query_key, _)| query_key == timeout.uri_key())
+                .last()
+            {
+                return Ok(value.into_owned());
+            }
         }
         let value = self.options.get_string(&key)?;
         if key == OptionDatabase::Uri {
@@ -464,8 +524,7 @@ impl Database for MonetdbDatabase {
                     Status::InvalidArguments,
                 )
             })?;
-        let mut parsed_uri =
-            url::Url::parse(uri).map_err(|value| map_display(value, Status::InvalidArguments))?;
+        let mut parsed_uri = parse_driver_uri(uri)?;
         let uri_username = (!parsed_uri.username().is_empty())
             .then(|| decode_userinfo(parsed_uri.username()))
             .transpose()?;
@@ -616,6 +675,7 @@ impl Database for MonetdbDatabase {
         options.set(OptionConnection::CurrentSchema, current_schema.into());
         options.set(OptionConnection::AutoCommit, "true".into());
         options.set(OptionConnection::ReadOnly, "false".into());
+        store_runtime_timeouts(&mut options, timeouts);
         let mut result = MonetdbConnection {
             inner,
             cancel,
@@ -640,15 +700,37 @@ fn decode_userinfo(value: &str) -> Result<String> {
         .map_err(|value| map_display(value, Status::InvalidArguments))
 }
 
-fn uri_without_userinfo(uri: &str) -> Result<String> {
-    let mut parsed =
+fn parse_driver_uri(uri: &str) -> Result<url::Url> {
+    let parsed =
         url::Url::parse(uri).map_err(|value| map_display(value, Status::InvalidArguments))?;
+    for (key, _) in parsed.query_pairs() {
+        if !URI_QUERY_KEYS.contains(&key.as_ref()) {
+            return Err(error(
+                format!("unknown MonetDB URI query parameter '{key}'"),
+                Status::InvalidArguments,
+            ));
+        }
+    }
+    Ok(parsed)
+}
+
+fn uri_without_userinfo(uri: &str) -> Result<String> {
+    let mut parsed = parse_driver_uri(uri)?;
     parsed
         .set_username("")
         .map_err(|()| error("URI user information is invalid", Status::InvalidArguments))?;
     parsed
         .set_password(None)
         .map_err(|()| error("URI user information is invalid", Status::InvalidArguments))?;
+    let query = parsed
+        .query_pairs()
+        .filter(|(key, _)| key != "password")
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    parsed.set_query(None);
+    if !query.is_empty() {
+        parsed.query_pairs_mut().extend_pairs(query);
+    }
     Ok(parsed.into())
 }
 
@@ -783,11 +865,13 @@ impl Connection for MonetdbConnection {
     type StatementType = MonetdbStatement;
 
     fn new_statement(&mut self) -> Result<Self::StatementType> {
+        let mut options = Options::default();
+        store_runtime_timeouts(&mut options, self.timeouts);
         Ok(MonetdbStatement {
             connection: Arc::clone(&self.inner),
             cancel: self.cancel.clone(),
             timeouts: self.timeouts,
-            options: Options::default(),
+            options,
             query: None,
             read_batch_rows: self.read_batch_rows,
             write_batch_rows: self.write_batch_rows,
@@ -1934,9 +2018,13 @@ fn prepare_query_inner(
                 .map_err(map_cursor_error)?
                 .filter(|value| !value.is_empty())
                 .map(str::to_owned);
+            let provisional = allow_any
+                && (code == "any"
+                    || code.eq_ignore_ascii_case("decimal")
+                        && (digits <= 0 || scale < 0 || scale > digits));
             fields.push(PreparedField {
-                undetermined: allow_any && code == "any",
-                data_type: if allow_any && code == "any" {
+                undetermined: provisional,
+                data_type: if provisional {
                     MonetType::Varchar(0)
                 } else {
                     prepared_monet_type(&code, digits, scale)?
@@ -2149,8 +2237,19 @@ fn query_reader_with_timeouts(
     if total_rows >= 16_384 && result.columns.len() > 1 {
         monetdb_arrow::initialize_parallel_decoder();
     }
-    if total_rows == 1 && !result.is_server_resident() {
-        let batch = monetdb_arrow::decode_inline_row(&mut cursor, &result.columns)
+    if !result.is_server_resident() {
+        let rows = usize::try_from(total_rows).map_err(|_| {
+            error(
+                "inline result row count exceeds this platform",
+                Status::InvalidData,
+            )
+        })?;
+        if rows == 0 {
+            return Ok(Box::new(EmptyReader::new(schema_for_columns(
+                &result.columns,
+            )?)));
+        }
+        let batch = monetdb_arrow::decode_inline_rows(&mut cursor, &result.columns, rows)
             .map_err(|value| map_display(value, Status::InvalidData))?;
         return Ok(Box::new(SingleBatchReader::new(batch)));
     }
@@ -2834,6 +2933,48 @@ mod tests {
         )
         .unwrap();
         assert_eq!(timeouts.read, Some(Duration::from_secs(4)));
+    }
+
+    #[test]
+    fn validates_uri_query_keys_and_reads_back_uri_timeouts() {
+        let uri = "monetdb://localhost/test?connect_timeout=9&read_timeout=8&write_timeout=7&operation_timeout=6";
+        let mut database = MonetdbDatabase::default();
+        database
+            .set_option(OptionDatabase::Uri, uri.into())
+            .unwrap();
+        for (key, expected) in [
+            (CONNECT_TIMEOUT_OPTION, "9"),
+            (READ_TIMEOUT_OPTION, "8"),
+            (WRITE_TIMEOUT_OPTION, "7"),
+            (OPERATION_TIMEOUT_OPTION, "6"),
+        ] {
+            assert_eq!(
+                database
+                    .get_option_string(OptionDatabase::Other(key.into()))
+                    .unwrap(),
+                expected
+            );
+        }
+
+        database
+            .set_option(
+                OptionDatabase::Other(READ_TIMEOUT_OPTION.into()),
+                "5".into(),
+            )
+            .unwrap();
+        assert_eq!(
+            database
+                .get_option_string(OptionDatabase::Other(READ_TIMEOUT_OPTION.into()))
+                .unwrap(),
+            "5"
+        );
+
+        for key in URI_QUERY_KEYS {
+            parse_driver_uri(&format!("monetdb://localhost/test?{key}=0")).unwrap();
+        }
+        let error = parse_driver_uri("monetdb://localhost/test?operation_timout=1").unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert!(error.message.contains("operation_timout"));
     }
 
     #[test]

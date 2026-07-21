@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "adbc-monetdb"
-version = "0.1.0"
+version = "0.8.0"
 dependencies = [
  "adbc_core",
  "adbc_ffi",
@@ -823,7 +823,7 @@ dependencies = [
 
 [[package]]
 name = "monetdb-arrow"
-version = "0.1.0"
+version = "0.8.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",

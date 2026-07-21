@@ -85,8 +85,8 @@ connection, TLS, authentication, redirects, and initial driver metadata. A timeo
 closes the MAPI session, so the partially read connection cannot be reused.
 
 The URI names are `connect_timeout`, `read_timeout`, `write_timeout`, and
-`operation_timeout`. This is the only configuration channel available to
-`polars.read_database_uri`:
+`operation_timeout`. Unknown query names are rejected so misspelled settings cannot be silently
+ignored. This is the only configuration channel available to `polars.read_database_uri`:
 
 ```python
 df = pl.read_database_uri(
@@ -225,10 +225,10 @@ cargo about generate --all-features --fail --locked \
     --target aarch64-apple-darwin,aarch64-unknown-linux-gnu,x86_64-pc-windows-msvc,x86_64-unknown-linux-gnu \
     license.tpl > THIRD_PARTY_LICENSES
 uv run python packaging/dbc/build_package.py \
-    --wheel dist/adbc_driver_monetdb-0.1.0-cp313-abi3-macosx_11_0_arm64.whl \
+    --wheel dist/adbc_driver_monetdb-0.8.0-cp313-abi3-macosx_11_0_arm64.whl \
     --platform macos_arm64 --out-dir dist/dbc --license THIRD_PARTY_LICENSES
 ADBC_DRIVER_PATH="$PWD/.adbc-drivers" \
-    uvx --from dbc dbc install --no-verify dist/dbc/monetdb_macos_arm64_v0.1.0.tar.gz
+    uvx --from dbc dbc install --no-verify dist/dbc/monetdb_macos_arm64_v0.8.0.tar.gz
 ```
 
 The repository packages are unsigned development artifacts, hence `--no-verify`. A registry
