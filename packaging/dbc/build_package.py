@@ -26,6 +26,7 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--platform", choices=PLATFORMS, required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--license", type=Path, required=True)
+    parser.add_argument("--source-root", type=Path)
     return parser.parse_args()
 
 
@@ -53,7 +54,13 @@ def _machine(binary: bytes, kind: str) -> int:
     return struct.unpack_from("<H", binary, header + 4)[0]
 
 
-def build_package(library: Path, platform: str, out_dir: Path, license_path: Path) -> Path:
+def build_package(
+    library: Path,
+    platform: str,
+    out_dir: Path,
+    license_path: Path,
+    source_root: Path | None = None,
+) -> Path:
     template_name, native_suffix, binary_kind, expected_machine = PLATFORMS[platform]
     if library.suffix.lower() != native_suffix:
         raise ValueError(f"{platform} requires a {native_suffix} standalone library, got {library.name}")
@@ -67,7 +74,7 @@ def build_package(library: Path, platform: str, out_dir: Path, license_path: Pat
     manifest = tomllib.loads(manifest_bytes.decode())
     version = manifest["version"]
     driver_name = manifest["Files"]["driver"]
-    root = Path(__file__).parents[2]
+    root = Path(__file__).parents[2] if source_root is None else source_root
     project_version = tomllib.loads((root / "pyproject.toml").read_text())["project"]["version"]
     if version != project_version:
         raise ValueError(f"manifest version {version} does not match project version {project_version}")
@@ -88,7 +95,7 @@ def build_package(library: Path, platform: str, out_dir: Path, license_path: Pat
 
 def main() -> None:
     args = _arguments()
-    print(build_package(args.library, args.platform, args.out_dir, args.license))
+    print(build_package(args.library, args.platform, args.out_dir, args.license, args.source_root))
 
 
 if __name__ == "__main__":

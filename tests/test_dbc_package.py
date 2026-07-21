@@ -38,6 +38,12 @@ def _run_builder(tmp_path: Path, platform: str, suffix: str, binary: bytes) -> s
     library.write_bytes(binary)
     license_path = tmp_path / "THIRD_PARTY_LICENSES"
     license_path.write_text("dependency licenses")
+    source_root = tmp_path / "source"
+    (source_root / "monetdb-rust").mkdir(parents=True)
+    (source_root / "pyproject.toml").write_text('[project]\nversion = "0.8.0"\n')
+    (source_root / "LICENSE").write_text("MIT")
+    (source_root / "NOTICE").write_text("notice")
+    (source_root / "monetdb-rust" / "LICENSE").write_text("MPL")
     return subprocess.run(
         [
             sys.executable,
@@ -50,6 +56,8 @@ def _run_builder(tmp_path: Path, platform: str, suffix: str, binary: bytes) -> s
             str(tmp_path / "out"),
             "--license",
             str(license_path),
+            "--source-root",
+            str(source_root),
         ],
         check=False,
         capture_output=True,
@@ -92,6 +100,10 @@ def test_builds_flat_dbc_archive(
         dependency_licenses = archive.extractfile("THIRD_PARTY_LICENSES")
         assert dependency_licenses is not None
         assert dependency_licenses.read() == b"dependency licenses"
+        for name, content in {"LICENSE": b"MIT", "NOTICE": b"notice", "LICENSE.monetdb-rust": b"MPL"}.items():
+            license_file = archive.extractfile(name)
+            assert license_file is not None
+            assert license_file.read() == content
     assert manifest["description"] == "ADBC driver for MonetDB: Arrow-native reads and writes"
     assert manifest["url"] == "https://github.com/wlaur/adbc-driver-monetdb"
     assert manifest["Driver"]["entrypoint"] == "AdbcDriverMonetdbInit"
