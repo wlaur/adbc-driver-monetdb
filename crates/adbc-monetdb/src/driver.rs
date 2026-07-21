@@ -2842,6 +2842,20 @@ mod tests {
     }
 
     #[test]
+    fn maps_nested_socket_attempts_from_the_tcp_error() {
+        let nested = |tcp| monetdb::ConnectError::SocketAttempts {
+            unix: Box::new(monetdb::ConnectError::UnixDomain),
+            tcp: Box::new(tcp),
+        };
+        let refused = std::io::Error::from(std::io::ErrorKind::ConnectionRefused).into();
+        assert_eq!(connect_error_status(&nested(refused)), Status::IO);
+        assert_eq!(
+            connect_error_status(&nested(monetdb::ConnectError::Timeout)),
+            Status::Timeout
+        );
+    }
+
+    #[test]
     fn validates_boolean_options() {
         assert!(option_bool(&OptionValue::String("enabled".into())).unwrap());
         assert!(!option_bool(&OptionValue::String("false".into())).unwrap());

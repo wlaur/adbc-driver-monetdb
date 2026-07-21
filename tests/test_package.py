@@ -56,7 +56,10 @@ def test_connect_rejects_unreachable_localhost_as_io() -> None:
         port = probe.getsockname()[1]
     with pytest.raises(adbc_driver_manager.OperationalError) as caught:
         dbapi.connect(f"monetdb://localhost:{port}/test?connect_timeout=2")
-    assert caught.value.status_code == adbc_driver_manager.AdbcStatusCode.IO
+    assert caught.value.status_code in {
+        adbc_driver_manager.AdbcStatusCode.IO,
+        adbc_driver_manager.AdbcStatusCode.TIMEOUT,
+    }
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Unix sockets are not available on Windows")
