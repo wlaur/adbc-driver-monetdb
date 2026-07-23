@@ -269,11 +269,14 @@ def test_statement_operation_timeout_bounds_slow_drip_response() -> None:
 
 @pytest.mark.skipif(
     sys.platform == "win32",
-    reason="Windows loopback accepts a complete 16 MiB upload fragment before the peer stops reading",
+    reason="Windows loopback accepts a complete upload fragment before the peer stops reading",
 )
 def test_statement_write_timeout_bounds_stalled_copy_upload() -> None:
-    rows = 8 * 1024 * 1024
-    batch = pa.record_batch({"value": pa.nulls(rows, type=pa.int64())})
+    rows = 131_072
+    value_width = 256
+    values = pa.py_buffer(bytes(rows * value_width))
+    array = pa.FixedSizeBinaryArray.from_buffers(pa.binary(value_width), rows, [None, values])
+    batch = pa.record_batch({"value": array})
     with (
         _BlackHoleServer(initialize=True, behavior="write_stall") as server,
         dbapi.connect(server.uri, autocommit=True) as connection,
