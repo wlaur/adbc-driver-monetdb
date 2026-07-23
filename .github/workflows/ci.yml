@@ -225,7 +225,7 @@ jobs:
       - name: Verify the Linux dbc driver built inside manylinux
         if: runner.os == 'Linux'
         shell: bash
-        run: test -f standalone-dbc/libadbc_monetdb.so
+        run: test -f wheelhouse/standalone-dbc/libadbc_monetdb.so
       - name: Build the macOS dbc driver without Python
         if: runner.os == 'macOS'
         run: cargo build --locked --release -p adbc-monetdb --no-default-features
@@ -239,7 +239,7 @@ jobs:
         shell: bash
         run: |
           uvx --from 'auditwheel==6.7.0' auditwheel show wheelhouse/*.whl
-          library=standalone-dbc/libadbc_monetdb.so
+          library=wheelhouse/standalone-dbc/libadbc_monetdb.so
           readelf -h -d "$library"
           ldd "$library"
           nm -D --defined-only "$library" | grep -F AdbcDriverMonetdbInit
@@ -306,7 +306,7 @@ jobs:
         shell: bash
         run: |
           case '${{ runner.os }}' in
-            Linux) library=standalone-dbc/libadbc_monetdb.so ;;
+            Linux) library=wheelhouse/standalone-dbc/libadbc_monetdb.so ;;
             macOS) library=target/release/libadbc_monetdb.dylib ;;
             Windows)
               library=target/release/adbc_monetdb.dll

@@ -106,8 +106,8 @@ chmod +x "$rustup_init"
 '''
 before-build = '''
 cargo build --locked --release -p adbc-monetdb --no-default-features
-mkdir -p standalone-dbc
-cp target/release/libadbc_monetdb.so standalone-dbc/libadbc_monetdb.so
+mkdir -p /output/standalone-dbc
+cp target/release/libadbc_monetdb.so /output/standalone-dbc/libadbc_monetdb.so
 '''
 environment = { PATH = "$HOME/.cargo/bin:$PATH" }
 repair-wheel-command = "auditwheel repair -w {dest_dir} {wheel}"
