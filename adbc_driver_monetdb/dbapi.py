@@ -1,8 +1,12 @@
 """PEP 249 (DB-API 2.0) interface to MonetDB, backed by adbc_driver_manager."""
 
+import sys
+from pathlib import Path
+from urllib.parse import parse_qsl
+
 from adbc_driver_manager import dbapi as _dbapi
 
-from adbc_driver_monetdb import ENTRYPOINT, driver_path
+from adbc_driver_monetdb import ENTRYPOINT, DatabaseOptions, driver_path
 
 apilevel = _dbapi.apilevel
 threadsafety = _dbapi.threadsafety
@@ -47,10 +51,17 @@ def connect(
     ``uri`` is a ``monetdb://`` or ``monetdbs://`` URL, e.g.
     ``monetdb://user:password@localhost:50000/database``.
     """
+    database_options = dict(db_kwargs or {})
+    client_application = str(DatabaseOptions.CLIENT_APPLICATION)
+    query = uri.partition("?")[2].partition("#")[0]
+    uri_has_application = any(key == "client_application" for key, _ in parse_qsl(query, keep_blank_values=True))
+    if client_application not in database_options and not uri_has_application:
+        database_options[client_application] = Path(sys.argv[0]).name if sys.argv else ""
+    database_options["uri"] = uri
     return _dbapi.connect(
         driver=driver_path(),
         entrypoint=ENTRYPOINT,
-        db_kwargs={**(db_kwargs or {}), "uri": uri},
+        db_kwargs=database_options,
         conn_kwargs=conn_kwargs,
         autocommit=autocommit,
     )

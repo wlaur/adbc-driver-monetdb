@@ -37,6 +37,8 @@ use parameters::{
 };
 
 const DEFAULT_READ_BATCH_ROWS: usize = 131_072;
+const MAX_ENCODE_BATCH_ROWS: usize = 131_072;
+const PREFETCH_DROP_GRACE: Duration = Duration::from_millis(250);
 const METADATA_REPLY_ROWS: usize = 1024;
 const READ_BATCH_ROWS_OPTION: &str = "adbc.monetdb.read_batch_rows";
 const READ_PREFETCH_OPTION: &str = "adbc.monetdb.read_prefetch";
@@ -46,6 +48,9 @@ const CONNECT_TIMEOUT_OPTION: &str = "adbc.monetdb.connect_timeout_seconds";
 const READ_TIMEOUT_OPTION: &str = "adbc.monetdb.read_timeout_seconds";
 const WRITE_TIMEOUT_OPTION: &str = "adbc.monetdb.write_timeout_seconds";
 const OPERATION_TIMEOUT_OPTION: &str = "adbc.monetdb.operation_timeout_seconds";
+const CLIENT_APPLICATION_OPTION: &str = "adbc.monetdb.client_application";
+const CLIENT_REMARK_OPTION: &str = "adbc.monetdb.client_remark";
+const CLIENT_INFO_OPTION: &str = "adbc.monetdb.client_info";
 const MINIMUM_VERSION: (u16, u16, u16) = (11, 55, 0);
 static SAVEPOINT_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -77,6 +82,75 @@ enum TimeoutOption {
     Operation,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientInfoOption {
+    Application,
+    Remark,
+    Enabled,
+}
+
+impl ClientInfoOption {
+    fn from_key(key: &str) -> Option<Self> {
+        match key {
+            CLIENT_APPLICATION_OPTION => Some(Self::Application),
+            CLIENT_REMARK_OPTION => Some(Self::Remark),
+            CLIENT_INFO_OPTION => Some(Self::Enabled),
+            _ => None,
+        }
+    }
+
+    fn uri_key(self) -> &'static str {
+        match self {
+            Self::Application => "client_application",
+            Self::Remark => "client_remark",
+            Self::Enabled => "client_info",
+        }
+    }
+
+    fn default_value(self) -> &'static str {
+        match self {
+            Self::Application | Self::Remark => "",
+            Self::Enabled => "true",
+        }
+    }
+
+    fn validate(self, key: &str, value: &OptionValue) -> Result<OptionValue> {
+        let OptionValue::String(value) = value else {
+            return Err(error(
+                format!("option '{key}' must be a string"),
+                Status::InvalidArguments,
+            ));
+        };
+        match self {
+            Self::Application | Self::Remark => {
+                if value.contains('\n') {
+                    return Err(error(
+                        format!("option '{key}' must not contain newlines"),
+                        Status::InvalidArguments,
+                    ));
+                }
+                Ok(value.clone().into())
+            }
+            Self::Enabled => Ok(parse_bool_option(value)?.to_string().into()),
+        }
+    }
+
+    fn apply(self, parameters: &mut Parameters, value: &OptionValue) -> Result<()> {
+        let OptionValue::String(value) = value else {
+            return Err(error(
+                "validated client-info option is not a string",
+                Status::Internal,
+            ));
+        };
+        let result = match self {
+            Self::Application => parameters.set_client_application(value),
+            Self::Remark => parameters.set_client_remark(value),
+            Self::Enabled => parameters.set_client_info(value),
+        };
+        result.map_err(|error| map_display(error, Status::InvalidArguments))
+    }
+}
+
 impl TimeoutOption {
     fn from_key(key: &str) -> Option<Self> {
         match key {
@@ -102,7 +176,7 @@ fn timeout_seconds(key: &str, value: &OptionValue) -> Result<i64> {
     let seconds = integer_option(key, value)?;
     if seconds < 0 {
         return Err(error(
-            format!("option '{key}' must be nonnegative"),
+            format!("option '{key}' must be non-negative"),
             Status::InvalidArguments,
         ));
     }
@@ -142,7 +216,12 @@ fn read_batch_rows_option(value: &OptionValue) -> Result<usize> {
     usize::try_from(rows)
         .ok()
         .filter(|rows| *rows > 0)
-        .ok_or_else(|| error("read_batch_rows must be positive", Status::InvalidArguments))
+        .ok_or_else(|| {
+            error(
+                format!("option '{READ_BATCH_ROWS_OPTION}' must be positive"),
+                Status::InvalidArguments,
+            )
+        })
 }
 
 fn write_batch_rows_option(value: &OptionValue) -> Result<Option<usize>> {
@@ -152,7 +231,7 @@ fn write_batch_rows_option(value: &OptionValue) -> Result<Option<usize>> {
     }
     usize::try_from(rows).map(Some).map_err(|_| {
         error(
-            "write_batch_rows must be non-negative",
+            format!("option '{WRITE_BATCH_ROWS_OPTION}' must be non-negative"),
             Status::InvalidArguments,
         )
     })
@@ -257,7 +336,7 @@ fn error(message: impl Into<String>, status: Status) -> Error {
 
 fn not_implemented(what: &str) -> Error {
     error(
-        format!("adbc-monetdb: {what} is not implemented yet"),
+        format!("adbc-monetdb: {what} is not implemented"),
         Status::NotImplemented,
     )
 }
@@ -280,9 +359,7 @@ fn lock_connection(
 
 fn map_cursor_error(value: CursorError) -> Error {
     let status = match value {
-        CursorError::Closed | CursorError::NoResultSet | CursorError::NoActiveOperation => {
-            Status::InvalidState
-        }
+        CursorError::Closed | CursorError::NoResultSet => Status::InvalidState,
         CursorError::Cancelled => Status::Cancelled,
         CursorError::Timeout => Status::Timeout,
         CursorError::IO(_) => Status::IO,
@@ -454,10 +531,15 @@ impl Optionable for MonetdbDatabase {
             parse_driver_uri(uri)?;
         }
         if let OptionDatabase::Other(name) = &key {
-            if TimeoutOption::from_key(name).is_none() {
-                return Err(not_implemented(key.as_ref()));
+            if TimeoutOption::from_key(name).is_some() {
+                timeout_seconds(name, &value)?;
+            } else if let Some(option) = ClientInfoOption::from_key(name) {
+                let value = option.validate(name, &value)?;
+                self.options.set(key, value);
+                return Ok(());
+            } else {
+                return Err(not_implemented(name));
             }
-            timeout_seconds(name, &value)?;
         }
         self.options.set(key, value);
         Ok(())
@@ -471,17 +553,26 @@ impl Optionable for MonetdbDatabase {
             ));
         }
         if let OptionDatabase::Other(name) = &key
-            && let Some(timeout) = TimeoutOption::from_key(name)
             && self.options.get(&key).is_none()
-            && let Some(uri) = self.options.optional_string(OptionDatabase::Uri)
         {
-            let parsed = parse_driver_uri(uri)?;
-            if let Some((_, value)) = parsed
-                .query_pairs()
-                .filter(|(query_key, _)| query_key == timeout.uri_key())
-                .last()
+            let timeout = TimeoutOption::from_key(name);
+            let client_info = ClientInfoOption::from_key(name);
+            if let Some(uri_key) = timeout
+                .map(TimeoutOption::uri_key)
+                .or_else(|| client_info.map(ClientInfoOption::uri_key))
+                && let Some(uri) = self.options.optional_string(OptionDatabase::Uri)
             {
-                return Ok(value.into_owned());
+                let parsed = parse_driver_uri(uri)?;
+                if let Some((_, value)) = parsed
+                    .query_pairs()
+                    .filter(|(query_key, _)| query_key == uri_key)
+                    .last()
+                {
+                    return Ok(value.into_owned());
+                }
+            }
+            if let Some(client_info) = client_info {
+                return Ok(client_info.default_value().to_owned());
             }
         }
         let value = self.options.get_string(&key)?;
@@ -576,6 +667,17 @@ impl Database for MonetdbDatabase {
                 )?;
             }
         }
+        for key in [
+            CLIENT_APPLICATION_OPTION,
+            CLIENT_REMARK_OPTION,
+            CLIENT_INFO_OPTION,
+        ] {
+            if let Some(value) = self.options.get(key) {
+                ClientInfoOption::from_key(key)
+                    .expect("constant is a client-info option")
+                    .apply(&mut parameters, value)?;
+            }
+        }
         for (key, value) in &opts {
             if let OptionConnection::Other(name) = key
                 && let Some(timeout) = TimeoutOption::from_key(name)
@@ -588,8 +690,16 @@ impl Database for MonetdbDatabase {
                 }
                 apply_parameter_timeout(&mut parameters, timeout, name, value)?;
             }
+            if let OptionConnection::Other(name) = key
+                && ClientInfoOption::from_key(name).is_some()
+            {
+                return Err(error(
+                    format!("option '{name}' is only valid as a database option"),
+                    Status::InvalidState,
+                ));
+            }
         }
-        // One minimizes the inline text prefix. Multi-row results remain open
+        // A reply size of one minimizes the inline text prefix. Multi-row results remain open
         // for Xexportbin; a complete scalar row is decoded directly.
         parameters
             .set_replysize(1)
@@ -602,6 +712,9 @@ impl Database for MonetdbDatabase {
             .map_err(|value| map_display(value, Status::InvalidArguments))?;
         parameters
             .set_timezone(0)
+            .map_err(|value| map_display(value, Status::InvalidArguments))?;
+        parameters
+            .set_client_prefix(concat!("adbc_driver_monetdb ", env!("CARGO_PKG_VERSION")))
             .map_err(|value| map_display(value, Status::InvalidArguments))?;
         let catalog = parameters
             .get_str(Parm::Database)
@@ -859,6 +972,12 @@ impl Optionable for MonetdbConnection {
         if key.as_ref() == READ_PREFETCH_OPTION {
             return Ok(self.read_prefetch.to_string());
         }
+        if key.as_ref() == READ_BATCH_ROWS_OPTION {
+            return Ok(self.read_batch_rows.to_string());
+        }
+        if key.as_ref() == WRITE_BATCH_ROWS_OPTION {
+            return Ok(self.write_batch_rows.unwrap_or(0).to_string());
+        }
         self.options.get_string(key)
     }
 
@@ -1037,6 +1156,10 @@ fn option_bool(value: &OptionValue) -> Result<bool> {
             Status::InvalidArguments,
         ));
     };
+    parse_bool_option(value)
+}
+
+fn parse_bool_option(value: &str) -> Result<bool> {
     match value.to_ascii_lowercase().as_str() {
         "true" | "1" | "enabled" | "on" => Ok(true),
         "false" | "0" | "disabled" | "off" => Ok(false),
@@ -1155,6 +1278,12 @@ impl Optionable for MonetdbStatement {
         }
         if key.as_ref() == READ_PREFETCH_OPTION {
             return Ok(self.read_prefetch.to_string());
+        }
+        if key.as_ref() == READ_BATCH_ROWS_OPTION {
+            return Ok(self.read_batch_rows.to_string());
+        }
+        if key.as_ref() == WRITE_BATCH_ROWS_OPTION {
+            return Ok(self.write_batch_rows.unwrap_or(0).to_string());
         }
         if key == OptionStatement::IngestMode {
             return Ok(self
@@ -1561,16 +1690,18 @@ impl MonetdbStatement {
             let data_type = monetdb_arrow::monet_type_for_field(field)
                 .map_err(|value| map_display(value, Status::NotImplemented))?;
             if data_type == MonetType::Oid {
-                return Err(not_implemented(
+                return Err(error(
                     "COPY BINARY ingestion for OID columns is not supported by MonetDB",
+                    Status::NotImplemented,
                 ));
             }
             if matches!(
                 data_type,
                 MonetType::Inet | MonetType::Inet4 | MonetType::Inet6
             ) {
-                return Err(not_implemented(
+                return Err(error(
                     "COPY BINARY ingestion for INET columns is not supported by MonetDB",
+                    Status::NotImplemented,
                 ));
             }
         }
@@ -1658,7 +1789,7 @@ impl MonetdbStatement {
                 if batch.num_rows() == 0 {
                     continue;
                 }
-                let write_batch_rows = self.write_batch_rows.unwrap_or(batch.num_rows());
+                let write_batch_rows = encode_batch_rows(batch.num_rows(), self.write_batch_rows);
                 for range in batch_ranges(batch.num_rows(), write_batch_rows) {
                     let batch = batch.slice(range.start, range.len());
                     let encoded = schema
@@ -1717,6 +1848,12 @@ fn batch_ranges(rows: usize, batch_rows: usize) -> impl Iterator<Item = Range<us
         let len = (rows - start).min(batch_rows);
         start..start + len
     })
+}
+
+fn encode_batch_rows(batch_rows: usize, configured_rows: Option<usize>) -> usize {
+    configured_rows
+        .unwrap_or(batch_rows)
+        .min(MAX_ENCODE_BATCH_ROWS)
 }
 
 fn validate_record_batch(batch: &RecordBatch) -> Result<()> {
@@ -2290,8 +2427,9 @@ fn query_reader_with_timeouts(
             .iter()
             .any(|column| *column.sql_type() == MonetType::Oid)
     {
-        return Err(not_implemented(
+        return Err(error(
             "multi-row OID results are unavailable through Xexportbin; cast OID columns to VARCHAR in SQL",
+            Status::NotImplemented,
         ));
     }
     if !result.is_server_resident() {
@@ -2315,16 +2453,20 @@ fn query_reader_with_timeouts(
         return Ok(Box::new(EmptyReader::new(schema)));
     }
     let adopt_frame = monetdb_arrow::prefers_owned_frame(&result.columns);
+    let cancel = connection_guard.cancel_handle();
     drop(connection_guard);
     if read_prefetch && total_rows > batch_rows as u64 {
         return Ok(Box::new(PrefetchedBinaryReader::new(
             cursor,
-            result.result_id,
-            result.columns,
-            schema,
-            total_rows,
-            batch_rows,
-            adopt_frame,
+            cancel,
+            PrefetchPlan {
+                result_id: result.result_id,
+                columns: result.columns,
+                schema,
+                total_rows,
+                batch_rows,
+                adopt_frame,
+            },
         )?));
     }
     Ok(Box::new(BinaryReader {
@@ -2634,6 +2776,15 @@ struct BinaryFrame {
 
 type BinaryFrameResult = std::result::Result<BinaryFrame, ArrowError>;
 
+struct PrefetchPlan {
+    result_id: u64,
+    columns: Vec<ResultColumn>,
+    schema: SchemaRef,
+    total_rows: u64,
+    batch_rows: usize,
+    adopt_frame: bool,
+}
+
 struct PrefetchedBinaryReader {
     result_id: u64,
     columns: Vec<ResultColumn>,
@@ -2642,22 +2793,21 @@ struct PrefetchedBinaryReader {
     decoded_rows: u64,
     adopt_frame: bool,
     receiver: Option<std::sync::mpsc::Receiver<BinaryFrameResult>>,
+    completion: std::sync::mpsc::Receiver<()>,
     worker: Option<std::thread::JoinHandle<()>>,
+    cancel: CancelHandle,
     finished: bool,
 }
 
 impl PrefetchedBinaryReader {
-    fn new(
-        cursor: monetdb::Cursor,
-        result_id: u64,
-        columns: Vec<ResultColumn>,
-        schema: SchemaRef,
-        total_rows: u64,
-        batch_rows: usize,
-        adopt_frame: bool,
-    ) -> Result<Self> {
+    fn new(cursor: monetdb::Cursor, cancel: CancelHandle, plan: PrefetchPlan) -> Result<Self> {
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-        let worker_columns = columns.clone();
+        let (completion_sender, completion) = std::sync::mpsc::sync_channel(1);
+        let worker_columns = plan.columns.clone();
+        let result_id = plan.result_id;
+        let total_rows = plan.total_rows;
+        let batch_rows = plan.batch_rows;
+        let adopt_frame = plan.adopt_frame;
         let worker = std::thread::Builder::new()
             .name("adbc-monetdb-prefetch".into())
             .spawn(move || {
@@ -2678,17 +2828,20 @@ impl PrefetchedBinaryReader {
                         "MonetDB result fetching panicked".into(),
                     )));
                 }
+                let _ = completion_sender.send(());
             })
             .map_err(|value| map_display(value, Status::Internal))?;
         Ok(Self {
             result_id,
-            columns,
-            schema,
+            columns: plan.columns,
+            schema: plan.schema,
             total_rows,
             decoded_rows: 0,
             adopt_frame,
             receiver: Some(receiver),
+            completion,
             worker: Some(worker),
+            cancel,
             finished: false,
         })
     }
@@ -2703,7 +2856,13 @@ impl PrefetchedBinaryReader {
             self.finish();
             return None;
         }
-        let frame = match self.receiver.as_ref()?.recv() {
+        let Some(receiver) = self.receiver.as_ref() else {
+            self.finish();
+            return Some(Err(ArrowError::ParseError(
+                "MonetDB result prefetch receiver is unavailable".into(),
+            )));
+        };
+        let frame = match receiver.recv() {
             Ok(Ok(frame)) => frame,
             Ok(Err(error)) => {
                 self.finish();
@@ -2781,6 +2940,9 @@ impl Drop for PrefetchedBinaryReader {
     fn drop(&mut self) {
         self.receiver.take();
         if let Some(worker) = self.worker.take() {
+            if self.completion.recv_timeout(PREFETCH_DROP_GRACE).is_err() {
+                let _ = self.cancel.cancel();
+            }
             let _ = worker.join();
         }
     }
@@ -2809,7 +2971,7 @@ fn fetch_binary_frames(
             let _ = sender.send(Err(ArrowError::ExternalError(Box::new(value))));
             return;
         }
-        let frame = match monetdb_arrow::exportbin::parse_frame(&response) {
+        let frame = match monetdb_arrow::exportbin::parse_frame_header(&response) {
             Ok(frame) => frame,
             Err(value) => {
                 let _ = sender.send(Err(ArrowError::ExternalError(Box::new(value))));
@@ -2852,7 +3014,6 @@ fn fetch_binary_frames(
                 return;
             }
         };
-        drop(frame);
         if sender
             .send(Ok(BinaryFrame {
                 start_row: next_row,
@@ -3350,6 +3511,75 @@ mod tests {
     }
 
     #[test]
+    fn validates_and_reads_back_client_info_database_options() {
+        let mut database = MonetdbDatabase::default();
+        database
+            .set_option(
+                OptionDatabase::Uri,
+                "monetdb://localhost/test?client_application=uri-app&client_remark=uri-remark"
+                    .into(),
+            )
+            .unwrap();
+        assert_eq!(
+            database
+                .get_option_string(OptionDatabase::Other(CLIENT_APPLICATION_OPTION.into()))
+                .unwrap(),
+            "uri-app"
+        );
+        assert_eq!(
+            database
+                .get_option_string(OptionDatabase::Other(CLIENT_REMARK_OPTION.into()))
+                .unwrap(),
+            "uri-remark"
+        );
+        assert_eq!(
+            database
+                .get_option_string(OptionDatabase::Other(CLIENT_INFO_OPTION.into()))
+                .unwrap(),
+            "true"
+        );
+
+        database
+            .set_option(
+                OptionDatabase::Other(CLIENT_APPLICATION_OPTION.into()),
+                "explicit-app".into(),
+            )
+            .unwrap();
+        assert_eq!(
+            database
+                .get_option_string(OptionDatabase::Other(CLIENT_APPLICATION_OPTION.into()))
+                .unwrap(),
+            "explicit-app"
+        );
+        database
+            .set_option(
+                OptionDatabase::Other(CLIENT_INFO_OPTION.into()),
+                "disabled".into(),
+            )
+            .unwrap();
+        assert_eq!(
+            database
+                .get_option_string(OptionDatabase::Other(CLIENT_INFO_OPTION.into()))
+                .unwrap(),
+            "false"
+        );
+
+        let newline = database
+            .set_option(
+                OptionDatabase::Other(CLIENT_REMARK_OPTION.into()),
+                "first\nsecond".into(),
+            )
+            .unwrap_err();
+        assert_eq!(newline.status, Status::InvalidArguments);
+        assert!(newline.message.contains("must not contain newlines"));
+
+        let prefix =
+            parse_driver_uri("monetdb://localhost/test?client_prefix=impersonate").unwrap_err();
+        assert_eq!(prefix.status, Status::InvalidArguments);
+        assert!(prefix.message.contains("client_prefix"));
+    }
+
+    #[test]
     fn quotes_identifiers() {
         assert_eq!(quote_identifier("a\"b").unwrap(), "\"a\"\"b\"");
         assert!(quote_identifier("a\0b").is_err());
@@ -3445,5 +3675,12 @@ mod tests {
             [0..100_000, 100_000..200_000, 200_000..250_001]
         );
         assert!(batch_ranges(0, 100_000).next().is_none());
+        assert_eq!(encode_batch_rows(10_000_000, None), MAX_ENCODE_BATCH_ROWS);
+        assert_eq!(
+            encode_batch_rows(10_000_000, Some(1_000_000)),
+            MAX_ENCODE_BATCH_ROWS
+        );
+        assert_eq!(encode_batch_rows(10_000_000, Some(100_000)), 100_000);
+        assert_eq!(encode_batch_rows(100_000, None), 100_000);
     }
 }

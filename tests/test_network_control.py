@@ -161,6 +161,7 @@ class _FailureServer:
         self._listener.listen(1)
         self._listener.settimeout(5)
         self._thread = Thread(target=self._serve, daemon=True)
+        self.export_received = Event()
         self.errors: Queue[BaseException] = Queue()
 
     @property
@@ -206,7 +207,12 @@ class _FailureServer:
                     b"% 0 0 # typesizes\n"
                     b"[ 1\t]\n",
                 )
-                assert _read_message(stream).startswith(b"Xexportbin 42 0 2")
+                assert _read_message(stream).startswith(b"Xexportbin 42 0 ")
+                self.export_received.set()
+                if self._mode == "stream_stall":
+                    while stream.recv(1):
+                        pass
+                    return
                 _write_message(stream, b"!42000!mid-stream failure\n!second diagnostic")
         except BaseException as error:
             self.errors.put(error)
@@ -360,9 +366,62 @@ def test_midstream_error_preserves_sqlstate_and_all_diagnostics() -> None:
     with (
         _FailureServer("stream_error") as server,
         dbapi.connect(server.uri, autocommit=True) as connection,
-        connection.cursor() as cursor,
+        connection.cursor(
+            adbc_stmt_kwargs={
+                StatementOptions.READ_BATCH_ROWS: 1,
+                StatementOptions.READ_PREFETCH: "true",
+            }
+        ) as cursor,
     ):
         cursor.execute("SELECT value")
         with pytest.raises(ValueError, match="42000!mid-stream failure") as failed:
             cursor.fetchall()
         assert "second diagnostic" in str(failed.value)
+        with pytest.raises(adbc_driver_manager.OperationalError) as disconnected:
+            cursor.execute("SELECT value")
+        assert disconnected.value.status_code == adbc_driver_manager.AdbcStatusCode.IO
+        with pytest.raises(adbc_driver_manager.ProgrammingError):
+            cursor.execute("SELECT value")
+
+
+def test_closing_prefetched_reader_cancels_a_stalled_fetch() -> None:
+    with (
+        _FailureServer("stream_stall") as server,
+        dbapi.connect(server.uri, autocommit=True) as connection,
+        connection.cursor(
+            adbc_stmt_kwargs={
+                StatementOptions.READ_BATCH_ROWS: 1,
+                StatementOptions.READ_PREFETCH: "true",
+            }
+        ) as cursor,
+    ):
+        cursor.execute("SELECT value")
+        reader = cursor.fetch_record_batch()
+        assert server.export_received.wait(timeout=5), "prefetch did not reach the fake server"
+
+        started = monotonic()
+        reader.close()
+        assert monotonic() - started < 5
+        with pytest.raises(adbc_driver_manager.ProgrammingError):
+            cursor.execute("SELECT value")
+
+
+def test_cancel_interrupts_a_stalled_prefetch() -> None:
+    with (
+        _FailureServer("stream_stall") as server,
+        dbapi.connect(server.uri, autocommit=True) as connection,
+        connection.cursor(
+            adbc_stmt_kwargs={
+                StatementOptions.READ_BATCH_ROWS: 1,
+                StatementOptions.READ_PREFETCH: "true",
+            }
+        ) as cursor,
+    ):
+        cursor.execute("SELECT value")
+        reader = cursor.fetch_record_batch()
+        assert server.export_received.wait(timeout=5), "prefetch did not reach the fake server"
+
+        cursor.adbc_cancel()
+        reader.close()
+        with pytest.raises(adbc_driver_manager.ProgrammingError):
+            cursor.execute("SELECT value")

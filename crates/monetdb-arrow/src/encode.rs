@@ -28,6 +28,7 @@ use monetdb::MonetType;
 #[derive(Debug)]
 pub enum EncodeError {
     Unsupported(DataType),
+    UnsupportedMonetType(MonetType),
     InvalidValue {
         row: usize,
         message: &'static str,
@@ -42,6 +43,12 @@ impl fmt::Display for EncodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unsupported(data_type) => write!(f, "Arrow type {data_type} is not supported"),
+            Self::UnsupportedMonetType(data_type) => {
+                write!(
+                    f,
+                    "MonetDB type {data_type} is not supported for COPY BINARY encoding"
+                )
+            }
             Self::InvalidValue { row, message } => {
                 write!(f, "invalid value at row {row}: {message}")
             }
@@ -156,7 +163,9 @@ pub fn encode_column(field: &Field, array: &dyn Array) -> Result<Vec<u8>, Encode
         monet_type_for_field(field)?,
         MonetType::Inet | MonetType::Inet4 | MonetType::Inet6
     ) {
-        return Err(EncodeError::Unsupported(array.data_type().clone()));
+        return Err(EncodeError::UnsupportedMonetType(monet_type_for_field(
+            field,
+        )?));
     }
     let mut out = Vec::new();
     if let Some(width) = fixed_wire_width(field, array.data_type())? {
@@ -575,7 +584,10 @@ fn encode_strings<'a>(
                 null = Some(row);
             }
         }
-        if row + 1 == sample_rows && seen.len() >= sample_rows * 3 / 4 {
+        if total_rows > CARDINALITY_SAMPLE_ROWS
+            && row + 1 == sample_rows
+            && seen.len() >= sample_rows * 3 / 4
+        {
             seen.reserve(total_rows.saturating_sub(seen.len()));
         }
     }
@@ -1177,7 +1189,7 @@ mod tests {
         assert_eq!(monet_type_for_field(&inet).unwrap(), MonetType::Inet);
         assert!(matches!(
             encode_column(&inet, &StringArray::from(vec!["127.0.0.1"])),
-            Err(EncodeError::Unsupported(DataType::Utf8))
+            Err(EncodeError::UnsupportedMonetType(MonetType::Inet))
         ));
 
         let inet4 = Field::new("inet4", DataType::LargeUtf8, true).with_metadata(
@@ -1190,7 +1202,7 @@ mod tests {
         assert_eq!(monet_type_for_field(&inet4).unwrap(), MonetType::Inet4);
         assert!(matches!(
             encode_column(&inet4, &LargeStringArray::from(vec!["127.0.0.1"])),
-            Err(EncodeError::Unsupported(DataType::LargeUtf8))
+            Err(EncodeError::UnsupportedMonetType(MonetType::Inet4))
         ));
 
         let inet6 = Field::new("inet6", DataType::Utf8View, true).with_metadata(
@@ -1203,7 +1215,7 @@ mod tests {
         assert_eq!(monet_type_for_field(&inet6).unwrap(), MonetType::Inet6);
         assert!(matches!(
             encode_column(&inet6, &StringViewArray::from(vec!["::1"])),
-            Err(EncodeError::Unsupported(DataType::Utf8View))
+            Err(EncodeError::UnsupportedMonetType(MonetType::Inet6))
         ));
     }
 

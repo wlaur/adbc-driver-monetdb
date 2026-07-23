@@ -228,6 +228,21 @@ def test_prefetched_reader_can_be_closed_early_and_connection_reused(monetdb_uri
 
 
 @pytest.mark.integration
+def test_connection_read_prefetch_false_is_inherited_by_statements(monetdb_uri: str) -> None:
+    with dbapi.connect(
+        monetdb_uri,
+        conn_kwargs={ConnectionOptions.READ_PREFETCH: "false"},
+    ) as connection:
+        assert connection.adbc_connection.get_option(str(ConnectionOptions.READ_PREFETCH)) == "false"
+        assert connection.adbc_connection.get_option(str(ConnectionOptions.READ_BATCH_ROWS)) == "131072"
+        assert connection.adbc_connection.get_option(str(ConnectionOptions.WRITE_BATCH_ROWS)) == "0"
+        with connection.cursor() as cursor:
+            assert cursor.adbc_statement.get_option(str(StatementOptions.READ_PREFETCH)) == "false"
+            assert cursor.adbc_statement.get_option(str(StatementOptions.READ_BATCH_ROWS)) == "131072"
+            assert cursor.adbc_statement.get_option(str(StatementOptions.WRITE_BATCH_ROWS)) == "0"
+
+
+@pytest.mark.integration
 def test_i64_null_sentinel_ingest_is_a_clean_error(monetdb_uri: str) -> None:
     frame = pl.DataFrame({"value": pl.Series([-(2**63)], dtype=pl.Int64)})
     with dbapi.connect(monetdb_uri, autocommit=True) as connection:
@@ -320,6 +335,51 @@ def test_quoted_column_names_roundtrip_through_arrow_and_polars(
     assert arrow_table.num_rows == row_count
     assert polars_frame.columns == names
     assert polars_frame.height == row_count
+
+
+@pytest.mark.integration
+def test_adversarial_identifier_matrix_roundtrips_through_ingest_arrow_and_polars(
+    monetdb_uri: str,
+) -> None:
+    names = [
+        'double"quote',
+        'double""quote',
+        '"""triple_double_start',
+        'triple_double_end"""',
+        '"""both_double"""',
+        "single'quote",
+        "single''quote",
+        "'''triple_single_start",
+        "triple_single_end'''",
+        "'''both_single'''",
+        "mixed''quotes%",
+        'mixed""quotes%',
+        "percent%name",
+        "multiple%%percent",
+        "percent_at_end%",
+        '"',
+        '""',
+        "'",
+        "''",
+    ]
+    table_name = "review_adversarial_identifiers"
+    frame = pl.DataFrame({name: [index] for index, name in enumerate(names)})
+    quoted_table = f'"{table_name}"'
+    query = f"SELECT * FROM {quoted_table}"
+
+    with dbapi.connect(monetdb_uri, autocommit=True) as connection, connection.cursor() as cursor:
+        try:
+            cursor.execute(f"DROP TABLE IF EXISTS {quoted_table}")
+            assert cursor.adbc_ingest(table_name, frame.to_arrow(), mode="create") == 1
+            cursor.execute(query)
+            arrow_table = cursor.fetch_arrow_table()
+            polars_frame = pl.read_database(query, connection)
+        finally:
+            cursor.execute(f"DROP TABLE IF EXISTS {quoted_table}")
+
+    assert arrow_table.schema.names == names
+    assert arrow_table.to_pydict() == frame.to_dict(as_series=False)
+    assert polars_frame.equals(frame)
 
 
 @pytest.mark.integration

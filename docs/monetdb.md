@@ -49,6 +49,14 @@ Zero disables any timeout explicitly.
 Timeout and cancellation close the MAPI session. Cancellation is connection-scoped and may
 interrupt whichever statement currently owns the connection; open a new connection afterward.
 
+## Client information
+
+Client information is enabled by default. URI parameters `client_application`, `client_remark`,
+and `client_info` map to the database options `adbc.monetdb.client_application`,
+`adbc.monetdb.client_remark`, and `adbc.monetdb.client_info`. The session is visible in
+`sys.sessions`; set `client_info=false` to suppress the hostname, process id, application, driver,
+and remark values.
+
 ## Feature and type support
 
 {{ features|safe }}

@@ -36,6 +36,19 @@ pub struct ExportbinFrame<'a> {
     pub columns: Vec<&'a [u8]>,
 }
 
+/// Header fields from an `Xexportbin` frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExportbinHeader {
+    /// Server-side result-set id this window belongs to.
+    pub result_id: i64,
+    /// Number of columns in the frame.
+    pub column_count: usize,
+    /// Number of rows in this window.
+    pub row_count: u64,
+    /// Absolute row offset of the window within the result set.
+    pub start_row: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrameError {
     /// The server reported an error instead of (or inside) a frame.
@@ -113,16 +126,20 @@ pub fn parse_frame(frame: &[u8]) -> Result<ExportbinFrame<'_>, FrameError> {
     })
 }
 
-struct Header {
-    result_id: i64,
-    column_count: usize,
-    row_count: u64,
-    start_row: u64,
+/// Parse only the text header of a complete `Xexportbin` response.
+///
+/// This is useful for scheduling row windows. Consumers must still call
+/// [`parse_frame`] before accessing column bytes.
+pub fn parse_frame_header(frame: &[u8]) -> Result<ExportbinHeader, FrameError> {
+    if frame.first() == Some(&b'!') {
+        return Err(FrameError::Server(read_error_message(frame, 0)));
+    }
+    parse_header(frame).map(|(header, _)| header)
 }
 
 /// Parse the `&6 <res_id> <nr_cols> <rows> <offset>\n` header line; returns the
 /// header and the offset of the first byte after it.
-fn parse_header(frame: &[u8]) -> Result<(Header, usize), FrameError> {
+fn parse_header(frame: &[u8]) -> Result<(ExportbinHeader, usize), FrameError> {
     if !frame.starts_with(HEADER_PREFIX) {
         return Err(FrameError::Malformed("missing &6 block header"));
     }
@@ -146,7 +163,7 @@ fn parse_header(frame: &[u8]) -> Result<(Header, usize), FrameError> {
     let start_row = parse_int::<u64>(next()?)?;
 
     Ok((
-        Header {
+        ExportbinHeader {
             result_id,
             column_count,
             row_count,
@@ -247,6 +264,29 @@ mod tests {
         assert_eq!(parsed.row_count, 3);
         assert_eq!(parsed.start_row, 100);
         assert_eq!(parsed.columns, vec![&ints[..], &strings[..]]);
+    }
+
+    #[test]
+    fn parses_header_without_walking_the_table_of_contents() {
+        let frame = build_frame(7, 100, &[b"first", b"second"]);
+
+        assert_eq!(
+            parse_frame_header(&frame),
+            Ok(ExportbinHeader {
+                result_id: 7,
+                column_count: 2,
+                row_count: 3,
+                start_row: 100,
+            })
+        );
+    }
+
+    #[test]
+    fn header_parser_reports_textual_server_errors() {
+        assert_eq!(
+            parse_frame_header(b"!42000 syntax error\0"),
+            Err(FrameError::Server("42000 syntax error".into()))
+        );
     }
 
     #[test]
