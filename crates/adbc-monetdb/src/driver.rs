@@ -692,7 +692,18 @@ fn connect_error_status(value: &monetdb::ConnectError) -> Status {
         monetdb::ConnectError::Timeout => Status::Timeout,
         monetdb::ConnectError::IO(_) => Status::IO,
         monetdb::ConnectError::SocketAttempts { tcp, .. } => connect_error_status(tcp),
-        _ => Status::InvalidArguments,
+        monetdb::ConnectError::Utf(_)
+        | monetdb::ConnectError::InvalidChallenge(_)
+        | monetdb::ConnectError::UnsupportedHashAlgo(_)
+        | monetdb::ConnectError::TlsDowngrade
+        | monetdb::ConnectError::UnexpectedResponse(_) => Status::InvalidData,
+        monetdb::ConnectError::TooManyRedirects => Status::IO,
+        monetdb::ConnectError::TlsNotSupported | monetdb::ConnectError::UnixDomain => {
+            Status::NotImplemented
+        }
+        monetdb::ConnectError::Parm(_)
+        | monetdb::ConnectError::TlsError(_)
+        | monetdb::ConnectError::OnlySqlSupported => Status::InvalidArguments,
     }
 }
 
@@ -1173,6 +1184,7 @@ impl Optionable for MonetdbStatement {
 
 impl Statement for MonetdbStatement {
     fn bind(&mut self, batch: RecordBatch) -> Result<()> {
+        validate_record_batch(&batch)?;
         self.bound = Some(Box::new(SingleBatchReader::new(batch)));
         Ok(())
     }
@@ -1607,6 +1619,7 @@ impl MonetdbStatement {
             let mut rows = 0i64;
             for batch in &mut reader {
                 let batch = batch.map_err(Error::from)?;
+                validate_record_batch(&batch)?;
                 if batch.schema() != schema {
                     return Err(error(
                         "record batch schema changed within ingest stream",
@@ -1677,6 +1690,18 @@ fn batch_ranges(rows: usize, batch_rows: usize) -> impl Iterator<Item = Range<us
         let len = (rows - start).min(batch_rows);
         start..start + len
     })
+}
+
+fn validate_record_batch(batch: &RecordBatch) -> Result<()> {
+    for (index, column) in batch.columns().iter().enumerate() {
+        column.to_data().validate_full().map_err(|value| {
+            error(
+                format!("invalid Arrow data in column {index}: {value}"),
+                Status::InvalidData,
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn validate_append_schema(
@@ -1791,16 +1816,20 @@ impl Iterator for BoundQueryStream {
                 return Some(sql);
             }
             match self.reader.next() {
-                Some(Ok(batch)) if batch.schema() == self.schema => {
-                    self.batch = Some(batch);
-                    self.next_row = 0;
-                }
-                Some(Ok(_)) => {
+                Some(Ok(batch)) if batch.schema() != self.schema => {
                     self.finished = true;
                     return Some(Err(error(
                         "parameter schema changed within the bound stream",
                         Status::InvalidData,
                     )));
+                }
+                Some(Ok(batch)) => {
+                    if let Err(value) = validate_record_batch(&batch) {
+                        self.finished = true;
+                        return Some(Err(value));
+                    }
+                    self.batch = Some(batch);
+                    self.next_row = 0;
                 }
                 Some(Err(value)) => {
                     self.finished = true;
@@ -2853,6 +2882,44 @@ mod tests {
             connect_error_status(&nested(monetdb::ConnectError::Timeout)),
             Status::Timeout
         );
+    }
+
+    #[test]
+    fn maps_malformed_server_replies_as_invalid_data() {
+        for value in [
+            monetdb::ConnectError::InvalidChallenge("bad".into()),
+            monetdb::ConnectError::UnsupportedHashAlgo("bad".into()),
+            monetdb::ConnectError::UnexpectedResponse("bad".into()),
+            monetdb::ConnectError::TlsDowngrade,
+        ] {
+            assert_eq!(connect_error_status(&value), Status::InvalidData);
+        }
+        assert_eq!(
+            connect_error_status(&monetdb::ConnectError::TooManyRedirects),
+            Status::IO
+        );
+    }
+
+    #[test]
+    fn bind_validation_rejects_corrupt_string_offsets() {
+        use arrow_buffer::{Buffer, OffsetBuffer, ScalarBuffer};
+
+        let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 100]));
+        // SAFETY: This deliberately models malformed Arrow C data. No value is
+        // accessed before `validate_record_batch` rejects the out-of-bounds offset.
+        let values = unsafe { StringArray::new_unchecked(offsets, Buffer::from(vec![b'x']), None) };
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Utf8,
+                false,
+            )])),
+            vec![Arc::new(values)],
+        )
+        .unwrap();
+        let rejected = validate_record_batch(&batch).unwrap_err();
+        assert_eq!(rejected.status, Status::InvalidData);
+        assert!(rejected.message.contains("invalid Arrow data in column 0"));
     }
 
     #[test]

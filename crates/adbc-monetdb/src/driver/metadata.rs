@@ -832,7 +832,7 @@ fn xdbc_type(column: &ObjectColumn) -> XdbcType {
     // DECIMAL_DIGITS, NUM_PREC_RADIX, SQL_DATA_TYPE, SQL_DATETIME_SUB, and
     // CHAR_OCTET_LENGTH).
     let (data_type, sql_data_type, datetime_sub) = match name.as_str() {
-        "boolean" => (Some(16), Some(16), None),
+        "boolean" => (Some(-7), Some(-7), None),
         "tinyint" => (Some(-6), Some(-6), None),
         "smallint" => (Some(5), Some(5), None),
         "int" | "integer" => (Some(4), Some(4), None),

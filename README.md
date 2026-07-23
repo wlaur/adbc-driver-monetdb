@@ -236,10 +236,12 @@ the driver discoverable as `monetdb` by C/C++, Go, R, Ruby, Rust, Python, and ot
 managers. `dbc` writes the installed ADBC TOML manifest with an absolute shared-library path; a
 relative `Driver.shared` path is not portable.
 
+Linux dbc libraries are built in the pinned `manylinux_2_28` environment and support glibc 2.28
+or newer. Windows dbc libraries statically link the Visual C++ runtime. Release CI audits both
+constraints before packaging.
+
 ```sh
-cargo about generate --all-features --fail --locked \
-    --target aarch64-apple-darwin,aarch64-unknown-linux-gnu,x86_64-pc-windows-msvc,x86_64-unknown-linux-gnu \
-    license.tpl > THIRD_PARTY_LICENSES
+uv run python packaging/generate_licenses.py
 uv run python packaging/dbc/build_package.py \
     --library target/release/libadbc_monetdb.dylib \
     --platform macos_arm64 --out-dir dist/dbc --license THIRD_PARTY_LICENSES
@@ -247,8 +249,9 @@ ADBC_DRIVER_PATH="$PWD/.adbc-drivers" \
     uvx --from dbc dbc install --no-verify dist/dbc/monetdb_macos_arm64_v*.tar.gz
 ```
 
-The repository packages are unsigned development artifacts, hence `--no-verify`. A registry
-release should be signed and installed without that flag.
+Locally built and GitHub Release archives are unsigned, hence `--no-verify` for direct archive
+installation. Every GitHub Release includes `SHA256SUMS`; verify the archive checksum before
+installing it.
 
 Polars can use a dbc-installed driver without the `adbc-driver-monetdb` Python package when the
 connection is created by the Python driver manager (which is still required by polars' ADBC engine):

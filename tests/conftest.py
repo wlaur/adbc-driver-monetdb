@@ -25,7 +25,7 @@ def monetdb_uri() -> str:
         try:
             dbapi.connect(readiness_uri).close()
             break
-        except adbc_driver_manager.Error:
+        except adbc_driver_manager.OperationalError:
             time.sleep(2)
     else:
         pytest.fail(f"MonetDB did not become ready at {uri} within 120 seconds")
