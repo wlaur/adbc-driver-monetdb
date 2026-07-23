@@ -17,6 +17,16 @@ PLATFORMS = {
 }
 
 
+def test_installation_docs_only_advertise_published_channels() -> None:
+    readme = (ROOT / "README.md").read_text()
+    template = (ROOT / "docs" / "monetdb.md").read_text()
+
+    for documentation in (readme, template):
+        assert "uv add adbc-driver-monetdb" in documentation
+        assert "dbc install --no-verify" in documentation
+        assert "dbc install monetdb" not in documentation
+
+
 def _binary(kind: str, machine: int) -> bytes:
     binary = bytearray(128)
     if kind == "elf":
