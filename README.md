@@ -154,14 +154,15 @@ and a dictionary for named `:name` values.
 `adbc_stmt_kwargs` is not an execute option. Polars' `batch_size` does not configure
 `adbc.monetdb.read_batch_rows`, and `DataFrame.write_database(..., engine_options=...)` supplies
 ingestion arguments rather than connection or timeout options. The read batch default is 131,072
-rows, matching PyArrow Dataset Scanner's default. Read prefetch is enabled by default and overlaps
-the next bounded binary window fetch with decoding the current window; set
-`adbc.monetdb.read_prefetch` to `"false"` to use the sequential diagnostic path. Ingestion
-preserves the incoming Arrow stream's batches by default; setting
-`adbc.monetdb.write_batch_rows` to a positive value zero-copy slices larger input batches before
-each COPY, while zero keeps the upstream boundaries. Set it through `conn_kwargs` as above when
-`DataFrame.write_database` creates its own cursor, or through `adbc_stmt_kwargs` for a directly
-managed cursor.
+rows, matching PyArrow Dataset Scanner's default. Read prefetch is enabled by default and can hold
+up to about three windows at once: one decoding, one buffered, and one in flight. Abandoning a
+stream can therefore waste up to two fetched windows; increasing `read_batch_rows` also increases
+this memory bound. Set `adbc.monetdb.read_prefetch` to `"false"` to use the sequential diagnostic
+path. Ingestion caps parallel encode/COPY windows at 131,072 rows to bound memory. Setting
+`adbc.monetdb.write_batch_rows` to a smaller positive value zero-copy slices larger input batches
+further; zero keeps upstream boundaries only up to the internal cap. Set it through `conn_kwargs`
+as above when `DataFrame.write_database` creates its own cursor, or through `adbc_stmt_kwargs` for
+a directly managed cursor.
 
 The examples use strings because `adbc-driver-manager` publishes string-valued type hints for
 database and connection option mappings. Statement options also accept native integers through the
@@ -172,6 +173,41 @@ use its own connection and cursors. Cancellation is connection-scoped: it interr
 currently using that connection, not necessarily the statement object on which `cancel` was called.
 MAPI cannot safely resume a partially read response, so cancellation closes the session permanently;
 close that connection and open another one before issuing more work.
+
+## Client information
+
+Client information is sent at login by default. The `client` value in
+[`sys.sessions`](https://www.monetdb.org/documentation-Dec2025/user-guide/sql-catalog/users-roles-privileges-sessions/)
+identifies this driver and its protocol library, for example
+`adbc_driver_monetdb 0.8.0 / monetdb-rust 0.2.1`. The Python shim uses the basename of
+`sys.argv[0]` as the default `application`. Hostname and process id are also sent by default, as
+they are by pymonetdb and libmapi; use `client_info=false` if that host metadata should not leave
+the client.
+
+The URI parameters are `client_application`, `client_remark`, and `client_info`. The equivalent
+pre-connect database options are `adbc.monetdb.client_application`,
+`adbc.monetdb.client_remark`, and `adbc.monetdb.client_info`; database options override URI
+values. Application and remark values cannot contain newlines.
+
+```python
+from adbc_driver_monetdb import DatabaseOptions, dbapi
+
+with dbapi.connect(
+    "monetdb://localhost:50000/db?client_application=nightly-load",
+    db_kwargs={DatabaseOptions.CLIENT_REMARK: "warehouse refresh"},
+) as conn:
+    session = conn.execute(
+        "SELECT hostname, application, client, clientpid, remark "
+        "FROM sys.sessions WHERE sessionid = current_sessionid()"
+    ).fetchone()
+```
+
+For a post-connect update, call
+[`sys.setclientinfo`](https://www.monetdb.org/documentation/admin-guide/monitoring/session-procedures/):
+
+```sql
+CALL sys.setclientinfo('ClientRemark', 'phase 2');
+```
 
 The native DB-API parameter style is `qmark` (`?`). Named `:name` parameters are also supported
 when a parameter dictionary is supplied, including SQLAlchemy expressions compiled to a SQL

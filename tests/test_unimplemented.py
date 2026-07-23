@@ -42,6 +42,24 @@ def test_cross_catalog_ingest_is_not_implemented(monetdb_uri: str) -> None:
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("extension_name", ["monetdb.inet", "monetdb.inet4", "monetdb.inet6"])
+def test_legacy_inet_ingest_is_not_implemented(
+    monetdb_uri: str,
+    extension_name: str,
+) -> None:
+    field = pa.field(
+        "address",
+        pa.string(),
+        metadata={b"ARROW:extension:name": extension_name.encode()},
+    )
+    batch = pa.record_batch([pa.array(["127.0.0.1"])], schema=pa.schema([field]))
+    with dbapi.connect(monetdb_uri) as connection, connection.cursor() as cursor:
+        with pytest.raises(adbc_driver_manager.NotSupportedError, match="INET") as caught:
+            cursor.adbc_ingest("never_created", batch, mode="create")
+        _assert_not_implemented(caught.value)
+
+
+@pytest.mark.integration
 def test_incremental_execution_is_not_implemented(monetdb_uri: str) -> None:
     with dbapi.connect(monetdb_uri) as connection, connection.cursor() as cursor:
         with pytest.raises(adbc_driver_manager.NotSupportedError) as caught:

@@ -20,6 +20,9 @@ class DatabaseOptions(StrEnum):
     READ_TIMEOUT = "adbc.monetdb.read_timeout_seconds"
     WRITE_TIMEOUT = "adbc.monetdb.write_timeout_seconds"
     OPERATION_TIMEOUT = "adbc.monetdb.operation_timeout_seconds"
+    CLIENT_APPLICATION = "adbc.monetdb.client_application"
+    CLIENT_REMARK = "adbc.monetdb.client_remark"
+    CLIENT_INFO = "adbc.monetdb.client_info"
 
 
 class ConnectionOptions(StrEnum):

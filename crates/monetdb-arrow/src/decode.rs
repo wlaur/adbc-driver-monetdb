@@ -1073,6 +1073,9 @@ fn decode_primitive<const N: usize, T: ArrowPrimitiveType>(
 where
     T::Native: Copy,
 {
+    const {
+        assert!(N == std::mem::size_of::<T::Native>());
+    }
     expect_fixed(bytes, rows, N)?;
     #[cfg(target_endian = "little")]
     {

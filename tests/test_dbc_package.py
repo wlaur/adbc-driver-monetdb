@@ -50,7 +50,8 @@ def _run_builder(tmp_path: Path, platform: str, suffix: str, binary: bytes) -> s
     license_path.write_text("dependency licenses")
     source_root = tmp_path / "source"
     (source_root / "monetdb-rust").mkdir(parents=True)
-    (source_root / "pyproject.toml").write_text('[project]\nversion = "0.8.0"\n')
+    version = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["version"]
+    (source_root / "pyproject.toml").write_text(f'[project]\nversion = "{version}"\n')
     (source_root / "LICENSE").write_text("MIT")
     (source_root / "NOTICE").write_text("notice")
     (source_root / "monetdb-rust" / "LICENSE").write_text("MPL")
