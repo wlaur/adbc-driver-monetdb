@@ -7,6 +7,22 @@ columnar result sets (MonetDB's binary result-set protocol decoded directly into
 batches) and bulk ingestion (`COPY BINARY ... ON CLIENT` streamed from Arrow buffers) through one
 standard interface.
 
+## Installation
+
+Install the Python package:
+
+```sh
+uv add adbc-driver-monetdb
+```
+
+For standalone driver-manager use, download the archive for your platform from the
+[GitHub Releases](https://github.com/wlaur/adbc-driver-monetdb/releases) page, verify it against
+the release's `SHA256SUMS`, and install the unsigned local archive:
+
+```sh
+uvx --from dbc dbc install --no-verify /path/to/monetdb_PLATFORM_vVERSION.tar.gz
+```
+
 ## Usage
 
 ```python
@@ -265,7 +281,7 @@ connection is created by the Python driver manager (which is still required by p
 import polars as pl
 from adbc_driver_manager import dbapi
 
-# The driver itself was installed with: dbc install monetdb
+# The driver itself was installed from a downloaded GitHub Release archive as shown above.
 with dbapi.connect(
     driver="monetdb",
     db_kwargs={"uri": "monetdb://user:password@localhost:50000/db"},

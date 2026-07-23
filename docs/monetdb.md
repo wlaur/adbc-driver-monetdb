@@ -12,8 +12,18 @@ Arrow record batches and writes Arrow data with `COPY BINARY ... ON CLIENT`.
 
 ## Installation
 
-Install the driver with `dbc install monetdb`, or install the `adbc-driver-monetdb` Python package
-for polars URI-scheme integration.
+Install the Python package for polars URI-scheme integration:
+
+```console
+$ uv add adbc-driver-monetdb
+```
+
+For standalone driver-manager use, download the archive for your platform from this version's
+GitHub Release, verify it against `SHA256SUMS`, and install the unsigned local archive:
+
+```console
+$ uvx --from dbc dbc install --no-verify /path/to/monetdb_PLATFORM_v{{ version }}.tar.gz
+```
 
 ## Connecting
 
