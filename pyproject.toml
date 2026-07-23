@@ -63,10 +63,11 @@ features = ["python"]
 locked = true
 include = [
     { path = "rust-toolchain.toml", format = "sdist" },
-    { path = "tests/**", format = "sdist" },
-    { path = "packaging/**", format = "sdist" },
+    { path = "tests/**/*", format = "sdist" },
+    { path = "packaging/**/*", format = "sdist" },
     { path = "compose.yaml", format = "sdist" },
 ]
+exclude = [{ path = "**/__pycache__/**", format = "sdist" }]
 
 [tool.cibuildwheel]
 # abi3 (cp313) -> one wheel per platform covers CPython >= 3.13.
@@ -76,6 +77,8 @@ skip = ["*-musllinux*", "*_i686", "*-win32"]
 test-command = 'python -c "import adbc_driver_monetdb as m; print(m.driver_path())"'
 
 [tool.cibuildwheel.linux]
+manylinux-x86_64-image = "manylinux_2_28"
+manylinux-aarch64-image = "manylinux_2_28"
 # The manylinux image lacks Rust; install the current stable toolchain for maturin.
 before-all = '''
 rustup_machine=$(uname -m)
@@ -100,6 +103,11 @@ curl --proto '=https' --tlsv1.2 -sSfL \
 printf '%s  %s\n' "$rustup_sha256" "$rustup_init" | sha256sum --check --strict
 chmod +x "$rustup_init"
 "$rustup_init" -y --profile minimal --default-toolchain stable --no-modify-path
+'''
+before-build = '''
+cargo build --locked --release -p adbc-monetdb --no-default-features
+mkdir -p standalone-dbc
+cp target/release/libadbc_monetdb.so standalone-dbc/libadbc_monetdb.so
 '''
 environment = { PATH = "$HOME/.cargo/bin:$PATH" }
 repair-wheel-command = "auditwheel repair -w {dest_dir} {wheel}"

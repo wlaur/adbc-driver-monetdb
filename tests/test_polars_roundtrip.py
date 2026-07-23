@@ -684,7 +684,7 @@ def test_write_database_roundtrip(monetdb_uri: str) -> None:
             "name": ["a", "b", None],
         }
     )
-    with dbapi.connect(monetdb_uri) as conn:
+    with dbapi.connect(monetdb_uri, autocommit=True) as conn:
         try:
             df.write_database("roundtrip_smoke", conn, if_table_exists="replace", engine="adbc")
             back = pl.read_database("SELECT id, value, name FROM roundtrip_smoke ORDER BY id", conn)
@@ -696,7 +696,7 @@ def test_write_database_roundtrip(monetdb_uri: str) -> None:
 @pytest.mark.integration
 def test_pandas_roundtrip(monetdb_uri: str) -> None:
     frame = pd.DataFrame({"id": [1, 2, 3], "name": ["a", None, "c"]})
-    with dbapi.connect(monetdb_uri) as conn:
+    with dbapi.connect(monetdb_uri, autocommit=True) as conn:
         try:
             assert (
                 frame.to_sql(
@@ -1077,7 +1077,7 @@ def test_dtype_matrix_roundtrip(monetdb_uri: str) -> None:
         pl.col("u32").cast(pl.Int64),
         pl.col("u64").cast(pl.Decimal(38, 0)),
     )
-    with dbapi.connect(monetdb_uri) as conn:
+    with dbapi.connect(monetdb_uri, autocommit=True) as conn:
         try:
             assert frame.write_database("dtype_matrix", conn, if_table_exists="replace", engine="adbc") == 3
             back = pl.read_database("SELECT * FROM dtype_matrix", conn)
@@ -1287,7 +1287,7 @@ def test_categorical_and_enum_ingest(monetdb_uri: str) -> None:
             "enum": pl.Series(["x", "y", "x", None], dtype=pl.Enum(["x", "y"])),
         }
     )
-    with dbapi.connect(monetdb_uri) as conn:
+    with dbapi.connect(monetdb_uri, autocommit=True) as conn:
         try:
             assert frame.write_database("categoricals", conn, if_table_exists="replace", engine="adbc") == 4
             back = pl.read_database("SELECT * FROM categoricals", conn)

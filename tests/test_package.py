@@ -32,6 +32,7 @@ def test_dbapi_module_surface() -> None:
     assert dbapi.Error is manager_dbapi.Error
     assert adbc_driver_monetdbs.ENTRYPOINT == adbc_driver_monetdb.ENTRYPOINT
     assert adbc_driver_monetdbs.driver_path is adbc_driver_monetdb.driver_path
+    assert set(adbc_driver_monetdbs.__all__) == set(adbc_driver_monetdb.__all__)
     assert secure_dbapi.connect is dbapi.connect
 
 

@@ -91,10 +91,9 @@ jobs:
       - name: Generate and validate the dependency license roll-up
         run: |
           cargo install cargo-about --version 0.9.1 --locked --features cli
-          cargo about generate --all-features --fail --locked \
-            --target aarch64-apple-darwin,aarch64-unknown-linux-gnu,x86_64-pc-windows-msvc,x86_64-unknown-linux-gnu \
-            license.tpl > THIRD_PARTY_LICENSES
+          python3 packaging/generate_licenses.py
           test -s THIRD_PARTY_LICENSES
+          git diff --exit-code -- THIRD_PARTY_LICENSES
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dependency-licenses
@@ -120,7 +119,7 @@ jobs:
         with:
           name: dependency-licenses
       - run: uv build --sdist --out-dir dist
-      - name: Verify the sdist license roll-up
+      - name: Verify the sdist release payload
         shell: bash
         run: |
           python - <<'PY'
@@ -130,7 +129,13 @@ jobs:
           assert len(sdists) == 1, sdists
           with tarfile.open(sdists[0]) as archive:
               names = archive.getnames()
-          assert any(name.endswith("/THIRD_PARTY_LICENSES") for name in names), names
+          for suffix in (
+              "/THIRD_PARTY_LICENSES",
+              "/tests/conftest.py",
+              "/packaging/dbc/MANIFEST.linux.toml",
+          ):
+              assert any(name.endswith(suffix) for name in names), suffix
+          assert not any("/__pycache__/" in name or name.endswith(".pyc") for name in names), names
           PY
       - name: Rebuild and smoke-test from the sdist
         shell: bash
@@ -217,14 +222,24 @@ jobs:
           ):
               assert any(name.endswith(suffix) for name in names), suffix
           PY
-      - name: Build the standalone dbc driver without Python
+      - name: Verify the Linux dbc driver built inside manylinux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: test -f standalone-dbc/libadbc_monetdb.so
+      - name: Build the macOS dbc driver without Python
+        if: runner.os == 'macOS'
+        run: cargo build --locked --release -p adbc-monetdb --no-default-features
+      - name: Build the Windows dbc driver without Python and with a static CRT
+        if: runner.os == 'Windows'
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
         run: cargo build --locked --release -p adbc-monetdb --no-default-features
       - name: Audit Linux wheel dependencies
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          uvx --from auditwheel auditwheel show wheelhouse/*.whl
-          library=target/release/libadbc_monetdb.so
+          uvx --from 'auditwheel==6.7.0' auditwheel show wheelhouse/*.whl
+          library=standalone-dbc/libadbc_monetdb.so
           readelf -h -d "$library"
           ldd "$library"
           nm -D --defined-only "$library" | grep -F AdbcDriverMonetdbInit
@@ -232,11 +247,21 @@ jobs:
             echo "standalone dbc driver imports Python runtime symbols" >&2
             exit 1
           fi
+          max_glibc=$(
+            readelf --version-info "$library" |
+              sed -n 's/.*Name: GLIBC_\([0-9.]*\).*/\1/p' |
+              sort -V |
+              tail -1
+          )
+          if [ -z "$max_glibc" ] || [ "$(printf '%s\n' "$max_glibc" 2.28 | sort -V | tail -1)" != 2.28 ]; then
+            echo "standalone dbc driver requires GLIBC_${max_glibc:-unknown}, newer than GLIBC_2.28" >&2
+            exit 1
+          fi
       - name: Audit macOS wheel dependencies
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          uvx --from delocate delocate-listdeps wheelhouse/*.whl
+          uvx --from 'delocate==0.13.0' delocate-listdeps wheelhouse/*.whl
           library=target/release/libadbc_monetdb.dylib
           otool -hv -L "$library"
           nm -gU "$library" | grep -F AdbcDriverMonetdbInit
@@ -272,20 +297,27 @@ jobs:
           if (-not ($dbcHeaders -match "machine \(x64\)")) { throw "dbc driver is not x86-64 PE" }
           if (-not ($dbcExports -match "AdbcDriverMonetdbInit")) { throw "dbc driver has no ADBC entrypoint" }
           if ($dbcImports -match '(?i)python3[0-9]*\.dll') { throw "dbc driver imports the Python runtime" }
+          if ($dbcImports -match '(?i)\b(?:VCRUNTIME|MSVCP|CONCRT)[^\s]*\.dll\b') {
+            throw "dbc driver unexpectedly depends on the dynamic Visual C++ runtime"
+          }
           $forbidden = $imports | Select-String -Pattern '(?i)\b(?:MSVCP|CONCRT)[^\s]*\.dll\b'
           if ($forbidden) { throw "extension unexpectedly depends on the C++ runtime: $forbidden" }
       - name: Build and load the dbc package
         shell: bash
         run: |
           case '${{ runner.os }}' in
-            Linux) library=target/release/libadbc_monetdb.so ;;
+            Linux) library=standalone-dbc/libadbc_monetdb.so ;;
             macOS) library=target/release/libadbc_monetdb.dylib ;;
-            Windows) library=target/release/adbc_monetdb.dll ;;
+            Windows)
+              library=target/release/adbc_monetdb.dll
+              export RUSTFLAGS='-C target-feature=+crt-static'
+              ;;
           esac
           python packaging/dbc/build_package.py \
             --library "$library" --platform '${{ matrix.dbc_platform }}' --out-dir dbc-dist \
             --license THIRD_PARTY_LICENSES
-          cargo run --locked -p adbc-monetdb --example dbc_smoke -- "$library"
+          cargo run --locked --release --no-default-features \
+            -p adbc-monetdb --example dbc_smoke -- "$library"
           driver_path="$RUNNER_TEMP/adbc-drivers"
           mkdir -p "$driver_path"
           ADBC_DRIVER_PATH="$driver_path" uvx --from 'dbc==0.3.0' \
@@ -595,7 +627,7 @@ jobs:
           path: dist
           name: sdist
       - name: Verify the complete PyPI artifact set
-        run: python packaging/release_checks.py publish-artifacts dist
+        run: python packaging/release_checks.py publish-artifacts dist --version "${GITHUB_REF_NAME#v}"
       - uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247 # release/v1
 
   github-release:
@@ -624,11 +656,14 @@ jobs:
         with:
           path: release/docs
           name: documentation
-      - name: Create the GitHub Release with auto-generated notes
+      - name: Create the GitHub Release with checksums and auto-generated notes
         env:
           GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
-          python packaging/release_checks.py github-artifacts release
+          python packaging/release_checks.py github-checksums release
+          python packaging/release_checks.py github-artifacts release --version "${GITHUB_REF_NAME#v}"
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
             --verify-tag --generate-notes \
-            release/python/*.whl release/python/*.tar.gz release/dbc/*.tar.gz release/docs/monetdb.md
+            release/python/*.whl release/python/*.tar.gz release/dbc/*.tar.gz \
+            release/docs/monetdb.md release/SHA256SUMS

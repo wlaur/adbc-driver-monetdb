@@ -32,6 +32,7 @@ url.workspace = true
 cargo-lock = "11"
 
 [dev-dependencies]
+arrow-buffer.workspace = true
 libloading = "0.9"
 
 [lints]

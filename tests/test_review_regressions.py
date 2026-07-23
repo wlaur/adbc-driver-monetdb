@@ -31,7 +31,7 @@ def test_get_objects_uses_canonical_monetdb_xdbc_metadata(monetdb_uri: str) -> N
             connection.execute("DROP TABLE IF EXISTS review_xdbc")
             connection.execute(
                 "CREATE TABLE review_xdbc("
-                "i INT, d DECIMAL(12,3), r REAL, f DOUBLE, h HUGEINT, "
+                "bo BOOLEAN, i INT, d DECIMAL(12,3), r REAL, f DOUBLE, h HUGEINT, "
                 "t TIME(4), ts TIMESTAMP(2), ym INTERVAL YEAR TO MONTH, "
                 "ds INTERVAL DAY TO SECOND, v VARCHAR(9), b BLOB, u UUID, j JSON)"
             )
@@ -62,6 +62,7 @@ def test_get_objects_uses_canonical_monetdb_xdbc_metadata(monetdb_uri: str) -> N
         "xdbc_char_octet_length",
     )
     expected = {
+        "bo": (-7, 1, None, None, -7, None, None),
         "i": (4, 31, 0, 2, 4, None, None),
         "d": (3, 12, 3, 10, 3, None, None),
         "r": (7, 24, 7, 2, 7, None, None),
@@ -79,6 +80,47 @@ def test_get_objects_uses_canonical_monetdb_xdbc_metadata(monetdb_uri: str) -> N
     assert by_name["b"]["xdbc_data_type"] == -4
     assert by_name["b"]["xdbc_char_octet_length"] == by_name["b"]["xdbc_column_size"]
     assert all(by_name["j"][field] is None for field in fields)
+
+
+@pytest.mark.integration
+def test_wide_results_accept_terse_column_metadata(monetdb_uri: str) -> None:
+    columns = ", ".join(f'"{chr(ord("a") + index)}" INT' for index in range(26))
+    expressions = ", ".join(f'1 AS "{chr(ord("a") + index % 26)}"' for index in range(29))
+    with dbapi.connect(monetdb_uri, autocommit=True) as connection, connection.cursor() as cursor:
+        try:
+            cursor.execute("DROP TABLE IF EXISTS review_wide_terse")
+            cursor.execute(f"CREATE TABLE review_wide_terse({columns})")
+            cursor.execute("SELECT * FROM review_wide_terse")
+            empty = cursor.fetch_record_batch().read_all()
+            cursor.execute(f"SELECT {expressions}")
+            row = cursor.fetchone()
+        finally:
+            cursor.execute("DROP TABLE IF EXISTS review_wide_terse")
+
+    assert empty.num_columns == 26
+    assert empty.num_rows == 0
+    assert row == (1,) * 29
+
+
+@pytest.mark.integration
+def test_dbapi_fetchmany_arraysize_and_rowcount(monetdb_uri: str) -> None:
+    with dbapi.connect(monetdb_uri, autocommit=True) as connection, connection.cursor() as cursor:
+        try:
+            cursor.execute("DROP TABLE IF EXISTS review_dbapi_accessories")
+            cursor.execute("CREATE TABLE review_dbapi_accessories(value INT)")
+            cursor.executemany(
+                "INSERT INTO review_dbapi_accessories VALUES (?)",
+                [(value,) for value in range(1, 8)],
+            )
+            assert cursor.rowcount == 7
+            cursor.execute("SELECT value FROM review_dbapi_accessories ORDER BY value")
+            cursor.arraysize = 3
+            assert cursor.fetchmany() == [(1,), (2,), (3,)]
+            assert cursor.fetchmany(2) == [(4,), (5,)]
+            assert cursor.fetchmany() == [(6,), (7,)]
+            assert cursor.fetchmany() == []
+        finally:
+            cursor.execute("DROP TABLE IF EXISTS review_dbapi_accessories")
 
 
 @pytest.mark.integration

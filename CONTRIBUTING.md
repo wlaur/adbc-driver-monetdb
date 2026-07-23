@@ -48,6 +48,11 @@ Changes are accepted under the repository's MIT and MPL-2.0 license boundary des
 
 ## Release recovery
 
+The first PyPI release uses the pending Trusted Publisher configured for owner `wlaur`, repository
+`adbc-driver-monetdb`, workflow `ci.yml`, and environment `pypi`. PyPI returning 404 before that
+first publish is expected: a pending publisher authorizes the initial upload but does not register
+or reserve the project name.
+
 Release uploads fail if any filename already exists on PyPI. If publishing succeeds but a later
 job fails, rerun only the failed jobs in GitHub Actions; do not rerun the complete workflow or
 delete and recreate the tag. This preserves the protected-main provenance check and prevents a
