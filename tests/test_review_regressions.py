@@ -172,15 +172,23 @@ def test_empty_typed_ingest_all_modes_and_polars(monetdb_uri: str) -> None:
 
 @pytest.mark.integration
 @pytest.mark.parametrize("resume_before_second_query", [False, True])
+@pytest.mark.parametrize("read_prefetch", ["false", "true"])
 def test_partially_consumed_stream_can_resume_around_a_second_query(
     monetdb_uri: str,
     resume_before_second_query: bool,
+    read_prefetch: str,
 ) -> None:
     with (
         dbapi.connect(monetdb_uri) as connection,
-        connection.cursor(adbc_stmt_kwargs={StatementOptions.READ_BATCH_ROWS: "100000"}) as first_cursor,
+        connection.cursor(
+            adbc_stmt_kwargs={
+                StatementOptions.READ_BATCH_ROWS: "100000",
+                StatementOptions.READ_PREFETCH: read_prefetch,
+            }
+        ) as first_cursor,
         connection.cursor() as second_cursor,
     ):
+        assert first_cursor.adbc_statement.get_option(str(StatementOptions.READ_PREFETCH)) == read_prefetch
         first_cursor.execute("SELECT value FROM sys.generate_series(1, 300001)")
         reader = first_cursor.fetch_record_batch()
         first = reader.read_next_batch()
@@ -199,6 +207,24 @@ def test_partially_consumed_stream_can_resume_around_a_second_query(
     assert resumed.num_rows == 100_000
     assert resumed.column(0)[0].as_py() == 100_001  # pyright: ignore[reportUnknownMemberType]
     assert second == (42,)
+
+
+@pytest.mark.integration
+def test_prefetched_reader_can_be_closed_early_and_connection_reused(monetdb_uri: str) -> None:
+    with dbapi.connect(monetdb_uri) as connection:
+        assert connection.adbc_connection.get_option(str(ConnectionOptions.READ_PREFETCH)) == "true"
+        for _ in range(25):
+            with connection.cursor(
+                adbc_stmt_kwargs={
+                    StatementOptions.READ_BATCH_ROWS: "10000",
+                    StatementOptions.READ_PREFETCH: "true",
+                }
+            ) as cursor:
+                cursor.execute("SELECT value FROM sys.generate_series(1, 100001)")
+                reader = cursor.fetch_record_batch()
+                assert reader.read_next_batch().num_rows == 10_000
+                reader.close()
+            assert connection.execute("SELECT 42").fetchone() == (42,)
 
 
 @pytest.mark.integration

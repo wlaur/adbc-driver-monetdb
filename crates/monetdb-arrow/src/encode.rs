@@ -546,7 +546,11 @@ fn encode_strings<'a>(
     values: impl Iterator<Item = Option<&'a str>>,
     out: &mut Vec<u8>,
 ) -> Result<(), EncodeError> {
-    let mut seen = HashMap::<&str, usize>::new();
+    const CARDINALITY_SAMPLE_ROWS: usize = 4096;
+    let (minimum_rows, maximum_rows) = values.size_hint();
+    let total_rows = maximum_rows.unwrap_or(minimum_rows);
+    let sample_rows = total_rows.min(CARDINALITY_SAMPLE_ROWS);
+    let mut seen = HashMap::<&str, usize>::with_capacity(sample_rows);
     let mut null = None;
     for (row, value) in values.enumerate() {
         match value {
@@ -570,6 +574,9 @@ fn encode_strings<'a>(
                 }
                 null = Some(row);
             }
+        }
+        if row + 1 == sample_rows && seen.len() >= sample_rows * 3 / 4 {
+            seen.reserve(total_rows.saturating_sub(seen.len()));
         }
     }
     Ok(())

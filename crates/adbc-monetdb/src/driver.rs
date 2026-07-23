@@ -26,6 +26,7 @@ use monetdb::{
     CancelHandle, CursorError, Endian, MonetType, Parameters, ResultColumn, Timeouts, parms::Parm,
 };
 use percent_encoding::percent_decode_str;
+use rayon::prelude::*;
 
 mod metadata;
 mod parameters;
@@ -38,6 +39,7 @@ use parameters::{
 const DEFAULT_READ_BATCH_ROWS: usize = 131_072;
 const METADATA_REPLY_ROWS: usize = 1024;
 const READ_BATCH_ROWS_OPTION: &str = "adbc.monetdb.read_batch_rows";
+const READ_PREFETCH_OPTION: &str = "adbc.monetdb.read_prefetch";
 const WRITE_BATCH_ROWS_OPTION: &str = "adbc.monetdb.write_batch_rows";
 const BIND_BY_NAME_OPTION: &str = "adbc.statement.bind_by_name";
 const CONNECT_TIMEOUT_OPTION: &str = "adbc.monetdb.connect_timeout_seconds";
@@ -674,6 +676,7 @@ impl Database for MonetdbDatabase {
             cancel,
             timeouts,
             read_batch_rows: DEFAULT_READ_BATCH_ROWS,
+            read_prefetch: true,
             write_batch_rows: None,
             options,
             version,
@@ -753,6 +756,7 @@ pub struct MonetdbConnection {
     cancel: CancelHandle,
     timeouts: Timeouts,
     read_batch_rows: usize,
+    read_prefetch: bool,
     write_batch_rows: Option<usize>,
     options: Options,
     version: (u16, u16, u16),
@@ -773,6 +777,11 @@ impl Optionable for MonetdbConnection {
         if key.as_ref() == READ_BATCH_ROWS_OPTION {
             self.read_batch_rows = read_batch_rows_option(&value)?;
             self.options.set(key, value);
+            return Ok(());
+        }
+        if key.as_ref() == READ_PREFETCH_OPTION {
+            self.read_prefetch = option_bool(&value)?;
+            self.options.set(key, self.read_prefetch.to_string().into());
             return Ok(());
         }
         if key.as_ref() == WRITE_BATCH_ROWS_OPTION {
@@ -847,6 +856,9 @@ impl Optionable for MonetdbConnection {
                 self.timeouts,
             );
         }
+        if key.as_ref() == READ_PREFETCH_OPTION {
+            return Ok(self.read_prefetch.to_string());
+        }
         self.options.get_string(key)
     }
 
@@ -888,6 +900,7 @@ impl Connection for MonetdbConnection {
             options,
             query: None,
             read_batch_rows: self.read_batch_rows,
+            read_prefetch: self.read_prefetch,
             write_batch_rows: self.write_batch_rows,
             bound: None,
             prepared: false,
@@ -1041,6 +1054,7 @@ pub struct MonetdbStatement {
     options: Options,
     query: Option<String>,
     read_batch_rows: usize,
+    read_prefetch: bool,
     write_batch_rows: Option<usize>,
     bound: Option<Box<dyn RecordBatchReader + Send>>,
     prepared: bool,
@@ -1062,6 +1076,11 @@ impl Optionable for MonetdbStatement {
         if key.as_ref() == READ_BATCH_ROWS_OPTION {
             self.read_batch_rows = read_batch_rows_option(&value)?;
             self.options.set(key, value);
+            return Ok(());
+        }
+        if key.as_ref() == READ_PREFETCH_OPTION {
+            self.read_prefetch = option_bool(&value)?;
+            self.options.set(key, self.read_prefetch.to_string().into());
             return Ok(());
         }
         if key.as_ref() == WRITE_BATCH_ROWS_OPTION {
@@ -1133,6 +1152,9 @@ impl Optionable for MonetdbStatement {
     fn get_option_string(&self, key: Self::Option) -> Result<String> {
         if key.as_ref() == BIND_BY_NAME_OPTION {
             return Ok(self.bind_by_name.to_string());
+        }
+        if key.as_ref() == READ_PREFETCH_OPTION {
+            return Ok(self.read_prefetch.to_string());
         }
         if key == OptionStatement::IngestMode {
             return Ok(self
@@ -1243,6 +1265,7 @@ impl Statement for MonetdbStatement {
                 &self.connection,
                 queries,
                 self.read_batch_rows,
+                self.read_prefetch,
                 self.timeouts,
             );
         }
@@ -1251,7 +1274,13 @@ impl Statement for MonetdbStatement {
             .as_deref()
             .ok_or_else(|| error("SQL query is not set", Status::InvalidState))?;
         validate_unbound_query(query)?;
-        query_reader_with_timeouts(&self.connection, query, self.read_batch_rows, self.timeouts)
+        query_reader_with_timeouts(
+            &self.connection,
+            query,
+            self.read_batch_rows,
+            self.read_prefetch,
+            self.timeouts,
+        )
     }
 
     fn execute_update(&mut self) -> Result<Option<i64>> {
@@ -1632,23 +1661,21 @@ impl MonetdbStatement {
                 let write_batch_rows = self.write_batch_rows.unwrap_or(batch.num_rows());
                 for range in batch_ranges(batch.num_rows(), write_batch_rows) {
                     let batch = batch.slice(range.start, range.len());
-                    cursor
-                        .execute_with_binary_uploads_lazy(&copy, |filename| {
-                            let index = filename
-                                .strip_prefix('c')
-                                .and_then(|value| value.parse::<usize>().ok())
-                                .filter(|index| *index < schema.fields().len())
-                                .ok_or_else(|| {
-                                    CursorError::FileTransfer(format!(
-                                        "server requested unknown file {filename:?}"
-                                    ))
-                                })?;
-                            monetdb_arrow::encode_column(
-                                &schema.fields()[index],
-                                batch.column(index).as_ref(),
-                            )
-                            .map_err(|value| CursorError::FileTransfer(value.to_string()))
+                    let encoded = schema
+                        .fields()
+                        .par_iter()
+                        .enumerate()
+                        .map(|(index, field)| {
+                            monetdb_arrow::encode_column(field, batch.column(index).as_ref())
+                                .map(|bytes| (format!("c{index}"), bytes))
+                                .map_err(|value| {
+                                    map_cursor_error(CursorError::FileTransfer(value.to_string()))
+                                })
                         })
+                        .collect::<Vec<_>>();
+                    let uploads = encoded.into_iter().collect::<Result<HashMap<_, _>>>()?;
+                    cursor
+                        .execute_with_binary_uploads(&copy, &uploads)
                         .map_err(map_cursor_error)?;
                     let server_rows = cursor.affected_rows().ok_or_else(|| {
                         error(
@@ -2239,6 +2266,7 @@ fn query_reader_with_timeouts(
     connection: &Arc<Mutex<monetdb::Connection>>,
     query: &str,
     batch_rows: usize,
+    read_prefetch: bool,
     timeouts: Timeouts,
 ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
     if is_prepare_statement(query) {
@@ -2283,8 +2311,22 @@ fn query_reader_with_timeouts(
         return Ok(Box::new(SingleBatchReader::new(batch)));
     }
     let schema = schema_for_columns(&result.columns)?;
+    if total_rows == 0 {
+        return Ok(Box::new(EmptyReader::new(schema)));
+    }
     let adopt_frame = monetdb_arrow::prefers_owned_frame(&result.columns);
     drop(connection_guard);
+    if read_prefetch && total_rows > batch_rows as u64 {
+        return Ok(Box::new(PrefetchedBinaryReader::new(
+            cursor,
+            result.result_id,
+            result.columns,
+            schema,
+            total_rows,
+            batch_rows,
+            adopt_frame,
+        )?));
+    }
     Ok(Box::new(BinaryReader {
         cursor,
         result_id: result.result_id,
@@ -2359,13 +2401,15 @@ fn parameter_query_reader(
     connection: &Arc<Mutex<monetdb::Connection>>,
     mut queries: BoundQueryStream,
     batch_rows: usize,
+    read_prefetch: bool,
     timeouts: Timeouts,
 ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
     let first = queries
         .next()
         .transpose()?
         .ok_or_else(|| error("no parameter rows to execute", Status::InvalidArguments))?;
-    let current = query_reader_with_timeouts(connection, &first, batch_rows, timeouts)?;
+    let current =
+        query_reader_with_timeouts(connection, &first, batch_rows, read_prefetch, timeouts)?;
     let schema = current.schema();
     Ok(Box::new(ParameterQueryReader {
         connection: Arc::clone(connection),
@@ -2373,6 +2417,7 @@ fn parameter_query_reader(
         current: Some(current),
         schema,
         batch_rows,
+        read_prefetch,
         timeouts,
         finished: false,
     }))
@@ -2383,7 +2428,7 @@ fn scalar_string(
     query: &str,
     timeouts: Timeouts,
 ) -> Result<String> {
-    let mut reader = query_reader_with_timeouts(connection, query, 1, timeouts)?;
+    let mut reader = query_reader_with_timeouts(connection, query, 1, false, timeouts)?;
     let batch = reader
         .next()
         .transpose()
@@ -2581,6 +2626,250 @@ fn schema_for_columns(columns: &[ResultColumn]) -> Result<SchemaRef> {
     Ok(Arc::new(Schema::new(fields)))
 }
 
+struct BinaryFrame {
+    start_row: u64,
+    requested_rows: usize,
+    response: Vec<u8>,
+}
+
+type BinaryFrameResult = std::result::Result<BinaryFrame, ArrowError>;
+
+struct PrefetchedBinaryReader {
+    result_id: u64,
+    columns: Vec<ResultColumn>,
+    schema: SchemaRef,
+    total_rows: u64,
+    decoded_rows: u64,
+    adopt_frame: bool,
+    receiver: Option<std::sync::mpsc::Receiver<BinaryFrameResult>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    finished: bool,
+}
+
+impl PrefetchedBinaryReader {
+    fn new(
+        cursor: monetdb::Cursor,
+        result_id: u64,
+        columns: Vec<ResultColumn>,
+        schema: SchemaRef,
+        total_rows: u64,
+        batch_rows: usize,
+        adopt_frame: bool,
+    ) -> Result<Self> {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let worker_columns = columns.clone();
+        let worker = std::thread::Builder::new()
+            .name("adbc-monetdb-prefetch".into())
+            .spawn(move || {
+                let panic_sender = sender.clone();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    fetch_binary_frames(
+                        cursor,
+                        result_id,
+                        &worker_columns,
+                        total_rows,
+                        batch_rows,
+                        adopt_frame,
+                        sender,
+                    );
+                }));
+                if result.is_err() {
+                    let _ = panic_sender.send(Err(ArrowError::ParseError(
+                        "MonetDB result fetching panicked".into(),
+                    )));
+                }
+            })
+            .map_err(|value| map_display(value, Status::Internal))?;
+        Ok(Self {
+            result_id,
+            columns,
+            schema,
+            total_rows,
+            decoded_rows: 0,
+            adopt_frame,
+            receiver: Some(receiver),
+            worker: Some(worker),
+            finished: false,
+        })
+    }
+
+    fn finish(&mut self) {
+        self.finished = true;
+        self.receiver.take();
+    }
+
+    fn next_inner(&mut self) -> Option<std::result::Result<RecordBatch, ArrowError>> {
+        if self.finished || self.decoded_rows >= self.total_rows {
+            self.finish();
+            return None;
+        }
+        let frame = match self.receiver.as_ref()?.recv() {
+            Ok(Ok(frame)) => frame,
+            Ok(Err(error)) => {
+                self.finish();
+                return Some(Err(error));
+            }
+            Err(_) => {
+                self.finish();
+                return Some(Err(ArrowError::ParseError(
+                    "MonetDB result prefetch ended before the result was complete".into(),
+                )));
+            }
+        };
+        let result = if self.adopt_frame {
+            monetdb_arrow::decode_frame_owned_with_schema(
+                frame.response,
+                &self.columns,
+                self.result_id,
+                frame.start_row,
+                frame.requested_rows,
+                Arc::clone(&self.schema),
+            )
+        } else {
+            monetdb_arrow::decode_frame_with_schema(
+                &frame.response,
+                &self.columns,
+                self.result_id,
+                frame.start_row,
+                frame.requested_rows,
+                Arc::clone(&self.schema),
+            )
+        }
+        .map_err(|value| ArrowError::ExternalError(Box::new(value)));
+        match &result {
+            Ok(batch) if batch.num_rows() > 0 => {
+                self.decoded_rows += batch.num_rows() as u64;
+            }
+            Ok(_) => {
+                self.finish();
+                return Some(Err(ArrowError::ParseError(
+                    "MonetDB returned an empty binary window before the result ended".into(),
+                )));
+            }
+            Err(_) => self.finish(),
+        }
+        if self.decoded_rows >= self.total_rows {
+            self.finish();
+        }
+        Some(result)
+    }
+}
+
+impl Iterator for PrefetchedBinaryReader {
+    type Item = std::result::Result<RecordBatch, ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.next_inner())) {
+            Ok(result) => result,
+            Err(_) => {
+                self.finish();
+                Some(Err(ArrowError::ParseError(
+                    "MonetDB result decoding panicked".into(),
+                )))
+            }
+        }
+    }
+}
+
+impl RecordBatchReader for PrefetchedBinaryReader {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+}
+
+impl Drop for PrefetchedBinaryReader {
+    fn drop(&mut self) {
+        self.receiver.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn fetch_binary_frames(
+    mut cursor: monetdb::Cursor,
+    result_id: u64,
+    columns: &[ResultColumn],
+    total_rows: u64,
+    batch_rows: usize,
+    adopt_frame: bool,
+    sender: std::sync::mpsc::SyncSender<BinaryFrameResult>,
+) {
+    let mut next_row = 0u64;
+    while next_row < total_rows {
+        let remaining = total_rows - next_row;
+        let requested_rows = batch_rows.min(usize::try_from(remaining).unwrap_or(usize::MAX));
+        let capacity = if adopt_frame {
+            monetdb_arrow::owned_frame_capacity(columns, requested_rows).unwrap_or(0)
+        } else {
+            0
+        };
+        let mut response = Vec::with_capacity(capacity);
+        if let Err(value) = cursor.fetch_binary_into(next_row, requested_rows, &mut response) {
+            let _ = sender.send(Err(ArrowError::ExternalError(Box::new(value))));
+            return;
+        }
+        let frame = match monetdb_arrow::exportbin::parse_frame(&response) {
+            Ok(frame) => frame,
+            Err(value) => {
+                let _ = sender.send(Err(ArrowError::ExternalError(Box::new(value))));
+                return;
+            }
+        };
+        if u64::try_from(frame.result_id) != Ok(result_id) {
+            let _ = sender.send(Err(ArrowError::ExternalError(Box::new(
+                monetdb_arrow::DecodeError::ResultId {
+                    expected: result_id,
+                    actual: frame.result_id,
+                },
+            ))));
+            return;
+        }
+        if frame.start_row != next_row {
+            let _ = sender.send(Err(ArrowError::ExternalError(Box::new(
+                monetdb_arrow::DecodeError::StartRow {
+                    expected: next_row,
+                    actual: frame.start_row,
+                },
+            ))));
+            return;
+        }
+        let actual_rows = match usize::try_from(frame.row_count) {
+            Ok(actual_rows) if actual_rows <= requested_rows => actual_rows,
+            Ok(actual_rows) => {
+                let _ = sender.send(Err(ArrowError::ExternalError(Box::new(
+                    monetdb_arrow::DecodeError::RowCount {
+                        requested: requested_rows,
+                        actual: actual_rows,
+                    },
+                ))));
+                return;
+            }
+            Err(_) => {
+                let _ = sender.send(Err(ArrowError::ParseError(
+                    "MonetDB binary window row count exceeds this platform".into(),
+                )));
+                return;
+            }
+        };
+        drop(frame);
+        if sender
+            .send(Ok(BinaryFrame {
+                start_row: next_row,
+                requested_rows,
+                response,
+            }))
+            .is_err()
+        {
+            return;
+        }
+        if actual_rows == 0 {
+            return;
+        }
+        next_row += actual_rows as u64;
+    }
+}
+
 struct BinaryReader {
     cursor: monetdb::Cursor,
     result_id: u64,
@@ -2681,6 +2970,7 @@ struct ParameterQueryReader {
     current: Option<Box<dyn RecordBatchReader + Send + 'static>>,
     schema: SchemaRef,
     batch_rows: usize,
+    read_prefetch: bool,
     timeouts: Timeouts,
     finished: bool,
 }
@@ -2721,6 +3011,7 @@ impl ParameterQueryReader {
                 &self.connection,
                 &query,
                 self.batch_rows,
+                self.read_prefetch,
                 self.timeouts,
             ) {
                 Ok(reader) if reader.schema() == self.schema => self.current = Some(reader),
