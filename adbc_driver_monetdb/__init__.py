@@ -27,6 +27,7 @@ class ConnectionOptions(StrEnum):
     WRITE_TIMEOUT = "adbc.monetdb.write_timeout_seconds"
     OPERATION_TIMEOUT = "adbc.monetdb.operation_timeout_seconds"
     READ_BATCH_ROWS = "adbc.monetdb.read_batch_rows"
+    READ_PREFETCH = "adbc.monetdb.read_prefetch"
     WRITE_BATCH_ROWS = "adbc.monetdb.write_batch_rows"
 
 
@@ -35,6 +36,7 @@ class StatementOptions(StrEnum):
     WRITE_TIMEOUT = "adbc.monetdb.write_timeout_seconds"
     OPERATION_TIMEOUT = "adbc.monetdb.operation_timeout_seconds"
     READ_BATCH_ROWS = "adbc.monetdb.read_batch_rows"
+    READ_PREFETCH = "adbc.monetdb.read_prefetch"
     WRITE_BATCH_ROWS = "adbc.monetdb.write_batch_rows"
 
 

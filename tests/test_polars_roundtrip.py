@@ -143,6 +143,7 @@ def test_one_row_query_executes_once(monetdb_uri: str) -> None:
             assert cursor.fetchone() == (2,)
         finally:
             cursor.execute("DROP SEQUENCE IF EXISTS adbc_single_execution")
+            conn.commit()
 
 
 @pytest.mark.integration
@@ -335,6 +336,7 @@ def test_clob_and_char_catalog_types_map_to_arrow_strings(monetdb_uri: str) -> N
             assert str(schema) == "c: string\nfixed: string"
         finally:
             cursor.execute("DROP TABLE IF EXISTS catalog_strings")
+            conn.commit()
 
 
 @pytest.mark.integration
@@ -367,6 +369,7 @@ def test_declared_decimal_schema_is_not_narrowed_by_prepare_statistics(
             assert str(query_schema) == "value: decimal128(10, 2)"
         finally:
             cursor.execute("DROP TABLE IF EXISTS decimal_schema_probe")
+            conn.commit()
 
 
 @pytest.mark.integration
@@ -378,6 +381,7 @@ def test_execute_schema_does_not_retype_an_aliased_cast(monetdb_uri: str) -> Non
             assert str(schema) == "value: int64"
         finally:
             cursor.execute("DROP TABLE IF EXISTS cast_alias_probe")
+            conn.commit()
 
 
 @pytest.mark.integration
@@ -396,6 +400,7 @@ def test_execute_schema_has_no_side_effect_and_preserves_bind(monetdb_uri: str) 
             assert cursor.fetchall() == [(42,)]
         finally:
             cursor.execute("DROP TABLE IF EXISTS execute_schema_probe")
+            conn.commit()
 
 
 @pytest.mark.integration
@@ -425,6 +430,7 @@ def test_untyped_parameter_fallback_is_eager_and_metadata_only(
             assert cursor.fetchone() == (3,)
         finally:
             cursor.execute("DROP TABLE IF EXISTS untyped_parameter_probe")
+            conn.commit()
 
 
 @pytest.mark.integration
@@ -463,6 +469,7 @@ def test_get_objects_with_columns_constraints_and_filters(monetdb_uri: str) -> N
         finally:
             cursor.execute("DROP TABLE IF EXISTS objects_child")
             cursor.execute("DROP TABLE IF EXISTS objects_parent")
+            conn.commit()
 
 
 @pytest.mark.integration
@@ -526,6 +533,7 @@ def test_prepared_parameters_and_executemany(monetdb_uri: str) -> None:
             ]
         finally:
             cursor.execute("DROP TABLE IF EXISTS parameter_rows")
+            conn.commit()
 
 
 @pytest.mark.integration
@@ -934,6 +942,7 @@ def test_append_rejects_destination_schema_mismatch_without_writes(monetdb_uri: 
             assert cursor.fetchone() == (0,)
         finally:
             cursor.execute("DROP TABLE IF EXISTS append_mismatch")
+            conn.commit()
 
 
 @pytest.mark.integration
@@ -966,6 +975,7 @@ def test_empty_parameter_streams_are_successful_noops(monetdb_uri: str) -> None:
             assert cursor.fetchone() == (0,)
         finally:
             cursor.execute("DROP TABLE IF EXISTS empty_parameters")
+            conn.commit()
 
 
 @pytest.mark.integration
@@ -1200,6 +1210,7 @@ def test_extension_parameters_and_hugeint_timetz_append_back(monetdb_uri: str) -
             cursor.execute("DROP TABLE IF EXISTS extension_ingest")
             cursor.execute("DROP TABLE IF EXISTS extension_oid_ingest")
             cursor.execute("DROP TABLE IF EXISTS extension_bind")
+            conn.commit()
 
 
 @pytest.mark.integration

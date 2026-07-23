@@ -4,13 +4,17 @@
 //! `sql/backends/monet5/sql_bincopyconvert.c`, `common/utils/copybinary.h`,
 //! and `documentation/source/bincopy-backref.rst`.
 
-use std::{fmt, net::IpAddr, sync::Arc};
+use std::{
+    fmt::{self, Write},
+    net::Ipv6Addr,
+    sync::Arc,
+};
 
 use arrow_array::{
     ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray,
     PrimitiveArray, RecordBatch, RecordBatchOptions, StringArray, Time64MicrosecondArray,
     TimestampMicrosecondArray,
-    builder::{BinaryBuilder, BooleanBuilder, FixedSizeBinaryBuilder, StringBuilder},
+    builder::{BinaryBuilder, FixedSizeBinaryBuilder, StringBuilder},
     types::{
         ArrowPrimitiveType, DurationMillisecondType, Float32Type, Float64Type, Int8Type, Int16Type,
         Int32Type, Int64Type, UInt64Type,
@@ -1063,44 +1067,61 @@ fn expect_fixed(bytes: &[u8], rows: usize, width: usize) -> Result<(), DecodeErr
 fn decode_primitive<const N: usize, T: ArrowPrimitiveType>(
     bytes: &[u8],
     rows: usize,
-    decode: impl Fn([u8; N]) -> T::Native,
+    _decode: impl Fn([u8; N]) -> T::Native,
     is_null: impl Fn(T::Native) -> bool,
 ) -> Result<PrimitiveArray<T>, DecodeError>
 where
     T::Native: Copy,
 {
     expect_fixed(bytes, rows, N)?;
-    let mut values = Vec::with_capacity(rows);
-    let mut validity = Vec::with_capacity(rows);
-    let mut has_nulls = false;
-    for chunk in bytes.chunks_exact(N) {
-        let value = decode(chunk.try_into().expect("chunk has fixed width"));
-        let valid = !is_null(value);
-        values.push(value);
-        validity.push(valid);
-        has_nulls |= !valid;
+    #[cfg(target_endian = "little")]
+    {
+        let buffer = Buffer::from_slice_ref(bytes);
+        let values = ScalarBuffer::<T::Native>::new(buffer, 0, rows);
+        let has_nulls = values.iter().copied().any(&is_null);
+        let nulls = has_nulls.then(|| {
+            NullBuffer::new(BooleanBuffer::collect_bool(rows, |row| {
+                !is_null(values[row])
+            }))
+        });
+        Ok(PrimitiveArray::<T>::new(values, nulls))
     }
-    let nulls = has_nulls.then(|| NullBuffer::from(validity));
-    Ok(PrimitiveArray::<T>::new(values.into(), nulls))
+    #[cfg(target_endian = "big")]
+    {
+        let mut values = Vec::with_capacity(rows);
+        let mut validity = Vec::with_capacity(rows);
+        let mut has_nulls = false;
+        for chunk in bytes.chunks_exact(N) {
+            let value = _decode(chunk.try_into().expect("chunk has fixed width"));
+            let valid = !is_null(value);
+            values.push(value);
+            validity.push(valid);
+            has_nulls |= !valid;
+        }
+        let nulls = has_nulls.then(|| NullBuffer::from(validity));
+        Ok(PrimitiveArray::<T>::new(values.into(), nulls))
+    }
 }
 
 fn decode_bool(bytes: &[u8], rows: usize) -> Result<BooleanArray, DecodeError> {
     expect_fixed(bytes, rows, 1)?;
-    let mut builder = BooleanBuilder::with_capacity(rows);
-    for (row, value) in bytes.iter().copied().enumerate() {
-        match value {
-            0 => builder.append_value(false),
-            1 => builder.append_value(true),
-            0x80 => builder.append_null(),
-            _ => {
-                return Err(DecodeError::InvalidValue {
-                    row,
-                    message: "boolean is not 0, 1, or the NULL sentinel 0x80",
-                });
-            }
-        }
+    let invalid = bytes.iter().copied().fold(false, |invalid, value| {
+        invalid | (value > 1 && value != 0x80)
+    });
+    if invalid {
+        let row = bytes
+            .iter()
+            .position(|&value| value > 1 && value != 0x80)
+            .expect("the validation pass found an invalid boolean");
+        return Err(DecodeError::InvalidValue {
+            row,
+            message: "boolean is not 0, 1, or the NULL sentinel 0x80",
+        });
     }
-    Ok(builder.finish())
+    let values = BooleanBuffer::collect_bool(rows, |row| bytes[row] == 1);
+    let nulls = memchr::memchr(0x80, bytes)
+        .map(|_| NullBuffer::new(BooleanBuffer::collect_bool(rows, |row| bytes[row] != 0x80)));
+    Ok(BooleanArray::new(values, nulls))
 }
 
 fn decode_decimal(
@@ -1132,43 +1153,38 @@ fn decode_decimal(
     let mut values = Vec::with_capacity(rows);
     let mut validity = Vec::with_capacity(rows);
     let mut has_nulls = false;
-    for (row, chunk) in bytes.chunks_exact(width).enumerate() {
-        let value = match width {
-            1 => i128::from(i8::from_le_bytes([chunk[0]])),
-            2 => i128::from(i16::from_le_bytes(
-                chunk.try_into().expect("2-byte decimal"),
-            )),
-            4 => i128::from(i32::from_le_bytes(
-                chunk.try_into().expect("4-byte decimal"),
-            )),
-            8 => i128::from(i64::from_le_bytes(
-                chunk.try_into().expect("8-byte decimal"),
-            )),
-            16 => i128::from_le_bytes(chunk.try_into().expect("16-byte decimal")),
-            _ => unreachable!("MonetDB decimal backing widths are fixed"),
+    macro_rules! decode_width {
+        ($wire:ty, $width:literal) => {
+            for (row, chunk) in bytes.chunks_exact($width).enumerate() {
+                let value = i128::from(<$wire>::from_le_bytes(
+                    chunk
+                        .try_into()
+                        .expect(concat!(stringify!($width), "-byte decimal")),
+                ));
+                let null = value == i128::from(<$wire>::MIN);
+                if !null && (value <= -limit || value >= limit) {
+                    return Err(DecodeError::InvalidValue {
+                        row,
+                        message: if hugeint {
+                            "HUGEINT exceeds Arrow Decimal128's supported 38-digit range"
+                        } else {
+                            "decimal value exceeds its declared precision"
+                        },
+                    });
+                }
+                values.push(value);
+                validity.push(!null);
+                has_nulls |= null;
+            }
         };
-        let null = value
-            == match width {
-                1 => i128::from(i8::MIN),
-                2 => i128::from(i16::MIN),
-                4 => i128::from(i32::MIN),
-                8 => i128::from(i64::MIN),
-                16 => i128::MIN,
-                _ => unreachable!("MonetDB decimal backing widths are fixed"),
-            };
-        if !null && (value <= -limit || value >= limit) {
-            return Err(DecodeError::InvalidValue {
-                row,
-                message: if hugeint {
-                    "HUGEINT exceeds Arrow Decimal128's supported 38-digit range"
-                } else {
-                    "decimal value exceeds its declared precision"
-                },
-            });
-        }
-        values.push(value);
-        validity.push(!null);
-        has_nulls |= null;
+    }
+    match width {
+        1 => decode_width!(i8, 1),
+        2 => decode_width!(i16, 2),
+        4 => decode_width!(i32, 4),
+        8 => decode_width!(i64, 8),
+        16 => decode_width!(i128, 16),
+        _ => unreachable!("MonetDB decimal backing widths are fixed"),
     }
     let nulls = has_nulls.then(|| NullBuffer::from(validity));
     Ok(Decimal128Array::new(values.into(), nulls).with_precision_and_scale(precision, scale)?)
@@ -1443,16 +1459,27 @@ fn decode_uuid(bytes: &[u8], rows: usize) -> Result<FixedSizeBinaryArray, Decode
 
 fn decode_date(bytes: &[u8], rows: usize) -> Result<Date32Array, DecodeError> {
     expect_fixed(bytes, rows, 4)?;
-    let epoch = unix_epoch();
-    let values = bytes
-        .chunks_exact(4)
-        .enumerate()
-        .map(|(row, value)| date_value(value, row, epoch))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(Date32Array::from(values))
+    let mut values = Vec::with_capacity(rows);
+    let mut validity = Vec::with_capacity(rows);
+    let mut has_nulls = false;
+    for (row, value) in bytes.chunks_exact(4).enumerate() {
+        match date_value(value, row)? {
+            Some(value) => {
+                values.push(value);
+                validity.push(true);
+            }
+            None => {
+                values.push(0);
+                validity.push(false);
+                has_nulls = true;
+            }
+        }
+    }
+    let nulls = has_nulls.then(|| NullBuffer::from(validity));
+    Ok(Date32Array::new(values.into(), nulls))
 }
 
-fn date_value(value: &[u8], row: usize, epoch: NaiveDate) -> Result<Option<i32>, DecodeError> {
+fn date_value(value: &[u8], row: usize) -> Result<Option<i32>, DecodeError> {
     let day = value[0];
     let month = value[1];
     if month == u8::MAX {
@@ -1466,28 +1493,75 @@ fn date_value(value: &[u8], row: usize, epoch: NaiveDate) -> Result<Option<i32>,
         };
     }
     let year = i16::from_le_bytes(value[2..4].try_into().expect("date year is 2 bytes"));
-    let date = naive_date(RawDate { day, month, year }, row)?;
-    let days = date.signed_duration_since(epoch).num_days();
-    Ok(Some(i32::try_from(days).map_err(|_| {
-        DecodeError::InvalidValue {
+    let (year, month, day) = (i32::from(year), u32::from(month), u32::from(day));
+    if !valid_ymd(year, month, day) {
+        return Err(DecodeError::InvalidValue {
             row,
-            message: "date is outside Arrow's Date32 range",
-        }
-    })?))
+            message: "invalid Gregorian date",
+        });
+    }
+    Ok(Some(
+        i32::try_from(days_from_civil(year, month, day)).map_err(|_| {
+            DecodeError::InvalidValue {
+                row,
+                message: "date is outside Arrow's Date32 range",
+            }
+        })?,
+    ))
 }
 
-fn unix_epoch() -> NaiveDate {
-    NaiveDate::from_ymd_opt(1970, 1, 1).expect("the Unix epoch is a valid date")
+#[inline]
+fn valid_ymd(year: i32, month: u32, day: u32) -> bool {
+    const DAYS_PER_MONTH: [u32; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    if !(1..=12).contains(&month) || day == 0 {
+        return false;
+    }
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let last_day = if month == 2 && leap {
+        29
+    } else {
+        DAYS_PER_MONTH[(month - 1) as usize]
+    };
+    day <= last_day
+}
+
+#[inline]
+fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    // Howard Hinnant's proleptic-Gregorian `days_from_civil` algorithm:
+    // https://howardhinnant.github.io/date_algorithms.html#days_from_civil
+    let year = if month <= 2 { year - 1 } else { year };
+    // Rust integer division truncates toward zero, so negative years need this
+    // adjustment to obtain the floor-division era used by the algorithm.
+    let era = (if year >= 0 { year } else { year - 399 }) / 400;
+    let year_of_era = year - era * 400;
+    let shifted_month = if month > 2 { month - 3 } else { month + 9 };
+    let day_of_year = (153 * shifted_month + 2) / 5 + day - 1;
+    let day_of_era = i64::from(year_of_era) * 365 + i64::from(year_of_era / 4)
+        - i64::from(year_of_era / 100)
+        + i64::from(day_of_year);
+    i64::from(era) * 146_097 + day_of_era - 719_468
 }
 
 fn decode_time(bytes: &[u8], rows: usize) -> Result<Time64MicrosecondArray, DecodeError> {
     expect_fixed(bytes, rows, 8)?;
-    let values = bytes
-        .chunks_exact(8)
-        .enumerate()
-        .map(|(row, value)| time_value(value, row))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(Time64MicrosecondArray::from(values))
+    let mut values = Vec::with_capacity(rows);
+    let mut validity = Vec::with_capacity(rows);
+    let mut has_nulls = false;
+    for (row, value) in bytes.chunks_exact(8).enumerate() {
+        match time_value(value, row)? {
+            Some(value) => {
+                values.push(value);
+                validity.push(true);
+            }
+            None => {
+                values.push(0);
+                validity.push(false);
+                has_nulls = true;
+            }
+        }
+    }
+    let nulls = has_nulls.then(|| NullBuffer::from(validity));
+    Ok(Time64MicrosecondArray::new(values.into(), nulls))
 }
 
 fn time_value(value: &[u8], row: usize) -> Result<Option<i64>, DecodeError> {
@@ -1524,24 +1598,32 @@ fn decode_timestamp(
     utc: bool,
 ) -> Result<TimestampMicrosecondArray, DecodeError> {
     expect_fixed(bytes, rows, 12)?;
-    let epoch = unix_epoch();
-    let values = bytes
-        .chunks_exact(12)
-        .enumerate()
-        .map(|(row, value)| {
-            let time = time_value(&value[..8], row)?;
-            let date = date_value(&value[8..], row, epoch)?;
-            match (date, time) {
-                (None, None) => Ok(None),
-                (Some(date), Some(time)) => Ok(Some(i64::from(date) * 86_400_000_000 + time)),
-                _ => Err(DecodeError::InvalidValue {
+    let mut values = Vec::with_capacity(rows);
+    let mut validity = Vec::with_capacity(rows);
+    let mut has_nulls = false;
+    for (row, value) in bytes.chunks_exact(12).enumerate() {
+        let time = time_value(&value[..8], row)?;
+        let date = date_value(&value[8..], row)?;
+        match (date, time) {
+            (None, None) => {
+                values.push(0);
+                validity.push(false);
+                has_nulls = true;
+            }
+            (Some(date), Some(time)) => {
+                values.push(i64::from(date) * 86_400_000_000 + time);
+                validity.push(true);
+            }
+            _ => {
+                return Err(DecodeError::InvalidValue {
                     row,
                     message: "timestamp has mismatched date/time NULL sentinels",
-                }),
+                });
             }
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let array = TimestampMicrosecondArray::from(values);
+        }
+    }
+    let nulls = has_nulls.then(|| NullBuffer::from(validity));
+    let array = TimestampMicrosecondArray::new(values.into(), nulls);
     Ok(if utc {
         array.with_timezone("UTC")
     } else {
@@ -1562,19 +1644,39 @@ fn decode_inet(bytes: &[u8], rows: usize) -> Result<StringArray, DecodeError> {
         });
     };
     let mut builder = StringBuilder::with_capacity(rows, rows.saturating_mul(39));
+    let mut scratch = String::with_capacity(39);
     for value in bytes.chunks_exact(width) {
         if value.iter().all(|&byte| byte == 0) {
             builder.append_null();
         } else {
-            let address = if width == 4 {
-                IpAddr::from(<[u8; 4]>::try_from(value).expect("IPv4 is 4 bytes"))
+            scratch.clear();
+            if width == 4 {
+                push_u8_decimal(&mut scratch, value[0]);
+                scratch.push('.');
+                push_u8_decimal(&mut scratch, value[1]);
+                scratch.push('.');
+                push_u8_decimal(&mut scratch, value[2]);
+                scratch.push('.');
+                push_u8_decimal(&mut scratch, value[3]);
             } else {
-                IpAddr::from(<[u8; 16]>::try_from(value).expect("IPv6 is 16 bytes"))
-            };
-            builder.append_value(address.to_string());
+                let address =
+                    Ipv6Addr::from(<[u8; 16]>::try_from(value).expect("IPv6 is 16 bytes"));
+                write!(scratch, "{address}").expect("formatting an IP address cannot fail");
+            }
+            builder.append_value(&scratch);
         }
     }
     Ok(builder.finish())
+}
+
+fn push_u8_decimal(out: &mut String, value: u8) {
+    if value >= 100 {
+        out.push(char::from(b'0' + value / 100));
+    }
+    if value >= 10 {
+        out.push(char::from(b'0' + (value / 10) % 10));
+    }
+    out.push(char::from(b'0' + value % 10));
 }
 
 #[cfg(test)]
@@ -2093,7 +2195,7 @@ mod tests {
     #[test]
     fn decodes_temporal_values_at_microsecond_precision() {
         let date = [1, 1, 0xb2, 0x07];
-        assert_eq!(date_value(&date, 0, unix_epoch()).unwrap(), Some(0));
+        assert_eq!(date_value(&date, 0).unwrap(), Some(0));
 
         let time = [64, 226, 1, 0, 3, 2, 1, 0];
         assert_eq!(time_value(&time, 0).unwrap(), Some(3_723_123_456));
@@ -2112,11 +2214,7 @@ mod tests {
             (2000, 29, true),
         ] {
             let bytes = [day, 2, year as u8, (year >> 8) as u8];
-            assert_eq!(
-                date_value(&bytes, 0, unix_epoch()).is_ok(),
-                valid,
-                "year {year}"
-            );
+            assert_eq!(date_value(&bytes, 0).is_ok(), valid, "year {year}");
         }
 
         let time = RawTime {
@@ -2176,6 +2274,41 @@ mod tests {
     }
 
     #[test]
+    fn civil_date_conversion_matches_chrono_at_era_boundaries() {
+        for year in [-32768, -401, -400, -1, 0, 400, 1900, 2000, 32767] {
+            for month in 0..=13 {
+                for day in 0..=32 {
+                    let chrono = NaiveDate::from_ymd_opt(year, month, day)
+                        .map(|date| date.signed_duration_since(unix_epoch_for_test()).num_days());
+                    let direct =
+                        valid_ymd(year, month, day).then(|| days_from_civil(year, month, day));
+                    assert_eq!(direct, chrono, "{year}-{month}-{day}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "exhaustively checks roughly 30 million wire-date combinations"]
+    fn civil_date_conversion_matches_chrono_exhaustively() {
+        for year in i32::from(i16::MIN)..=i32::from(i16::MAX) {
+            for month in 0..=13 {
+                for day in 0..=32 {
+                    let chrono = NaiveDate::from_ymd_opt(year, month, day)
+                        .map(|date| date.signed_duration_since(unix_epoch_for_test()).num_days());
+                    let direct =
+                        valid_ymd(year, month, day).then(|| days_from_civil(year, month, day));
+                    assert_eq!(direct, chrono, "{year}-{month}-{day}");
+                }
+            }
+        }
+    }
+
+    fn unix_epoch_for_test() -> NaiveDate {
+        NaiveDate::from_ymd_opt(1970, 1, 1).expect("the Unix epoch is a valid date")
+    }
+
+    #[test]
     fn decodes_blobs_and_uuids() {
         let mut blobs = 3i64.to_le_bytes().to_vec();
         blobs.extend_from_slice(b"abc");
@@ -2211,13 +2344,61 @@ mod tests {
         let ipv6_nil = decode_inet(&[0; 16], 1).unwrap();
         assert!(ipv6_nil.is_null(0));
         assert!(matches!(
-            date_value(&[1, u8::MAX, u8::MAX, u8::MAX], 0, unix_epoch()),
+            date_value(&[1, u8::MAX, u8::MAX, u8::MAX], 0),
             Err(DecodeError::InvalidValue { row: 0, .. })
         ));
         assert!(matches!(
             time_value(&[u8::MAX, u8::MAX, u8::MAX, u8::MAX, 0, 0, 0, 0], 0),
             Err(DecodeError::InvalidValue { row: 0, .. })
         ));
+    }
+
+    #[test]
+    fn inet_formatting_matches_std() {
+        let octets = [0, 1, 9, 10, 99, 100, 255];
+        let mut ipv4 = Vec::new();
+        let mut expected = Vec::new();
+        for a in octets {
+            for b in octets {
+                for c in octets {
+                    for d in octets {
+                        let address = [a, b, c, d];
+                        ipv4.extend_from_slice(&address);
+                        expected.push(
+                            (address != [0; 4])
+                                .then(|| std::net::Ipv4Addr::from(address).to_string()),
+                        );
+                    }
+                }
+            }
+        }
+        let decoded = decode_inet(&ipv4, expected.len()).unwrap();
+        assert_eq!(
+            decoded.iter().collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|value| value.as_deref())
+                .collect::<Vec<_>>()
+        );
+
+        let ipv6 = [
+            [0; 16],
+            Ipv6Addr::LOCALHOST.octets(),
+            "2001:db8::1".parse::<Ipv6Addr>().unwrap().octets(),
+            "::ffff:192.0.2.128".parse::<Ipv6Addr>().unwrap().octets(),
+            "ffff:0:0:1::".parse::<Ipv6Addr>().unwrap().octets(),
+        ];
+        let bytes = ipv6.concat();
+        let decoded = decode_inet(&bytes, ipv6.len()).unwrap();
+        let expected =
+            ipv6.map(|address| (address != [0; 16]).then(|| Ipv6Addr::from(address).to_string()));
+        assert_eq!(
+            decoded.iter().collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|value| value.as_deref())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

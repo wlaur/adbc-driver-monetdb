@@ -116,6 +116,7 @@ with dbapi.connect(
     },
     conn_kwargs={
         ConnectionOptions.READ_TIMEOUT: "30",
+        ConnectionOptions.READ_PREFETCH: "true",
         ConnectionOptions.WRITE_BATCH_ROWS: "100000",
     },
 ) as conn:
@@ -123,6 +124,7 @@ with dbapi.connect(
         adbc_stmt_kwargs={
             StatementOptions.OPERATION_TIMEOUT: "15",
             StatementOptions.READ_BATCH_ROWS: "65536",
+            StatementOptions.READ_PREFETCH: "true",
         }
     ) as cursor:
         frame = pl.read_database("SELECT * FROM trades", cursor)
@@ -136,11 +138,14 @@ and a dictionary for named `:name` values.
 `adbc_stmt_kwargs` is not an execute option. Polars' `batch_size` does not configure
 `adbc.monetdb.read_batch_rows`, and `DataFrame.write_database(..., engine_options=...)` supplies
 ingestion arguments rather than connection or timeout options. The read batch default is 131,072
-rows, matching PyArrow Dataset Scanner's default. Ingestion preserves the incoming Arrow stream's
-batches by default; setting `adbc.monetdb.write_batch_rows` to a positive value zero-copy slices
-larger input batches before each COPY, while zero keeps the upstream boundaries. Set it through
-`conn_kwargs` as above when `DataFrame.write_database` creates its own cursor, or through
-`adbc_stmt_kwargs` for a directly managed cursor.
+rows, matching PyArrow Dataset Scanner's default. Read prefetch is enabled by default and overlaps
+the next bounded binary window fetch with decoding the current window; set
+`adbc.monetdb.read_prefetch` to `"false"` to use the sequential diagnostic path. Ingestion
+preserves the incoming Arrow stream's batches by default; setting
+`adbc.monetdb.write_batch_rows` to a positive value zero-copy slices larger input batches before
+each COPY, while zero keeps the upstream boundaries. Set it through `conn_kwargs` as above when
+`DataFrame.write_database` creates its own cursor, or through `adbc_stmt_kwargs` for a directly
+managed cursor.
 
 The examples use strings because `adbc-driver-manager` publishes string-valued type hints for
 database and connection option mappings. Statement options also accept native integers through the
