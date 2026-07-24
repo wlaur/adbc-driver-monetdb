@@ -24,6 +24,8 @@ docker compose up -d
 Set `MONETDB_TEST_URI=monetdb://monetdb:monetdb@localhost:50000/test` for integration tests.
 Protocol-generic MAPI changes belong in the `monetdb-rust` submodule; Arrow- or ADBC-specific
 changes belong in this repository.
+Durable architecture and performance choices are recorded in
+[`docs/design-decisions.md`](docs/design-decisions.md); it is a decision record, not a backlog.
 
 ## Pull requests
 
