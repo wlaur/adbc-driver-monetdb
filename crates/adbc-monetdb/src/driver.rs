@@ -16,7 +16,9 @@ use adbc_core::options::{
     InfoCode, ObjectDepth, OptionConnection, OptionDatabase, OptionStatement, OptionValue,
 };
 use adbc_core::schemas::{GET_INFO_SCHEMA, GET_TABLE_TYPES_SCHEMA};
-use adbc_core::{Connection, Database, Driver, Optionable, PartitionedResult, Statement};
+use adbc_core::{
+    Connection, Database, Driver, Optionable, PartitionedResult, Statement, StatementResult,
+};
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Int64Array, RecordBatch, RecordBatchReader, StringArray,
     UInt32Array, UnionArray, new_empty_array,
@@ -1346,6 +1348,11 @@ impl Statement for MonetdbStatement {
     }
 
     fn execute(&mut self) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
+        self.execute_with_rows_affected()
+            .map(|result| result.reader)
+    }
+
+    fn execute_with_rows_affected(&mut self) -> Result<StatementResult> {
         if self.bound.is_some() {
             if self
                 .options
@@ -1371,39 +1378,54 @@ impl Statement for MonetdbStatement {
                     }
                 };
                 let schema = Arc::new(schema);
-                return Ok(Box::new(EmptyReader::new(schema)));
+                let rows_affected = schema.fields().is_empty().then_some(0);
+                return Ok(StatementResult {
+                    reader: Box::new(EmptyReader::new(schema)),
+                    rows_affected,
+                });
             }
             if self
                 .prepared_result_schema
                 .as_ref()
                 .is_some_and(|schema| schema.fields().is_empty())
             {
-                execute_updates_atomic(&self.connection, &mut queries, self.timeouts)?;
-                return Ok(Box::new(EmptyReader::default()));
+                let rows_affected =
+                    execute_updates_atomic(&self.connection, &mut queries, self.timeouts)?;
+                return Ok(StatementResult {
+                    reader: Box::new(EmptyReader::default()),
+                    rows_affected,
+                });
             }
             if self.prepared_result_schema.is_none() {
                 let schema = self.execute_schema()?;
                 if schema.fields().is_empty() {
-                    execute_updates_atomic(&self.connection, &mut queries, self.timeouts)?;
+                    let rows_affected =
+                        execute_updates_atomic(&self.connection, &mut queries, self.timeouts)?;
                     self.prepared_result_schema = Some(schema);
-                    return Ok(Box::new(EmptyReader::default()));
+                    return Ok(StatementResult {
+                        reader: Box::new(EmptyReader::default()),
+                        rows_affected,
+                    });
                 }
                 self.prepared_result_schema = Some(schema);
             }
-            return parameter_query_reader(
-                &self.connection,
-                queries,
-                self.read_batch_rows,
-                self.read_prefetch,
-                self.timeouts,
-            );
+            return Ok(StatementResult {
+                reader: parameter_query_reader(
+                    &self.connection,
+                    queries,
+                    self.read_batch_rows,
+                    self.read_prefetch,
+                    self.timeouts,
+                )?,
+                rows_affected: None,
+            });
         }
         let query = self
             .query
             .as_deref()
             .ok_or_else(|| error("SQL query is not set", Status::InvalidState))?;
         validate_unbound_query(query)?;
-        query_reader_with_timeouts(
+        query_result_with_timeouts(
             &self.connection,
             query,
             self.read_batch_rows,
@@ -2406,6 +2428,17 @@ fn query_reader_with_timeouts(
     read_prefetch: bool,
     timeouts: Timeouts,
 ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
+    query_result_with_timeouts(connection, query, batch_rows, read_prefetch, timeouts)
+        .map(|result| result.reader)
+}
+
+fn query_result_with_timeouts(
+    connection: &Arc<Mutex<monetdb::Connection>>,
+    query: &str,
+    batch_rows: usize,
+    read_prefetch: bool,
+    timeouts: Timeouts,
+) -> Result<StatementResult> {
     if is_prepare_statement(query) {
         return Err(error(
             "execute() does not accept a PREPARE statement; call Statement::prepare() instead",
@@ -2417,7 +2450,10 @@ fn query_reader_with_timeouts(
     cursor.set_timeouts(timeouts);
     cursor.execute(query).map_err(map_cursor_error)?;
     if !cursor.has_result_set() {
-        return Ok(Box::new(EmptyReader::default()));
+        return Ok(StatementResult {
+            reader: Box::new(EmptyReader::default()),
+            rows_affected: cursor.affected_rows(),
+        });
     }
     let result = cursor.binary_result().map_err(map_cursor_error)?;
     let total_rows = result.total_rows;
@@ -2440,47 +2476,60 @@ fn query_reader_with_timeouts(
             )
         })?;
         if rows == 0 {
-            return Ok(Box::new(EmptyReader::new(schema_for_columns(
-                &result.columns,
-            )?)));
+            return Ok(StatementResult {
+                reader: Box::new(EmptyReader::new(schema_for_columns(&result.columns)?)),
+                rows_affected: None,
+            });
         }
         let batch = monetdb_arrow::decode_inline_rows(&mut cursor, &result.columns, rows)
             .map_err(|value| map_display(value, Status::InvalidData))?;
-        return Ok(Box::new(SingleBatchReader::new(batch)));
+        return Ok(StatementResult {
+            reader: Box::new(SingleBatchReader::new(batch)),
+            rows_affected: None,
+        });
     }
     let schema = schema_for_columns(&result.columns)?;
     if total_rows == 0 {
-        return Ok(Box::new(EmptyReader::new(schema)));
+        return Ok(StatementResult {
+            reader: Box::new(EmptyReader::new(schema)),
+            rows_affected: None,
+        });
     }
     let adopt_frame = monetdb_arrow::prefers_owned_frame(&result.columns);
     let cancel = connection_guard.cancel_handle();
     drop(connection_guard);
     if read_prefetch && total_rows > batch_rows as u64 {
-        return Ok(Box::new(PrefetchedBinaryReader::new(
-            cursor,
-            cancel,
-            PrefetchPlan {
-                result_id: result.result_id,
-                columns: result.columns,
-                schema,
-                total_rows,
-                batch_rows,
-                adopt_frame,
-            },
-        )?));
+        return Ok(StatementResult {
+            reader: Box::new(PrefetchedBinaryReader::new(
+                cursor,
+                cancel,
+                PrefetchPlan {
+                    result_id: result.result_id,
+                    columns: result.columns,
+                    schema,
+                    total_rows,
+                    batch_rows,
+                    adopt_frame,
+                },
+            )?),
+            rows_affected: None,
+        });
     }
-    Ok(Box::new(BinaryReader {
-        cursor,
-        result_id: result.result_id,
-        columns: result.columns,
-        schema,
-        next_row: 0,
-        total_rows,
-        batch_rows,
-        response: Vec::new(),
-        adopt_frame,
-        finished: false,
-    }))
+    Ok(StatementResult {
+        reader: Box::new(BinaryReader {
+            cursor,
+            result_id: result.result_id,
+            columns: result.columns,
+            schema,
+            next_row: 0,
+            total_rows,
+            batch_rows,
+            response: Vec::new(),
+            adopt_frame,
+            finished: false,
+        }),
+        rows_affected: None,
+    })
 }
 
 fn is_prepare_statement(query: &str) -> bool {

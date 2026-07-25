@@ -7,6 +7,18 @@ columnar result sets (MonetDB's binary result-set protocol decoded directly into
 batches) and bulk ingestion (`COPY BINARY ... ON CLIENT` streamed from Arrow buffers) through one
 standard interface.
 
+> [!IMPORTANT]
+> This release pins `adbc_core` and `adbc_ffi` 0.23 to a
+> [public backport](https://github.com/wlaur/arrow-adbc/commit/5fc505640f1c445f5c5c315fc8377ab79cbe566c).
+> The crates.io Rust exporter cannot carry a known affected-row count alongside an Arrow result
+> stream, although the standard ADBC C API returns both. The backport adds that missing internal
+> Rust capability without changing the ADBC ABI. It is compiled into every wheel and DBC library;
+> only source builds fetch the pinned commit.
+>
+> **TODO:** Get this generic capability fixed upstream—by merging the backport or adopting Apache's
+> alternative—and then remove the fork pin and return to the official Apache `adbc_core` and
+> `adbc_ffi` crates.io releases.
+
 ## Installation
 
 Install the Python package:
@@ -162,7 +174,10 @@ path. Ingestion caps parallel encode/COPY windows at 131,072 rows to bound memor
 `adbc.monetdb.write_batch_rows` to a smaller positive value zero-copy slices larger input batches
 further; zero keeps upstream boundaries only up to the internal cap. Set it through `conn_kwargs`
 as above when `DataFrame.write_database` creates its own cursor, or through `adbc_stmt_kwargs` for
-a directly managed cursor.
+a directly managed cursor. The input Arrow stream remains incremental, but columns within each
+bounded window are encoded eagerly so they can run in parallel. The protocol library's “lazy”
+upload callback still materializes one complete encoded column and serializes encoding with
+network transfer; it is not a byte-streaming encoder.
 
 The examples use strings because `adbc-driver-manager` publishes string-valued type hints for
 database and connection option mappings. Statement options also accept native integers through the
@@ -179,7 +194,7 @@ close that connection and open another one before issuing more work.
 Client information is sent at login by default. The `client` value in
 [`sys.sessions`](https://www.monetdb.org/documentation-Dec2025/user-guide/sql-catalog/users-roles-privileges-sessions/)
 identifies this driver and its protocol library, for example
-`adbc_driver_monetdb 0.8.0 / monetdb-rust 0.2.1`. The Python shim uses the basename of
+`adbc_driver_monetdb 0.8.1 / monetdb-rust 0.2.1`. The Python shim uses the basename of
 `sys.argv[0]` as the default `application`. Hostname and process id are also sent by default, as
 they are by pymonetdb and libmapi; use `client_info=false` if that host metadata should not leave
 the client.

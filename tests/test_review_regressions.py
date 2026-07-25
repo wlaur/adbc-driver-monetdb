@@ -124,6 +124,34 @@ def test_dbapi_fetchmany_arraysize_and_rowcount(monetdb_uri: str) -> None:
 
 
 @pytest.mark.integration
+def test_execute_query_propagates_known_dml_row_counts(monetdb_uri: str) -> None:
+    table = "review_execute_query_rowcount"
+    with dbapi.connect(monetdb_uri, autocommit=True) as connection, connection.cursor() as cursor:
+        try:
+            cursor.execute(f"DROP TABLE IF EXISTS {table}")
+            assert cursor.rowcount == -1
+            cursor.execute(f"CREATE TABLE {table}(value INT)")
+            assert cursor.rowcount == -1
+
+            cursor.execute(f"INSERT INTO {table} VALUES (1), (2), (3)")
+            assert cursor.rowcount == 3
+            cursor.execute(f"UPDATE {table} SET value = value + 10 WHERE value = ?", [2])
+            assert cursor.rowcount == 1
+            cursor.execute(f"UPDATE {table} SET value = value + 10 WHERE value = -1")
+            assert cursor.rowcount == 0
+            cursor.execute(f"DELETE FROM {table} WHERE value > 2")
+            assert cursor.rowcount == 2
+
+            statement = cursor.adbc_statement
+            statement.set_sql_query(f"SELECT value FROM {table}")
+            stream, rows_affected = statement.execute_query()
+            stream.release()
+            assert rows_affected == -1
+        finally:
+            cursor.execute(f"DROP TABLE IF EXISTS {table}")
+
+
+@pytest.mark.integration
 def test_session_timezone_does_not_change_timestamptz_decode(monetdb_uri: str) -> None:
     query = "SELECT TIMESTAMPTZ '2025-01-01 00:30:00+01:00' AS value"
     with dbapi.connect(monetdb_uri, autocommit=True) as connection:
