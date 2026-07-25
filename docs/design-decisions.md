@@ -52,6 +52,13 @@ requirements change their premises.
 - The default read window and maximum parallel encode/COPY window are both 131,072 rows. A sweep
   from 32,768 through 262,144 rows found no better general default. Smaller write windows remain
   configurable.
+- Bulk ingest is lazy across the bound Arrow stream but eager within each bounded COPY window.
+  The generic protocol library's lazy upload callback defers production until MonetDB requests a
+  named file, but it still returns one complete `Vec<u8>` and therefore is not a streaming encoder.
+  Encoding every column in the current window first permits parallel encoding; the measured
+  change from lazy serial columns improved tall-batch ingest by 8.2–8.5% for about 4.4 MB more
+  peak RSS. Use a smaller `adbc.monetdb.write_batch_rows` when a workload values memory over that
+  throughput rather than serializing every workload by default.
 - The prefetch worker fetches complete raw `Xexportbin` frames while the caller decodes the
   previous frame. A worker that both fetches and decodes would serialize those phases and lose the
   overlap.

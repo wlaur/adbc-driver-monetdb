@@ -1,5 +1,5 @@
 from collections.abc import Mapping
-from typing import Literal, Self
+from typing import Literal, Protocol, Self
 
 import pyarrow as pa
 from adbc_driver_manager import AdbcConnection as _ManagerAdbcConnection
@@ -35,6 +35,9 @@ apilevel: str
 threadsafety: int
 paramstyle: Literal["qmark"]
 
+class _ArrowArrayStreamHandle(Protocol):
+    def release(self) -> None: ...
+
 # These stub-only subclasses narrow methods used by this driver. Runtime exports remain the
 # manager's plain DB-API classes so Polars can identify the connection as ADBC.
 class _AdbcDatabase(_ManagerAdbcDatabase):
@@ -62,7 +65,7 @@ class _AdbcConnection(_ManagerAdbcConnection):
 
 class _AdbcStatement(_ManagerAdbcStatement):
     def bind(self, data: object, schema: object | None = None) -> None: ...
-    def execute_query(self) -> tuple[object, int]: ...
+    def execute_query(self) -> tuple[_ArrowArrayStreamHandle, int]: ...
     def execute_update(self) -> int: ...
     def get_option(
         self,
