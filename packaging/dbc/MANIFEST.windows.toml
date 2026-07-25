@@ -1,7 +1,7 @@
 manifest_version = 1
 name = "ADBC Driver for MonetDB"
 description = "ADBC driver for MonetDB: Arrow-native reads and writes"
-version = "0.8.2"
+version = "0.8.3"
 publisher = "William Laurén"
 license = "MIT AND MPL-2.0"
 url = "https://github.com/wlaur/adbc-driver-monetdb"

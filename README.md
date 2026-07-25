@@ -179,6 +179,14 @@ bounded window are encoded eagerly so they can run in parallel. The protocol lib
 upload callback still materializes one complete encoded column and serializes encoding with
 network transfer; it is not a byte-streaming encoder.
 
+Positional prepared statements are cached per connection by exact SQL text, so consumers such as
+SQLAlchemy can create a fresh cursor for each execution without making MonetDB compile the same
+plan again. The least-recently-used cache holds at most 128 plans; eviction queues server-side
+deallocation, and closing the connection releases the session and every remaining plan.
+Whitespace variants are intentionally different keys. Schema-changing statements issued through
+the connection invalidate the cache, and externally invalidated plans are prepared again and
+retried once when MonetDB can recover without rolling back a user transaction.
+
 The examples use strings because `adbc-driver-manager` publishes string-valued type hints for
 database and connection option mappings. Statement options also accept native integers through the
 ADBC integer option path.
@@ -194,7 +202,7 @@ close that connection and open another one before issuing more work.
 Client information is sent at login by default. The `client` value in
 [`sys.sessions`](https://www.monetdb.org/documentation-Dec2025/user-guide/sql-catalog/users-roles-privileges-sessions/)
 identifies this driver and its protocol library, for example
-`adbc_driver_monetdb 0.8.2 / monetdb-rust 0.2.1`. The Python shim uses the basename of
+`adbc_driver_monetdb 0.8.3 / monetdb-rust 0.2.1`. The Python shim uses the basename of
 `sys.argv[0]` as the default `application`. Hostname and process id are also sent by default, as
 they are by pymonetdb and libmapi; use `client_info=false` if that host metadata should not leave
 the client.
