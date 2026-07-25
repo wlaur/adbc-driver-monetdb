@@ -537,7 +537,7 @@ def test_prepared_parameters_and_executemany(monetdb_uri: str) -> None:
 
 
 @pytest.mark.integration
-def test_native_prepared_statement_lifecycle(monetdb_uri: str) -> None:
+def test_native_prepared_statements_are_cached_per_connection(monetdb_uri: str) -> None:
     with dbapi.connect(monetdb_uri) as conn:
         with conn.cursor() as prepared:
             schema = cast(
@@ -559,7 +559,141 @@ def test_native_prepared_statement_lifecycle(monetdb_uri: str) -> None:
             audit.execute("SELECT COUNT(*) FROM sys.prepared_statements")
             row = audit.fetchone()
             assert row is not None
-            assert row[0] == 0
+            assert row[0] == 1
+        for value in range(10):
+            with conn.cursor() as reused:
+                reused.execute("SELECT 1 + ? AS value", [value])
+                assert reused.fetchone() == (value + 1,)
+        with conn.cursor() as audit:
+            audit.execute("SELECT COUNT(*) FROM sys.prepared_statements")
+            assert audit.fetchone() == (1,)
+
+
+@pytest.mark.integration
+def test_cached_prepared_statement_recovers_after_same_connection_ddl(
+    monetdb_uri: str,
+) -> None:
+    table = "prepared_cache_ddl"
+    query = f"SELECT value FROM {table} WHERE id = ?"
+    with dbapi.connect(monetdb_uri) as conn, conn.cursor() as cursor:
+        try:
+            cursor.execute(f"DROP TABLE IF EXISTS {table}")
+            cursor.execute(f"CREATE TABLE {table}(id INTEGER, value INTEGER)")
+            cursor.execute(f"INSERT INTO {table} VALUES (1, 10)")
+            conn.commit()
+            with conn.cursor() as first:
+                first.execute(query, (1,))
+                assert first.fetchone() == (10,)
+            cursor.execute(f"ALTER TABLE {table} ADD COLUMN added INTEGER DEFAULT 7")
+            conn.commit()
+            with conn.cursor() as recovered:
+                recovered.execute(query, (1,))
+                assert recovered.fetchone() == (10,)
+            cursor.execute("SELECT COUNT(*) FROM sys.prepared_statements")
+            assert cursor.fetchone() == (1,)
+        finally:
+            cursor.execute(f"DROP TABLE IF EXISTS {table}")
+            conn.commit()
+
+
+@pytest.mark.integration
+def test_cached_prepared_statement_retries_external_ddl_once(monetdb_uri: str) -> None:
+    table = "prepared_cache_external_ddl"
+    query = f"SELECT value FROM {table} WHERE id = ?"
+    with (
+        dbapi.connect(monetdb_uri, autocommit=True) as owner,
+        dbapi.connect(monetdb_uri, autocommit=True) as ddl,
+    ):
+        try:
+            with owner.cursor() as cursor:
+                cursor.execute(f"DROP TABLE IF EXISTS {table}")
+                cursor.execute(f"CREATE TABLE {table}(id INTEGER, value INTEGER)")
+                cursor.execute(f"INSERT INTO {table} VALUES (1, 10)")
+            with owner.cursor() as first:
+                first.execute(query, (1,))
+                assert first.fetchone() == (10,)
+            with ddl.cursor() as cursor:
+                cursor.execute(f"ALTER TABLE {table} ADD COLUMN added INTEGER DEFAULT 7")
+            with owner.cursor() as recovered:
+                recovered.execute(query, (1,))
+                assert recovered.fetchone() == (10,)
+            with owner.cursor() as audit:
+                audit.execute("SELECT COUNT(*) FROM sys.prepared_statements")
+                assert audit.fetchone() == (1,)
+        finally:
+            with owner.cursor() as cursor:
+                cursor.execute(f"DROP TABLE IF EXISTS {table}")
+
+
+@pytest.mark.integration
+def test_cached_prepared_dml_recovers_external_ddl_in_transaction(
+    monetdb_uri: str,
+) -> None:
+    table = "prepared_cache_external_dml"
+    update = f"UPDATE {table} SET value = ? WHERE id = ?"
+    with dbapi.connect(monetdb_uri) as owner, dbapi.connect(monetdb_uri, autocommit=True) as ddl:
+        try:
+            with owner.cursor() as cursor:
+                cursor.execute(f"DROP TABLE IF EXISTS {table}")
+                cursor.execute(f"CREATE TABLE {table}(id INTEGER, value INTEGER)")
+                cursor.execute(f"INSERT INTO {table} VALUES (1, 10)")
+                owner.commit()
+                cursor.execute(update, (11, 1))
+                assert cursor.rowcount == 1
+                owner.commit()
+            with ddl.cursor() as cursor:
+                cursor.execute(f"ALTER TABLE {table} ADD COLUMN added INTEGER DEFAULT 7")
+            with owner.cursor() as recovered:
+                recovered.execute(update, (12, 1))
+                assert recovered.rowcount == 1
+                owner.commit()
+                recovered.execute(f"SELECT value FROM {table} WHERE id = 1")
+                assert recovered.fetchone() == (12,)
+        finally:
+            with owner.cursor() as cursor:
+                cursor.execute(f"DROP TABLE IF EXISTS {table}")
+                owner.commit()
+
+
+@pytest.mark.integration
+def test_prepared_statement_cache_is_lru_bounded(monetdb_uri: str) -> None:
+    with dbapi.connect(monetdb_uri, autocommit=True) as conn:
+        for value in range(128):
+            with conn.cursor() as cursor:
+                cursor.execute(f"SELECT ? + {value} AS value", (1,))
+                assert cursor.fetchone() == (value + 1,)
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT ? + 0 AS value", (1,))
+            assert cursor.fetchone() == (1,)
+            cursor.execute("SELECT ? + 128 AS value", (1,))
+            assert cursor.fetchone() == (129,)
+        with conn.cursor() as audit:
+            audit.execute("SELECT statement FROM sys.prepared_statements")
+            statements = [cast(str, row[0]).lower() for row in audit.fetchall()]
+            assert len(statements) == 128
+            assert any("+ 0 as value" in statement for statement in statements)
+            assert not any("+ 1 as value" in statement for statement in statements)
+            assert any("+ 128 as value" in statement for statement in statements)
+
+
+@pytest.mark.integration
+def test_interleaved_cached_statements_do_not_cross_talk(monetdb_uri: str) -> None:
+    with (
+        dbapi.connect(monetdb_uri, autocommit=True) as conn,
+        conn.cursor() as first,
+        conn.cursor() as second,
+    ):
+        first.execute("SELECT ? + 100 AS value", (1,))
+        second.execute("SELECT ? * 2 AS value", (3,))
+        assert first.fetchone() == (101,)
+        assert second.fetchone() == (6,)
+        first.execute("SELECT ? * 2 AS value", (4,))
+        second.execute("SELECT ? + 100 AS value", (5,))
+        assert first.fetchone() == (8,)
+        assert second.fetchone() == (105,)
+        with conn.cursor() as audit:
+            audit.execute("SELECT COUNT(*) FROM sys.prepared_statements")
+            assert audit.fetchone() == (2,)
 
 
 @pytest.mark.integration

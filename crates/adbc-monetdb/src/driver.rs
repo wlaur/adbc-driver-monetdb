@@ -1,11 +1,11 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fmt,
     num::NonZeroUsize,
     ops::Range,
     os::raw::c_char,
     sync::{
-        Arc, Mutex, MutexGuard,
+        Arc, Mutex, MutexGuard, Weak,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -40,6 +40,7 @@ use parameters::{
 
 const DEFAULT_READ_BATCH_ROWS: usize = 131_072;
 const MAX_ENCODE_BATCH_ROWS: usize = 131_072;
+const PREPARED_CACHE_CAPACITY: usize = 128;
 const PREFETCH_DROP_GRACE: Duration = Duration::from_millis(250);
 const METADATA_REPLY_ROWS: usize = 1024;
 const READ_BATCH_ROWS_OPTION: &str = "adbc.monetdb.read_batch_rows";
@@ -788,6 +789,7 @@ impl Database for MonetdbDatabase {
         store_runtime_timeouts(&mut options, timeouts);
         let mut result = MonetdbConnection {
             inner,
+            prepared_cache: Arc::new(Mutex::new(PreparedCache::new(PREPARED_CACHE_CAPACITY))),
             cancel,
             timeouts,
             read_batch_rows: DEFAULT_READ_BATCH_ROWS,
@@ -868,6 +870,7 @@ fn uri_without_userinfo(uri: &str) -> Result<String> {
 
 pub struct MonetdbConnection {
     inner: Arc<Mutex<monetdb::Connection>>,
+    prepared_cache: Arc<Mutex<PreparedCache>>,
     cancel: CancelHandle,
     timeouts: Timeouts,
     read_batch_rows: usize,
@@ -876,6 +879,101 @@ pub struct MonetdbConnection {
     options: Options,
     version: (u16, u16, u16),
     catalog: String,
+}
+
+type SharedPreparedCache = Arc<Mutex<PreparedCache>>;
+type PreparedSlot = Arc<Mutex<Arc<PreparedEntry>>>;
+
+struct PreparedEntry {
+    id: u64,
+    parameters: Schema,
+    result: Schema,
+    connection: Weak<Mutex<monetdb::Connection>>,
+}
+
+impl PreparedEntry {
+    fn new(metadata: PreparedMetadata, connection: &Arc<Mutex<monetdb::Connection>>) -> Self {
+        Self {
+            id: metadata.id,
+            parameters: metadata.parameters,
+            result: metadata.result,
+            connection: Arc::downgrade(connection),
+        }
+    }
+}
+
+impl Drop for PreparedEntry {
+    fn drop(&mut self) {
+        let Some(connection) = self.connection.upgrade() else {
+            return;
+        };
+        match connection.try_lock() {
+            Ok(connection) => {
+                connection.try_deallocate(self.id);
+            }
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                poisoned.into_inner().try_deallocate(self.id);
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
+    }
+}
+
+struct PreparedCache {
+    capacity: usize,
+    entries: HashMap<String, Arc<PreparedEntry>>,
+    least_to_most_recent: VecDeque<String>,
+}
+
+impl PreparedCache {
+    fn new(capacity: usize) -> Self {
+        assert!(capacity > 0, "prepared cache capacity must be positive");
+        Self {
+            capacity,
+            entries: HashMap::new(),
+            least_to_most_recent: VecDeque::new(),
+        }
+    }
+
+    fn get(&mut self, query: &str) -> Option<Arc<PreparedEntry>> {
+        let entry = Arc::clone(self.entries.get(query)?);
+        self.touch(query);
+        Some(entry)
+    }
+
+    fn insert(&mut self, query: String, candidate: Arc<PreparedEntry>) -> Arc<PreparedEntry> {
+        if let Some(existing) = self.entries.get(&query).cloned() {
+            self.touch(&query);
+            return existing;
+        }
+        self.entries.insert(query.clone(), Arc::clone(&candidate));
+        self.touch(&query);
+        while self.entries.len() > self.capacity {
+            let oldest = self
+                .least_to_most_recent
+                .pop_front()
+                .expect("a nonempty cache has an LRU key");
+            self.entries.remove(&oldest);
+        }
+        candidate
+    }
+
+    fn remove_if_id(&mut self, query: &str, id: u64) {
+        if self.entries.get(query).is_some_and(|entry| entry.id == id) {
+            self.entries.remove(query);
+            self.least_to_most_recent.retain(|key| key != query);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.least_to_most_recent.clear();
+    }
+
+    fn touch(&mut self, query: &str) {
+        self.least_to_most_recent.retain(|key| key != query);
+        self.least_to_most_recent.push_back(query.to_owned());
+    }
 }
 
 impl Optionable for MonetdbConnection {
@@ -937,6 +1035,10 @@ impl Optionable for MonetdbConnection {
                     &format!("SET SCHEMA {}", quote_identifier(schema)?),
                     self.timeouts,
                 )?;
+                self.prepared_cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clear();
             }
             OptionConnection::ReadOnly => {
                 let enabled = option_bool(&value)?;
@@ -1016,6 +1118,7 @@ impl Connection for MonetdbConnection {
         store_runtime_timeouts(&mut options, self.timeouts);
         Ok(MonetdbStatement {
             connection: Arc::clone(&self.inner),
+            prepared_cache: Arc::clone(&self.prepared_cache),
             cancel: self.cancel.clone(),
             timeouts: self.timeouts,
             options,
@@ -1025,7 +1128,7 @@ impl Connection for MonetdbConnection {
             write_batch_rows: self.write_batch_rows,
             bound: None,
             prepared: false,
-            prepared_id: None,
+            prepared_entry: None,
             prepared_parameter_schema: None,
             prepared_result_schema: None,
             bind_by_name: false,
@@ -1174,6 +1277,7 @@ fn parse_bool_option(value: &str) -> Result<bool> {
 
 pub struct MonetdbStatement {
     connection: Arc<Mutex<monetdb::Connection>>,
+    prepared_cache: SharedPreparedCache,
     cancel: CancelHandle,
     timeouts: Timeouts,
     options: Options,
@@ -1183,7 +1287,7 @@ pub struct MonetdbStatement {
     write_batch_rows: Option<usize>,
     bound: Option<Box<dyn RecordBatchReader + Send>>,
     prepared: bool,
-    prepared_id: Option<u64>,
+    prepared_entry: Option<PreparedSlot>,
     prepared_parameter_schema: Option<Schema>,
     prepared_result_schema: Option<Schema>,
     bind_by_name: bool,
@@ -1425,13 +1529,27 @@ impl Statement for MonetdbStatement {
             .as_deref()
             .ok_or_else(|| error("SQL query is not set", Status::InvalidState))?;
         validate_unbound_query(query)?;
-        query_result_with_timeouts(
+        let invalidates_cache = query_invalidates_prepared_cache(query)?;
+        if invalidates_cache {
+            self.prepared_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+        }
+        let result = query_result_with_timeouts(
             &self.connection,
             query,
             self.read_batch_rows,
             self.read_prefetch,
             self.timeouts,
-        )
+        );
+        if invalidates_cache && result.is_ok() {
+            self.prepared_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+        }
+        result
     }
 
     fn execute_update(&mut self) -> Result<Option<i64>> {
@@ -1451,10 +1569,43 @@ impl Statement for MonetdbStatement {
             .query
             .as_deref()
             .ok_or_else(|| error("SQL query is not set", Status::InvalidState))?;
-        execute_update_script(&self.connection, query, self.timeouts)
+        let invalidates_cache = query_invalidates_prepared_cache(query)?;
+        if invalidates_cache {
+            self.prepared_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+        }
+        let result = execute_update_script(&self.connection, query, self.timeouts);
+        if invalidates_cache && result.is_ok() {
+            self.prepared_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+        }
+        result
     }
 
     fn execute_schema(&mut self) -> Result<Schema> {
+        if let Some(slot) = self.prepared_entry.clone() {
+            let query = self
+                .query
+                .as_deref()
+                .ok_or_else(|| error("SQL query is not set", Status::InvalidState))?;
+            let entry = prepare_cached(
+                &self.connection,
+                &self.prepared_cache,
+                query,
+                parameter_layout(query)?.count(),
+                self.timeouts,
+            )?;
+            *slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::clone(&entry);
+            self.prepared_parameter_schema = Some(entry.parameters.clone());
+            self.prepared_result_schema = Some(entry.result.clone());
+            return Ok(entry.result.clone());
+        }
         if let Some(schema) = &self.prepared_result_schema {
             return Ok(schema.clone());
         }
@@ -1486,6 +1637,23 @@ impl Statement for MonetdbStatement {
     }
 
     fn get_parameter_schema(&self) -> Result<Schema> {
+        if let Some(slot) = &self.prepared_entry {
+            let query = self
+                .query
+                .as_deref()
+                .ok_or_else(|| error("SQL query is not set", Status::InvalidState))?;
+            let entry = prepare_cached(
+                &self.connection,
+                &self.prepared_cache,
+                query,
+                parameter_layout(query)?.count(),
+                self.timeouts,
+            )?;
+            *slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::clone(&entry);
+            return Ok(entry.parameters.clone());
+        }
         if let Some(schema) = &self.prepared_parameter_schema {
             return Ok(schema.clone());
         }
@@ -1530,11 +1698,17 @@ impl Statement for MonetdbStatement {
             self.prepared = true;
             return Ok(());
         }
-        match prepare_query(&self.connection, query, parameter_count, self.timeouts) {
-            Ok(metadata) => {
-                self.prepared_id = Some(metadata.id);
-                self.prepared_parameter_schema = Some(metadata.parameters);
-                self.prepared_result_schema = Some(metadata.result);
+        match prepare_cached(
+            &self.connection,
+            &self.prepared_cache,
+            query,
+            parameter_count,
+            self.timeouts,
+        ) {
+            Ok(entry) => {
+                self.prepared_parameter_schema = Some(entry.parameters.clone());
+                self.prepared_result_schema = Some(entry.result.clone());
+                self.prepared_entry = Some(Arc::new(Mutex::new(entry)));
             }
             Err(value) if could_not_determine_parameter_type(&value) => {
                 self.prepared_parameter_schema = Some(Schema::new(
@@ -1584,11 +1758,7 @@ fn could_not_determine_parameter_type(value: &Error) -> bool {
 
 impl MonetdbStatement {
     fn clear_prepared(&mut self) {
-        if let Some(id) = self.prepared_id.take() {
-            let connection = lock_connection(&self.connection)
-                .expect("locking a poison-tolerant connection cannot fail");
-            connection.try_deallocate(id);
-        }
+        self.prepared_entry = None;
         self.prepared_parameter_schema = None;
         self.prepared_result_schema = None;
         self.prepared = false;
@@ -1647,11 +1817,17 @@ impl MonetdbStatement {
             }
             ParameterLayout::Positional(_) => {}
         }
+        let prepared = self.prepared_entry.as_ref().map(|entry| PreparedPlan {
+            query: Arc::from(query.as_str()),
+            parameter_count: layout.count(),
+            entry: Arc::clone(entry),
+            cache: Arc::clone(&self.prepared_cache),
+        });
         Ok(BoundQueryStream {
             reader,
             schema,
             template,
-            prepared_id: self.prepared_id,
+            prepared,
             bind_by_name: self.bind_by_name,
             batch: None,
             next_row: 0,
@@ -1673,6 +1849,12 @@ impl MonetdbStatement {
             .options
             .optional_string(OptionStatement::IngestMode)
             .unwrap_or("adbc.ingest.mode.create");
+        if mode != "adbc.ingest.mode.append" {
+            self.prepared_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+        }
         let temporary = self
             .options
             .get(OptionStatement::Temporary)
@@ -1853,14 +2035,23 @@ impl MonetdbStatement {
             }
             Ok(rows)
         })();
-        finish_atomic(
+        let result = finish_atomic(
             &connection,
             &mut cursor,
             atomic_scope,
             result,
             self.timeouts,
         )
-        .map(Some)
+        .map(Some);
+        drop(cursor);
+        drop(connection);
+        if mode != "adbc.ingest.mode.append" && result.is_ok() {
+            self.prepared_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+        }
+        result
     }
 }
 
@@ -1938,18 +2129,36 @@ fn validate_append_schema(
     Ok(())
 }
 
-impl Drop for MonetdbStatement {
-    fn drop(&mut self) {
-        if let Some(id) = self.prepared_id.take() {
-            match self.connection.try_lock() {
-                Ok(connection) => {
-                    connection.try_deallocate(id);
-                }
-                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-                    poisoned.into_inner().try_deallocate(id);
-                }
-                Err(std::sync::TryLockError::WouldBlock) => {}
-            }
+#[derive(Clone)]
+struct PreparedPlan {
+    query: Arc<str>,
+    parameter_count: usize,
+    entry: PreparedSlot,
+    cache: SharedPreparedCache,
+}
+
+#[derive(Clone)]
+struct PreparedInvocation {
+    plan: PreparedPlan,
+    entry: Arc<PreparedEntry>,
+    arguments: String,
+}
+
+#[derive(Clone)]
+struct BoundQuery {
+    sql: String,
+    prepared: Option<PreparedInvocation>,
+}
+
+impl BoundQuery {
+    fn prepared(plan: PreparedPlan, entry: Arc<PreparedEntry>, arguments: String) -> Self {
+        Self {
+            sql: format!("EXECUTE {}({arguments})", entry.id),
+            prepared: Some(PreparedInvocation {
+                plan,
+                entry,
+                arguments,
+            }),
         }
     }
 }
@@ -1958,11 +2167,11 @@ struct BoundQueryStream {
     reader: Box<dyn RecordBatchReader + Send>,
     schema: SchemaRef,
     template: QueryTemplate,
-    prepared_id: Option<u64>,
+    prepared: Option<PreparedPlan>,
     bind_by_name: bool,
     batch: Option<RecordBatch>,
     next_row: usize,
-    pending: Option<String>,
+    pending: Option<BoundQuery>,
     finished: bool,
 }
 
@@ -1979,7 +2188,7 @@ impl BoundQueryStream {
 }
 
 impl Iterator for BoundQueryStream {
-    type Item = Result<String>;
+    type Item = Result<BoundQuery>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(query) = self.pending.take() {
@@ -1994,12 +2203,25 @@ impl Iterator for BoundQueryStream {
             {
                 let row = self.next_row;
                 self.next_row += 1;
-                let sql = match self.prepared_id {
-                    Some(id) => render_arguments(batch, row)
-                        .map(|values| format!("EXECUTE {id}({})", values.join(", "))),
-                    None => self.template.render_row(batch, row, self.bind_by_name),
+                let query = match &self.prepared {
+                    Some(plan) => render_arguments(batch, row).map(|values| {
+                        let entry = Arc::clone(
+                            &plan
+                                .entry
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner),
+                        );
+                        BoundQuery::prepared(plan.clone(), entry, values.join(", "))
+                    }),
+                    None => self
+                        .template
+                        .render_row(batch, row, self.bind_by_name)
+                        .map(|sql| BoundQuery {
+                            sql,
+                            prepared: None,
+                        }),
                 };
-                return Some(sql);
+                return Some(query);
             }
             match self.reader.next() {
                 Some(Ok(batch)) if batch.schema() != self.schema => {
@@ -2028,6 +2250,102 @@ impl Iterator for BoundQueryStream {
             }
         }
     }
+}
+
+fn prepared_statement_missing(value: &Error) -> bool {
+    value.sqlstate.map(|value| value as u8) == *b"42000"
+        && value.message.contains("EXEC: PREPARED Statement missing")
+}
+
+fn current_bound_query(
+    connection: &Arc<Mutex<monetdb::Connection>>,
+    query: &BoundQuery,
+    timeouts: Timeouts,
+) -> Result<BoundQuery> {
+    let Some(invocation) = &query.prepared else {
+        return Ok(query.clone());
+    };
+    let cached = invocation
+        .plan
+        .cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&invocation.plan.query);
+    let entry = match cached {
+        Some(entry) => entry,
+        None => prepare_cached(
+            connection,
+            &invocation.plan.cache,
+            &invocation.plan.query,
+            invocation.plan.parameter_count,
+            timeouts,
+        )?,
+    };
+    if entry.id != invocation.entry.id {
+        *invocation
+            .plan
+            .entry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::clone(&entry);
+    }
+    Ok(BoundQuery::prepared(
+        invocation.plan.clone(),
+        entry,
+        invocation.arguments.clone(),
+    ))
+}
+
+fn retry_bound_query(
+    connection: &Arc<Mutex<monetdb::Connection>>,
+    query: &BoundQuery,
+    timeouts: Timeouts,
+) -> Result<BoundQuery> {
+    let invocation = query.prepared.as_ref().ok_or_else(|| {
+        error(
+            "cannot recover an unprepared parameter query",
+            Status::Internal,
+        )
+    })?;
+    let current = Arc::clone(
+        &invocation
+            .plan
+            .entry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    let entry = if current.id != invocation.entry.id {
+        current
+    } else {
+        invocation
+            .plan
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove_if_id(&invocation.plan.query, invocation.entry.id);
+        let refreshed = prepare_cached(
+            connection,
+            &invocation.plan.cache,
+            &invocation.plan.query,
+            invocation.plan.parameter_count,
+            timeouts,
+        )?;
+        let mut slot = invocation
+            .plan
+            .entry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.id == invocation.entry.id {
+            *slot = Arc::clone(&refreshed);
+            refreshed
+        } else {
+            Arc::clone(&slot)
+        }
+    };
+    Ok(BoundQuery::prepared(
+        invocation.plan.clone(),
+        entry,
+        invocation.arguments.clone(),
+    ))
 }
 
 enum InfoValue {
@@ -2137,6 +2455,28 @@ struct PreparedMetadata {
     id: u64,
     parameters: Schema,
     result: Schema,
+}
+
+fn prepare_cached(
+    connection: &Arc<Mutex<monetdb::Connection>>,
+    cache: &SharedPreparedCache,
+    query: &str,
+    parameter_count: usize,
+    timeouts: Timeouts,
+) -> Result<Arc<PreparedEntry>> {
+    if let Some(entry) = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(query)
+    {
+        return Ok(entry);
+    }
+    let metadata = prepare_query(connection, query, parameter_count, timeouts)?;
+    let candidate = Arc::new(PreparedEntry::new(metadata, connection));
+    Ok(cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(query.to_owned(), candidate))
 }
 
 struct PreparedField {
@@ -2536,6 +2876,28 @@ fn is_prepare_statement(query: &str) -> bool {
     leading_sql_keyword(query).is_some_and(|keyword| keyword.eq_ignore_ascii_case("prepare"))
 }
 
+fn query_invalidates_prepared_cache(query: &str) -> Result<bool> {
+    Ok(unbound_statements(query)?.into_iter().any(|statement| {
+        leading_sql_keyword(statement).is_some_and(|keyword| {
+            matches!(
+                keyword.to_ascii_uppercase().as_str(),
+                "ALTER"
+                    | "ANALYZE"
+                    | "CALL"
+                    | "COMMENT"
+                    | "CREATE"
+                    | "DEALLOCATE"
+                    | "DROP"
+                    | "GRANT"
+                    | "RENAME"
+                    | "REVOKE"
+                    | "SET"
+                    | "TRUNCATE"
+            )
+        })
+    }))
+}
+
 fn leading_sql_keyword(query: &str) -> Option<&str> {
     let bytes = query.as_bytes();
     let mut index = 0;
@@ -2600,7 +2962,7 @@ fn parameter_query_reader(
         .transpose()?
         .ok_or_else(|| error("no parameter rows to execute", Status::InvalidArguments))?;
     let current =
-        query_reader_with_timeouts(connection, &first, batch_rows, read_prefetch, timeouts)?;
+        bound_query_reader_with_retry(connection, &first, batch_rows, read_prefetch, timeouts)?;
     let schema = current.schema();
     Ok(Box::new(ParameterQueryReader {
         connection: Arc::clone(connection),
@@ -2612,6 +2974,30 @@ fn parameter_query_reader(
         timeouts,
         finished: false,
     }))
+}
+
+fn bound_query_reader_with_retry(
+    connection: &Arc<Mutex<monetdb::Connection>>,
+    query: &BoundQuery,
+    batch_rows: usize,
+    read_prefetch: bool,
+    timeouts: Timeouts,
+) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
+    let query = current_bound_query(connection, query, timeouts)?;
+    match query_reader_with_timeouts(connection, &query.sql, batch_rows, read_prefetch, timeouts) {
+        Err(value) if query.prepared.is_some() && prepared_statement_missing(&value) => {
+            if !lock_connection(connection)?
+                .server_info()
+                .map_err(map_cursor_error)?
+                .autocommit
+            {
+                return Err(value);
+            }
+            let retry = retry_bound_query(connection, &query, timeouts)?;
+            query_reader_with_timeouts(connection, &retry.sql, batch_rows, read_prefetch, timeouts)
+        }
+        result => result,
+    }
 }
 
 fn scalar_string(
@@ -2785,17 +3171,49 @@ fn execute_updates_atomic(
     queries: &mut BoundQueryStream,
     timeouts: Timeouts,
 ) -> Result<Option<i64>> {
-    if queries.is_empty()? {
+    let Some(first) = queries.next().transpose()? else {
         return Ok(Some(0));
+    };
+    execute_updates_atomic_from_first(connection, queries, first, timeouts, true)
+}
+
+fn execute_updates_atomic_from_first(
+    connection: &Arc<Mutex<monetdb::Connection>>,
+    queries: &mut BoundQueryStream,
+    first: BoundQuery,
+    timeouts: Timeouts,
+    allow_retry: bool,
+) -> Result<Option<i64>> {
+    let first = current_bound_query(connection, &first, timeouts)?;
+    let connection_guard = lock_connection(connection)?;
+    let (mut cursor, atomic_scope) = begin_atomic(&connection_guard, "parameter_batch", timeouts)?;
+    if let Err(root) = cursor.execute(&first.sql).map_err(map_cursor_error) {
+        let retryable =
+            allow_retry && first.prepared.is_some() && prepared_statement_missing(&root);
+        let root_message = root.message.clone();
+        let result = finish_atomic(
+            &connection_guard,
+            &mut cursor,
+            atomic_scope,
+            Err(root),
+            timeouts,
+        );
+        drop(cursor);
+        drop(connection_guard);
+        return match result {
+            Err(value) if retryable && value.message == root_message => {
+                let retry = retry_bound_query(connection, &first, timeouts)?;
+                execute_updates_atomic_from_first(connection, queries, retry, timeouts, false)
+            }
+            result => result,
+        };
     }
-    let connection = lock_connection(connection)?;
-    let (mut cursor, atomic_scope) = begin_atomic(&connection, "parameter_batch", timeouts)?;
     let result = (|| {
-        let mut total = 0i64;
-        let mut has_count = false;
+        let mut total = cursor.affected_rows().unwrap_or(0);
+        let mut has_count = cursor.affected_rows().is_some();
         for query in queries {
             let query = query?;
-            cursor.execute(&query).map_err(map_cursor_error)?;
+            cursor.execute(&query.sql).map_err(map_cursor_error)?;
             if let Some(rows) = cursor.affected_rows() {
                 total = total
                     .checked_add(rows)
@@ -2805,7 +3223,13 @@ fn execute_updates_atomic(
         }
         Ok(has_count.then_some(total))
     })();
-    finish_atomic(&connection, &mut cursor, atomic_scope, result, timeouts)
+    finish_atomic(
+        &connection_guard,
+        &mut cursor,
+        atomic_scope,
+        result,
+        timeouts,
+    )
 }
 
 fn schema_for_columns(columns: &[ResultColumn]) -> Result<SchemaRef> {
@@ -3217,7 +3641,7 @@ impl ParameterQueryReader {
                 Ok(query) => query,
                 Err(value) => return Some(Err(ArrowError::ExternalError(Box::new(value)))),
             };
-            match query_reader_with_timeouts(
+            match bound_query_reader_with_retry(
                 &self.connection,
                 &query,
                 self.batch_rows,
@@ -3647,6 +4071,26 @@ mod tests {
             .unwrap(),
             "\"s'; DROP SCHEMA sys; --\".\"t\"\"; DELETE FROM guard; --\""
         );
+    }
+
+    #[test]
+    fn identifies_queries_that_can_invalidate_prepared_statements() {
+        for query in [
+            "ALTER TABLE t ADD COLUMN value INT",
+            "/* comment */ CREATE TABLE t(value INT)",
+            "INSERT INTO t VALUES (1); DROP TABLE t",
+            "SET SCHEMA sys",
+        ] {
+            assert!(query_invalidates_prepared_cache(query).unwrap(), "{query}");
+        }
+        for query in [
+            "SELECT * FROM t",
+            "INSERT INTO t VALUES (1)",
+            "UPDATE t SET value = 2",
+            "DELETE FROM t",
+        ] {
+            assert!(!query_invalidates_prepared_cache(query).unwrap(), "{query}");
+        }
     }
 
     #[test]

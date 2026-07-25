@@ -96,6 +96,20 @@ requirements change their premises.
   normalization. Known pymonetdb differences remain explicit nonblocking xfails so upstream fixes
   become visible.
 
+## Prepared-statement lifetime
+
+- Positional prepared statements are cached per connection under their exact SQL text. A
+  128-entry LRU bounds session memory, while shared entry leases prevent eviction from
+  deallocating a plan still used by a live statement. Statement destruction remains nonblocking;
+  the cache or session owns server cleanup.
+- Commit and rollback preserve MonetDB prepared statements. Schema-changing SQL observed on the
+  same connection clears the cache before execution. MonetDB can also silently discard a plan
+  after DDL from another session; an `EXEC: PREPARED Statement missing` response evicts that exact
+  entry and retries once when doing so cannot roll back user work.
+- On the documented 200-query workload, new-cursor execution fell from 1.944 to 0.342 ms per
+  statement. Cache lookup, LRU maintenance, and invalidation bookkeeping added about 0.010 ms over
+  the cache-only path and kept the result below the 0.50 ms acceptance threshold.
+
 ## Measured optimization rejections
 
 These conclusions record comparative measurements completed on 2026-07-23. A proposal to reverse
