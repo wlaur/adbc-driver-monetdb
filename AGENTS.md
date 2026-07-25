@@ -6,6 +6,19 @@ An ADBC driver for MonetDB in Rust: reads decode the binary result-set protocol
 `adbc-driver-manager`. The [README](README.md) covers usage and layout. This file
 covers the conventions that are easy to get wrong.
 
+## Documentation map
+
+- **Read [docs/design-decisions.md](docs/design-decisions.md) before changing or
+  proposing component boundaries, client identity, result scheduling or memory,
+  error semantics, test infrastructure, release design, or performance work.** It is
+  a decision record, not a backlog. Do not reopen a measured optimization rejection
+  without new reproducible evidence; record the commands, workload, environment, and
+  repeated results in the pull request.
+- The README is the primary user guide. `docs/monetdb.md` is the source template for
+  generated ADBC validation documentation and the standalone DBC release package.
+  Keep both current when installation, connection options, support policy,
+  feature/type coverage, or packaging behavior changes.
+
 ## Hard support policy — no compatibility code
 
 - **MonetDB Dec2025 (11.55)+ and little-endian servers only.** Fail fast at connect;

@@ -1,10 +1,9 @@
 # Design decisions
 
 This file records durable choices that are easy to mistake for unfinished work. It is not a
-backlog or a release checklist. User-visible behavior belongs in the README, and reproducible
-performance work belongs in [`benchmarks/README.md`](../benchmarks/README.md). Revisit these
-decisions only when new protocol evidence, workload measurements, or user requirements change
-their premises.
+backlog or a release checklist. User-visible behavior belongs in the README. Revisit these
+decisions only when new protocol evidence, reproducible workload measurements, or user
+requirements change their premises.
 
 ## Component and release boundaries
 
@@ -76,8 +75,9 @@ their premises.
 
 ## Measured optimization rejections
 
-These conclusions were measured on 2026-07-23 with the repository harness. Rerun the documented
-benchmarks before reopening them.
+These conclusions record comparative measurements completed on 2026-07-23. A proposal to reverse
+one must provide its commands, workload, environment, and repeated results so the new evidence can
+be reviewed and reproduced.
 
 | Proposal | Decision |
 |---|---|
