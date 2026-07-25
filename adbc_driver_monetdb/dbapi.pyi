@@ -34,6 +34,7 @@ from adbc_driver_manager.dbapi import Cursor as _ManagerCursor
 apilevel: str
 threadsafety: int
 paramstyle: Literal["qmark"]
+Binary: type[bytes]
 
 class _ArrowArrayStreamHandle(Protocol):
     def release(self) -> None: ...
