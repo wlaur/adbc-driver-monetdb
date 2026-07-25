@@ -11,6 +11,8 @@ from adbc_driver_monetdb import ENTRYPOINT, DatabaseOptions, driver_path
 apilevel = _dbapi.apilevel
 threadsafety = _dbapi.threadsafety
 paramstyle = "qmark"
+Binary = bytes
+
 
 Warning = _dbapi.Warning
 Error = _dbapi.Error
@@ -73,6 +75,7 @@ __all__ = [
     "NUMBER",
     "ROWID",
     "STRING",
+    "Binary",
     "Connection",
     "Cursor",
     "DataError",

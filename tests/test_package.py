@@ -25,9 +25,44 @@ def test_driver_path_exists() -> None:
 
 
 def test_dbapi_module_surface() -> None:
+    required = {
+        "BINARY",
+        "Binary",
+        "DATETIME",
+        "NUMBER",
+        "ROWID",
+        "STRING",
+        "DataError",
+        "DatabaseError",
+        "Date",
+        "DateFromTicks",
+        "Error",
+        "IntegrityError",
+        "InterfaceError",
+        "InternalError",
+        "NotSupportedError",
+        "OperationalError",
+        "ProgrammingError",
+        "Time",
+        "TimeFromTicks",
+        "Timestamp",
+        "TimestampFromTicks",
+        "Warning",
+        "apilevel",
+        "connect",
+        "paramstyle",
+        "threadsafety",
+    }
+    public = set(vars(dbapi)["__all__"])
+    assert required <= public
+    assert all(hasattr(dbapi, name) for name in required)
     assert dbapi.apilevel == "2.0"
     assert dbapi.paramstyle == "qmark"
     assert dbapi.threadsafety == 1
+    for value in (b"\x00binary", bytearray(b"\x00binary"), memoryview(b"\x00binary")):
+        converted = dbapi.Binary(value)
+        assert type(converted) is bytes
+        assert converted == b"\x00binary"
     assert dbapi.Connection is manager_dbapi.Connection
     assert dbapi.Error is manager_dbapi.Error
     assert adbc_driver_monetdbs.ENTRYPOINT == adbc_driver_monetdb.ENTRYPOINT

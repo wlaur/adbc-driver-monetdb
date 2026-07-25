@@ -6,7 +6,7 @@ members = ["crates/monetdb-arrow", "crates/adbc-monetdb"]
 exclude = ["monetdb-rust"]
 
 [workspace.package]
-version = "0.8.1"
+version = "0.8.2"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/wlaur/adbc-driver-monetdb"
