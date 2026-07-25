@@ -669,7 +669,7 @@ def test_prepared_statement_cache_is_lru_bounded(monetdb_uri: str) -> None:
             assert cursor.fetchone() == (129,)
         with conn.cursor() as audit:
             audit.execute("SELECT statement FROM sys.prepared_statements")
-            statements = [row[0].lower() for row in audit.fetchall()]
+            statements = [cast(str, row[0]).lower() for row in audit.fetchall()]
             assert len(statements) == 128
             assert any("+ 0 as value" in statement for statement in statements)
             assert not any("+ 1 as value" in statement for statement in statements)
