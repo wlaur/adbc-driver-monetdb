@@ -175,7 +175,7 @@ path. Ingestion caps parallel encode/COPY windows at 131,072 rows to bound memor
 further; zero keeps upstream boundaries only up to the internal cap. Set it through `conn_kwargs`
 as above when `DataFrame.write_database` creates its own cursor, or through `adbc_stmt_kwargs` for
 a directly managed cursor. The input Arrow stream remains incremental, but columns within each
-bounded window are encoded eagerly so they can run in parallel. The protocol library's “lazy”
+bounded window are encoded eagerly so they can run in parallel. The protocol library's `lazy`
 upload callback still materializes one complete encoded column and serializes encoding with
 network transfer; it is not a byte-streaming encoder.
 
