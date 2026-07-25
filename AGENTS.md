@@ -79,8 +79,9 @@ covers the conventions that are easy to get wrong.
 ## Tests
 
 - `uv run pytest -m "not integration"` needs no server. Integration tests need
-  `MONETDB_TEST_URI` and a dockerized `monetdb/monetdb:Dec2025-SP3` (command in
-  `tests/conftest.py`); they skip when the variable is unset.
+  `MONETDB_TEST_URI` and the pinned native ARM64 Dec2025-SP3 image from
+  `wlaur/monetdb-container` (command in `tests/conftest.py`); they skip when the
+  variable is unset.
 - Not-yet-implemented behavior: write the test now and mark it
   `xfail(strict=False, reason="...")`; remove the marker when the milestone lands.
   Don't delete or skip instead.

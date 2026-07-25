@@ -67,6 +67,11 @@ requirements change their premises.
 
 ## Semantics and test strategy
 
+- The canonical local Dec2025-SP3 test service is the pinned native ARM64
+  `wlaur/monetdb-container` image built from its public recipe. CI retains the official amd64
+  images only for the x86_64 wheel job and the 11.55.1 minimum-server gate: an ARM64-only image
+  cannot run those architecture/version checks, and no 11.55.1 tag exists in the ARM64 image
+  repository.
 - MonetDB `JSON` maps to the canonical Arrow `arrow.json` extension backed by UTF-8, never to an
   Arrow `Struct`. MonetDB defines JSON as a validated string subtype, and a column may contain
   objects, arrays, scalars, and JSON `null` with different shapes in different rows. Functions

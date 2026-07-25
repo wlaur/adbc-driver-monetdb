@@ -14,7 +14,8 @@ from adbc_driver_monetdb import dbapi
 def monetdb_uri() -> str:
     """URI of a running MonetDB server for integration tests.
 
-    Start one with: docker compose -f compose.yaml up -d
+    Start the pinned native ARM64 image with:
+    docker compose -f compose.yaml up -d
     """
     uri = os.environ.get("MONETDB_TEST_URI")
     if uri is None:

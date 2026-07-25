@@ -383,6 +383,7 @@ uv run pytest -m "not integration and not local_only"  # python tests (no server
 cargo test --workspace                 # rust tests
 
 # integration tests against a real server:
+# compose.yaml pins the native ARM64 Dec2025-SP3 wlaur/monetdb-container image
 docker compose -f compose.yaml up -d
 MONETDB_TEST_URI=monetdb://monetdb:monetdb@localhost:50000/test \
     uv run pytest -m "integration and not local_only"
