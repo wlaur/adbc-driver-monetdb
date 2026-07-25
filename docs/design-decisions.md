@@ -10,6 +10,11 @@ requirements change their premises.
 - Generic MAPI transport, framing, authentication, timeout, and client-information behavior
   belongs in the `monetdb-rust` fork under MPL-2.0. Arrow conversion and ADBC scheduling belong in
   this repository under MIT. Performance work must not move Arrow or ADBC policy into the fork.
+- `adbc_driver_monetdbs` remains a re-export of `adbc_driver_monetdb` solely because Polars derives
+  the Python module name `adbc_driver_<scheme>` from a URI. It keeps the standard
+  `monetdbs://` TLS URI usable through Polars without creating a second driver identity. ADBC
+  standardizes `uri` as an option and driver loading separately; there is one native driver, one
+  wheel distribution, and one DBC manifest named `monetdb`.
 - MonetDB exposes one sequential result channel per MAPI connection. Partitioned and incremental
   results remain explicitly unsupported. Multi-connection range-partitioned reads would be a new
   feature with transaction-consistency semantics, not an implementation detail of the current
@@ -62,6 +67,17 @@ requirements change their premises.
 
 ## Semantics and test strategy
 
+- The canonical local Dec2025-SP3 test service is the pinned native ARM64
+  `wlaur/monetdb-container` image built from its public recipe. CI retains the official amd64
+  images only for the x86_64 wheel job and the 11.55.1 minimum-server gate: an ARM64-only image
+  cannot run those architecture/version checks, and no 11.55.1 tag exists in the ARM64 image
+  repository.
+- MonetDB `JSON` maps to the canonical Arrow `arrow.json` extension backed by UTF-8, never to an
+  Arrow `Struct`. MonetDB defines JSON as a validated string subtype, and a column may contain
+  objects, arrays, scalars, and JSON `null` with different shapes in different rows. Functions
+  declared to return JSON preserve `arrow.json`; functions declared to return strings, numbers,
+  integers, or booleans use those scalar Arrow types. Polars may explicitly decode the resulting
+  `String` storage into a known struct schema when an application wants that narrower view.
 - `TIMESTAMPTZ` decoding under `SET TIME ZONE` is correct and is pinned by a live regression test.
 - TLS configuration errors are argument-shaped, but handshake and certificate-verification
   failures are I/O failures and map to `OperationalError`.

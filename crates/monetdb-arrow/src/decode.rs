@@ -1688,6 +1688,7 @@ mod tests {
         Array, DurationMillisecondArray, Float32Array, Float64Array, Int8Array, Int16Array,
         Int32Array, Int64Array, UInt64Array,
     };
+    use proptest::prelude::*;
 
     use super::*;
 
@@ -1923,6 +1924,51 @@ mod tests {
                     .value(0),
                 expected
             );
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn arbitrary_column_bytes_return_errors_or_row_sized_arrays(
+            bytes in prop::collection::vec(any::<u8>(), 0..512),
+            rows in 0usize..32,
+        ) {
+            let types = [
+                MonetType::Bool,
+                MonetType::TinyInt,
+                MonetType::SmallInt,
+                MonetType::Int,
+                MonetType::BigInt,
+                MonetType::HugeInt,
+                MonetType::Oid,
+                MonetType::Decimal(2, 0),
+                MonetType::Decimal(38, 10),
+                MonetType::Varchar(0),
+                MonetType::Url,
+                MonetType::Json,
+                MonetType::Real,
+                MonetType::Double,
+                MonetType::MonthInterval,
+                MonetType::DayInterval,
+                MonetType::SecInterval,
+                MonetType::Time,
+                MonetType::TimeTz,
+                MonetType::Date,
+                MonetType::Timestamp,
+                MonetType::TimestampTz,
+                MonetType::Blob,
+                MonetType::Uuid,
+                MonetType::Inet4,
+                MonetType::Inet6,
+                MonetType::Geometry,
+                MonetType::Inet,
+                MonetType::Xml,
+            ];
+            for data_type in types {
+                if let Ok(array) = decode_column(&data_type, &bytes, rows) {
+                    prop_assert_eq!(array.len(), rows);
+                }
+            }
         }
     }
 

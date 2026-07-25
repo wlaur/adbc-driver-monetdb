@@ -376,6 +376,8 @@ jobs:
     runs-on: ubuntu-latest
     services:
       monetdb:
+        # The x86_64 wheel must use the amd64 service. Local Compose and the ARM64
+        # integration job use the native wlaur/monetdb-container image.
         image: monetdb/monetdb:Dec2025-SP3@sha256:a71e6e8c8402beadc51aebf944b465ee5b185c7ae4a9e6808b5d9133ee921786
         ports:
           - 50000:50000
@@ -460,6 +462,8 @@ jobs:
     runs-on: ubuntu-latest
     services:
       monetdb:
+        # wlaur/monetdb-container starts at 11.55.7; keep the official amd64
+        # image for the required 11.55.1 lower-bound check.
         image: monetdb/monetdb:Dec2025@sha256:2d85475cd9324de70a5f6f14326918d39aa924862e9719d3ca87978cd8dd44ef
         ports:
           - 50000:50000

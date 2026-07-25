@@ -1089,6 +1089,7 @@ mod tests {
         types::Int8Type,
     };
     use arrow_schema::{Field, Schema};
+    use proptest::prelude::*;
 
     use super::*;
 
@@ -1149,6 +1150,18 @@ mod tests {
             ]
         );
         assert!(unbound_statements("SELECT ?; SELECT 1").is_err());
+    }
+
+    proptest! {
+        #[test]
+        fn arbitrary_query_text_returns_bounded_results(query in any::<String>()) {
+            if let Ok(template) = QueryTemplate::parse(&query) {
+                let _ = template.render(|_| Ok("NULL")).unwrap();
+            }
+            let _ = parameter_layout(&query);
+            let _ = render_null_parameters(&query);
+            let _ = unbound_statements(&query);
+        }
     }
 
     #[test]

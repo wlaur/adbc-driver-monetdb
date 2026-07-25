@@ -1,7 +1,8 @@
 services:
   monetdb:
-    image: monetdb/monetdb:Dec2025-SP3@sha256:a71e6e8c8402beadc51aebf944b465ee5b185c7ae4a9e6808b5d9133ee921786
-    platform: linux/amd64
+    # Native ARM64 Dec2025-SP3 image recipe: https://github.com/wlaur/monetdb-container
+    image: wlaur/monetdb-container:11.55.7-2@sha256:22dd41bd10fd7136ca1ef6afaec5cf0c1670f16a84b80785a5fee12aac480eb4
+    platform: linux/arm64
     ports:
       - "50000:50000"
     environment:

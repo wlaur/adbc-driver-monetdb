@@ -273,6 +273,26 @@ HUGEINT and TIMETZ remain round-trippable when loaded as extension types. The
 −(10^38−1) through 10^38−1; wider values in MonetDB's signed 128-bit domain return a bounded
 conversion error instead of silently changing the public Arrow type.
 
+MonetDB `JSON` query results use Arrow's canonical
+[`arrow.json`](https://arrow.apache.org/docs/format/CanonicalExtensions.html#json) extension with
+UTF-8 string storage. Under the supported storage policy, Polars loads it as `pl.String`; the
+driver does not expand it to `pl.Struct` because one JSON column can contain objects, arrays,
+scalars, and JSON `null` with different shapes. Applications that know an object schema can opt in:
+
+```python
+decoded = frame.with_columns(
+    pl.col("payload").str.json_decode(
+        dtype=pl.Struct({"id": pl.Int64, "label": pl.String}),
+    )
+)
+```
+
+MonetDB functions declared to return JSON—including `json.filter`, `json.keyarray`, and
+`json.valuearray`—preserve `arrow.json`. Functions such as `json.text`, `json.number`,
+`json."integer"`, `json.length`, and the JSON predicates return their declared scalar Arrow types.
+This follows [MonetDB's JSON model](https://www.monetdb.org/documentation-Dec2025/user-guide/sql-manual/data-types/json-types/),
+where JSON is a validated string subtype.
+
 Backend-specific type boundaries are explicit:
 
 | MonetDB type | Query results | Parameter binding | Bulk ingest |
@@ -330,8 +350,16 @@ The URI-string conveniences `pl.read_database_uri(..., engine="adbc")` and
 `DataFrame.write_database(..., connection="monetdb://...")` import the driver package by URI
 scheme and therefore require the Python distribution. The wheel includes both
 `adbc_driver_monetdb` and the TLS alias `adbc_driver_monetdbs`, so both `monetdb://` and
-`monetdbs://` work through those conveniences. Both distribution channels are intentional and
-ship the same native driver.
+`monetdbs://` work through those conveniences. This alias follows
+[Polars' scheme-to-module lookup](https://github.com/pola-rs/polars/blob/py-1.42.1/py-polars/src/polars/io/database/_utils.py#L123-L191);
+it is not a second ADBC driver or Python distribution.
+
+ADBC itself treats the canonical
+[`uri` option](https://arrow.apache.org/adbc/current/format/specification.html#changelog) and
+[driver loading](https://arrow.apache.org/adbc/current/format/driver_manifests.html) separately.
+The wheel aliases load the same native entrypoint, and the standalone DBC package has one
+`monetdb` manifest. DBC users select `driver="monetdb"` and may pass either URI scheme unchanged
+to that driver.
 
 ## Repository layout
 
@@ -355,6 +383,7 @@ uv run pytest -m "not integration and not local_only"  # python tests (no server
 cargo test --workspace                 # rust tests
 
 # integration tests against a real server:
+# compose.yaml pins the native ARM64 Dec2025-SP3 wlaur/monetdb-container image
 docker compose -f compose.yaml up -d
 MONETDB_TEST_URI=monetdb://monetdb:monetdb@localhost:50000/test \
     uv run pytest -m "integration and not local_only"
