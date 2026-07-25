@@ -57,6 +57,14 @@ and `client_info` map to the database options `adbc.monetdb.client_application`,
 `sys.sessions`; set `client_info=false` to suppress the hostname, process id, application, driver,
 and remark values.
 
+## Python TLS URI resolution
+
+The wheel includes `adbc_driver_monetdbs` as a re-export of `adbc_driver_monetdb` because Polars
+derives the Python module name `adbc_driver_<scheme>` from URI strings. This keeps `monetdbs://`
+usable through Polars' URI convenience without defining a second ADBC driver,
+distribution, native library, or DBC manifest. The standalone driver remains named `monetdb`;
+ADBC treats driver loading and the `uri` database option separately.
+
 ## Feature and type support
 
 {{ features|safe }}
@@ -64,3 +72,15 @@ and remark values.
 ### Types
 
 {{ types|safe }}
+
+MonetDB `JSON` query results use Arrow's canonical
+[`arrow.json`](https://arrow.apache.org/docs/format/CanonicalExtensions.html#json) extension with
+UTF-8 string storage. Under the supported storage policy, Polars loads that storage as `String`;
+it is not automatically expanded to `Struct` because rows may contain objects, arrays, scalars,
+and JSON `null` with different shapes. Applications that know an object schema can explicitly use
+`str.json_decode(dtype=pl.Struct(...))`.
+
+Functions declared to return JSON—including `json.filter`, `json.keyarray`, and
+`json.valuearray`—preserve `arrow.json`. Functions declared to return strings, numbers, integers,
+or booleans use those scalar Arrow types. This matches
+[MonetDB's validated-string JSON model](https://www.monetdb.org/documentation-Dec2025/user-guide/sql-manual/data-types/json-types/).

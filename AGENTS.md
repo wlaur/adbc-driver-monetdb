@@ -64,11 +64,13 @@ covers the conventions that are easy to get wrong.
   is disabled; use rule-specific `# pyright: ignore[rule]`, and delete a suppression in
   the same change that makes it unnecessary (`reportUnnecessaryTypeIgnoreComment` is an
   error). `ruff check` + `ruff format` gate everything else.
-- Two names are load-bearing for polars integration; never rename them:
+- Three names are load-bearing for polars integration; never rename them:
   the import package `adbc_driver_monetdb` (polars resolves `adbc_driver_{scheme}` from
-  `monetdb://` URIs), and `dbapi.connect` returning a plain
+  `monetdb://` URIs), its `adbc_driver_monetdbs` re-export for `monetdbs://` URI
+  resolution, and `dbapi.connect` returning a plain
   `adbc_driver_manager.dbapi.Connection` (polars detects ADBC by that class's module and
-  isinstance-checks it on the write path).
+  isinstance-checks it on the write path). The TLS re-export is a Polars adapter, not a
+  second ADBC driver, distribution, native library, or DBC manifest.
 - Mixed build via maturin: the driver cdylib ships as the extension module
   `adbc_driver_monetdb._native` (abi3, cp313). `uv sync` builds it; the editable install
   drops the compiled `_native` inside the source package directory.

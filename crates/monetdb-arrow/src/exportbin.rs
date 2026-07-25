@@ -226,6 +226,8 @@ fn read_error_message(frame: &[u8], offset: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
 
     /// Build a syntactically valid frame the way `mvc_export_bin_chunk` does.
@@ -386,5 +388,17 @@ mod tests {
             parse_frame(&frame),
             Err(FrameError::Malformed("table of contents length overflows"))
         );
+    }
+
+    proptest! {
+        #[test]
+        fn arbitrary_frame_bytes_return_bounded_results(
+            frame in prop::collection::vec(any::<u8>(), 0..4096),
+        ) {
+            if let Ok(parsed) = parse_frame(&frame) {
+                prop_assert!(parsed.columns.iter().all(|column| column.len() <= frame.len()));
+            }
+            let _ = parse_frame_header(&frame);
+        }
     }
 }

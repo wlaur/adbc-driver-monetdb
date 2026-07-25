@@ -17,6 +17,7 @@ dependencies = [
  "monetdb",
  "monetdb-arrow",
  "percent-encoding",
+ "proptest",
  "pyo3",
  "rayon",
  "url",
