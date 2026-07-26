@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     fmt,
     num::NonZeroUsize,
     ops::Range,
@@ -957,8 +957,13 @@ impl Drop for PreparedEntry {
 
 struct PreparedCache {
     capacity: usize,
-    entries: HashMap<String, Arc<PreparedEntry>>,
-    least_to_most_recent: VecDeque<String>,
+    entries: HashMap<String, CachedPrepared>,
+    use_counter: u64,
+}
+
+struct CachedPrepared {
+    entry: Arc<PreparedEntry>,
+    last_used: u64,
 }
 
 impl PreparedCache {
@@ -967,27 +972,37 @@ impl PreparedCache {
         Self {
             capacity,
             entries: HashMap::new(),
-            least_to_most_recent: VecDeque::new(),
+            use_counter: 0,
         }
     }
 
     fn get(&mut self, query: &str) -> Option<Arc<PreparedEntry>> {
-        let entry = Arc::clone(self.entries.get(query)?);
-        self.touch(query);
-        Some(entry)
+        let query = normalize_prepared_query(query);
+        let last_used = self.next_use();
+        let cached = self.entries.get_mut(query)?;
+        cached.last_used = last_used;
+        Some(Arc::clone(&cached.entry))
     }
 
     fn insert(&mut self, query: String, candidate: Arc<PreparedEntry>) -> Arc<PreparedEntry> {
-        if let Some(existing) = self.entries.get(&query).cloned() {
-            self.touch(&query);
+        let query = normalize_prepared_query(&query).to_owned();
+        if let Some(existing) = self.get(&query) {
             return existing;
         }
-        self.entries.insert(query.clone(), Arc::clone(&candidate));
-        self.touch(&query);
+        let last_used = self.next_use();
+        self.entries.insert(
+            query,
+            CachedPrepared {
+                entry: Arc::clone(&candidate),
+                last_used,
+            },
+        );
         while self.entries.len() > self.capacity {
             let oldest = self
-                .least_to_most_recent
-                .pop_front()
+                .entries
+                .iter()
+                .min_by_key(|(_, cached)| cached.last_used)
+                .map(|(query, _)| query.clone())
                 .expect("a nonempty cache has an LRU key");
             self.entries.remove(&oldest);
         }
@@ -995,20 +1010,23 @@ impl PreparedCache {
     }
 
     fn remove_if_id(&mut self, query: &str, id: u64) {
-        if self.entries.get(query).is_some_and(|entry| entry.id == id) {
+        let query = normalize_prepared_query(query);
+        if self
+            .entries
+            .get(query)
+            .is_some_and(|cached| cached.entry.id == id)
+        {
             self.entries.remove(query);
-            self.least_to_most_recent.retain(|key| key != query);
         }
     }
 
     fn clear(&mut self) {
         self.entries.clear();
-        self.least_to_most_recent.clear();
     }
 
-    fn touch(&mut self, query: &str) {
-        self.least_to_most_recent.retain(|key| key != query);
-        self.least_to_most_recent.push_back(query.to_owned());
+    fn next_use(&mut self) -> u64 {
+        self.use_counter = self.use_counter.saturating_add(1);
+        self.use_counter
     }
 }
 
@@ -1854,7 +1872,7 @@ impl MonetdbStatement {
             ParameterLayout::Positional(_) => {}
         }
         let prepared = self.prepared_entry.as_ref().map(|entry| PreparedPlan {
-            query: Arc::from(query.as_str()),
+            query: Arc::from(normalize_prepared_query(&query)),
             parameter_count: layout.count(),
             entry: Arc::clone(entry),
             cache: Arc::clone(&self.prepared_cache),
@@ -1935,12 +1953,9 @@ impl MonetdbStatement {
                     Status::NotImplemented,
                 ));
             }
-            if matches!(
-                data_type,
-                MonetType::Inet | MonetType::Inet4 | MonetType::Inet6
-            ) {
+            if data_type == MonetType::Inet {
                 return Err(error(
-                    "COPY BINARY ingestion for INET columns is not supported by MonetDB",
+                    "COPY BINARY ingestion for legacy INET columns is not supported by MonetDB",
                     Status::NotImplemented,
                 ));
             }
@@ -2500,6 +2515,7 @@ fn prepare_cached(
     parameter_count: usize,
     timeouts: Timeouts,
 ) -> Result<Arc<PreparedEntry>> {
+    let query = normalize_prepared_query(query);
     if let Some(entry) = cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2548,7 +2564,7 @@ fn prepare_query_inner(
     allow_any: bool,
     timeouts: Timeouts,
 ) -> Result<PreparedMetadata> {
-    let query = query.trim().trim_end_matches(';');
+    let query = normalize_prepared_query(query);
     let connection = lock_connection(connection)?;
     let use_savepoint = !connection
         .server_info()
@@ -2672,6 +2688,10 @@ fn prepare_query_inner(
         None => Ok(()),
     };
     combine_atomic_error(parsed, release, "releasing the PREPARE savepoint")
+}
+
+fn normalize_prepared_query(query: &str) -> &str {
+    query.trim().trim_end_matches(';').trim_end()
 }
 
 fn restore_declared_result_types(
@@ -3265,17 +3285,33 @@ fn execute_updates_atomic_from_first(
         };
     }
     let result = (|| {
-        let mut total = cursor.affected_rows().unwrap_or(0);
-        let mut has_count = cursor.affected_rows().is_some();
-        for query in queries {
-            let query = query?;
-            cursor.execute(&query.sql).map_err(map_cursor_error)?;
-            if let Some(rows) = cursor.affected_rows() {
-                total = total
-                    .checked_add(rows)
-                    .ok_or_else(|| error("affected row count overflows i64", Status::Internal))?;
-                has_count = true;
+        let mut total = 0i64;
+        let mut has_count = false;
+        add_current_affected_rows(&cursor, &mut total, &mut has_count)?;
+        let mut pending: Option<BoundQuery> = None;
+        loop {
+            let mut batch = Vec::with_capacity(PARAMETER_UPDATE_BATCH_ROWS);
+            let mut sql_bytes = 0usize;
+            if let Some(query) = pending.take() {
+                sql_bytes = query.sql.len();
+                batch.push(query);
             }
+            while batch.len() < PARAMETER_UPDATE_BATCH_ROWS {
+                let Some(query) = queries.next().transpose()? else {
+                    break;
+                };
+                let next_bytes = sql_bytes.saturating_add(query.sql.len()).saturating_add(2);
+                if !batch.is_empty() && next_bytes > PARAMETER_UPDATE_BATCH_BYTES {
+                    pending = Some(query);
+                    break;
+                }
+                sql_bytes = next_bytes;
+                batch.push(query);
+            }
+            if batch.is_empty() {
+                break;
+            }
+            execute_update_batch(&mut cursor, &batch, &mut total, &mut has_count)?;
         }
         Ok(has_count.then_some(total))
     })();
@@ -3286,6 +3322,50 @@ fn execute_updates_atomic_from_first(
         result,
         timeouts,
     )
+}
+
+const PARAMETER_UPDATE_BATCH_ROWS: usize = 1_024;
+const PARAMETER_UPDATE_BATCH_BYTES: usize = 8 * 1024 * 1024;
+
+fn execute_update_batch(
+    cursor: &mut monetdb::Cursor,
+    queries: &[BoundQuery],
+    total: &mut i64,
+    has_count: &mut bool,
+) -> Result<()> {
+    let sql_bytes = queries
+        .iter()
+        .map(|query| query.sql.len().saturating_add(2))
+        .sum();
+    let mut script = String::with_capacity(sql_bytes);
+    for query in queries {
+        script.push_str(query.sql.trim_end().trim_end_matches(';'));
+        script.push_str(";\n");
+    }
+    cursor.execute(&script).map_err(map_cursor_error)?;
+    loop {
+        add_current_affected_rows(cursor, total, has_count)?;
+        if !cursor.next_reply().map_err(map_cursor_error)? {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn add_current_affected_rows(
+    cursor: &monetdb::Cursor,
+    total: &mut i64,
+    has_count: &mut bool,
+) -> Result<()> {
+    if !cursor.has_result_set()
+        && let Some(rows) = cursor.affected_rows()
+    {
+        *total = total
+            .checked_add(rows)
+            .ok_or_else(|| error("affected row count overflows i64", Status::Internal))?;
+        *has_count = true;
+    }
+    Ok(())
 }
 
 fn schema_for_columns(columns: &[ResultColumn]) -> Result<SchemaRef> {

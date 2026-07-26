@@ -1,3 +1,5 @@
+from typing import Any, cast
+
 import adbc_driver_manager
 import pyarrow as pa
 import pytest
@@ -42,21 +44,52 @@ def test_cross_catalog_ingest_is_not_implemented(monetdb_uri: str) -> None:
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("extension_name", ["monetdb.inet", "monetdb.inet4", "monetdb.inet6"])
-def test_legacy_inet_ingest_is_not_implemented(
-    monetdb_uri: str,
-    extension_name: str,
-) -> None:
+def test_legacy_inet_ingest_is_not_implemented(monetdb_uri: str) -> None:
     field = pa.field(
         "address",
         pa.string(),
-        metadata={b"ARROW:extension:name": extension_name.encode()},
+        metadata={b"ARROW:extension:name": b"monetdb.inet"},
     )
     batch = pa.record_batch([pa.array(["127.0.0.1"])], schema=pa.schema([field]))
     with dbapi.connect(monetdb_uri) as connection, connection.cursor() as cursor:
         with pytest.raises(adbc_driver_manager.NotSupportedError, match="INET") as caught:
             cursor.adbc_ingest("never_created", batch, mode="create")
         _assert_not_implemented(caught.value)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("extension_name", "values"),
+    [
+        ("monetdb.inet4", ["127.0.0.1", "192.0.2.10", None]),
+        ("monetdb.inet6", ["::1", "2001:db8::1", None]),
+    ],
+)
+def test_inet_address_ingest_round_trips(
+    monetdb_uri: str,
+    extension_name: str,
+    values: list[str | None],
+) -> None:
+    field = pa.field(
+        "address",
+        pa.string(),
+        metadata={b"ARROW:extension:name": extension_name.encode()},
+    )
+    batch = pa.record_batch([pa.array(values)], schema=pa.schema([field]))
+    table_name = f"roundtrip_{extension_name.removeprefix('monetdb.')}"
+    with dbapi.connect(monetdb_uri, autocommit=True) as connection, connection.cursor() as cursor:
+        cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
+        try:
+            assert cursor.adbc_ingest(table_name, batch, mode="create") == len(values)
+            cursor.execute(f"SELECT address FROM {table_name} ORDER BY address NULLS LAST")
+            result = cursor.fetch_arrow_table()
+            actual = result.column("address").to_pylist()
+            assert actual[-1] is None
+            assert set(actual[:-1]) == set(values[:-1])
+            result_field = cast(Any, result.schema).field("address")
+            assert result_field.metadata == {b"ARROW:extension:name": extension_name.encode()}
+        finally:
+            cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
 
 
 @pytest.mark.integration

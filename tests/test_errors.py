@@ -7,6 +7,22 @@ import pytest
 from adbc_driver_monetdb import DatabaseOptions, dbapi
 
 
+def test_dbapi_exception_hierarchy_matches_pep_249() -> None:
+    assert issubclass(dbapi.Warning, Exception)
+    assert issubclass(dbapi.Error, Exception)
+    assert issubclass(dbapi.InterfaceError, dbapi.Error)
+    assert issubclass(dbapi.DatabaseError, dbapi.Error)
+    for exception_type in (
+        dbapi.DataError,
+        dbapi.OperationalError,
+        dbapi.IntegrityError,
+        dbapi.InternalError,
+        dbapi.ProgrammingError,
+        dbapi.NotSupportedError,
+    ):
+        assert issubclass(exception_type, dbapi.DatabaseError)
+
+
 def _uri_with_credentials(uri: str, username: str, password: str) -> str:
     parsed = urlsplit(uri)
     hostname = parsed.hostname

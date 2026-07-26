@@ -233,9 +233,10 @@ fn prefers_owned_types(types: impl IntoIterator<Item = MonetType>) -> bool {
             | MonetType::Oid
             | MonetType::Double
             | MonetType::DayInterval
-            | MonetType::SecInterval => true,
-            MonetType::Bool
+            | MonetType::SecInterval
             | MonetType::HugeInt
+            | MonetType::Decimal(19..=38, _) => true,
+            MonetType::Bool
             | MonetType::Uuid
             | MonetType::Decimal(_, _)
             | MonetType::Time
@@ -399,6 +400,7 @@ fn should_adopt_frame(
                 | MonetType::Double
                 | MonetType::DayInterval
                 | MonetType::SecInterval => std::mem::align_of::<i64>(),
+                MonetType::HugeInt | MonetType::Decimal(19..=38, _) => std::mem::align_of::<i128>(),
                 _ => return None,
             };
             let pointer = frame.as_ptr().wrapping_add(range.start) as usize;
@@ -491,12 +493,42 @@ fn decode_owned_column(
                 value == i64::MIN
             })?
         }
+        MonetType::HugeInt => adopt_decimal(buffer, range, rows, 38, 0, true)?,
+        MonetType::Decimal(precision @ 19..=38, scale) => adopt_decimal(
+            buffer,
+            range,
+            rows,
+            *precision,
+            decimal_scale(*scale)?,
+            false,
+        )?,
         _ => None,
     };
     match adopted {
         Some(array) => Ok(array),
         None => decode_column(data_type, &buffer.as_slice()[range.clone()], rows),
     }
+}
+
+fn adopt_decimal(
+    buffer: &Buffer,
+    range: &std::ops::Range<usize>,
+    rows: usize,
+    precision: u8,
+    scale: i8,
+    hugeint: bool,
+) -> Result<Option<ArrayRef>, DecodeError> {
+    let bytes = &buffer.as_slice()[range.clone()];
+    expect_fixed(bytes, rows, 16)?;
+    if cfg!(target_endian = "big") || bytes.as_ptr().align_offset(std::mem::align_of::<i128>()) != 0
+    {
+        return Ok(None);
+    }
+    let values =
+        ScalarBuffer::<i128>::new(buffer.slice_with_length(range.start, range.len()), 0, rows);
+    let nulls = validate_decimal_values(&values, precision, hugeint)?;
+    let array = Decimal128Array::new(values, nulls).with_precision_and_scale(precision, scale)?;
+    Ok(Some(Arc::new(array)))
 }
 
 fn adopt_primitive<T, F>(
@@ -1126,6 +1158,12 @@ fn decode_decimal(
         }
     };
     expect_fixed(bytes, rows, width)?;
+    #[cfg(target_endian = "little")]
+    if width == 16 {
+        let values = ScalarBuffer::<i128>::new(Buffer::from_slice_ref(bytes), 0, rows);
+        let nulls = validate_decimal_values(&values, precision, hugeint)?;
+        return Ok(Decimal128Array::new(values, nulls).with_precision_and_scale(precision, scale)?);
+    }
     let mut values = Vec::with_capacity(rows);
     let mut validity = Vec::with_capacity(rows);
     let mut has_nulls = false;
@@ -1164,6 +1202,34 @@ fn decode_decimal(
     }
     let nulls = has_nulls.then(|| NullBuffer::from(validity));
     Ok(Decimal128Array::new(values.into(), nulls).with_precision_and_scale(precision, scale)?)
+}
+
+fn validate_decimal_values(
+    values: &ScalarBuffer<i128>,
+    precision: u8,
+    hugeint: bool,
+) -> Result<Option<NullBuffer>, DecodeError> {
+    let limit = 10i128.pow(u32::from(precision));
+    let mut has_nulls = false;
+    for (row, value) in values.iter().copied().enumerate() {
+        let null = value == i128::MIN;
+        if !null && (value <= -limit || value >= limit) {
+            return Err(DecodeError::InvalidValue {
+                row,
+                message: if hugeint {
+                    "HUGEINT exceeds Arrow Decimal128's supported 38-digit range"
+                } else {
+                    "decimal value exceeds its declared precision"
+                },
+            });
+        }
+        has_nulls |= null;
+    }
+    Ok(has_nulls.then(|| {
+        NullBuffer::new(BooleanBuffer::collect_bool(values.len(), |row| {
+            values[row] != i128::MIN
+        }))
+    }))
 }
 
 pub(crate) fn decode_strings(bytes: &[u8], rows: usize) -> Result<StringArray, DecodeError> {
@@ -1245,6 +1311,9 @@ fn decode_strings_with_backrefs(bytes: &[u8], rows: usize) -> Result<StringArray
     let mut history: Vec<Option<&str>> = Vec::with_capacity(rows);
     let mut pos = 0;
     let mut value_bytes = 0usize;
+    // Dec2025's `sql_bincopyconvert.c` emits literal strings only. Keep the
+    // bounded backreference path for future exporters without letting a
+    // hostile response expand without limit.
     let expansion_limit = bytes.len().saturating_mul(16).max(1024 * 1024);
     for row in 0..rows {
         let Some(&first) = bytes.get(pos) else {
@@ -1994,6 +2063,16 @@ mod tests {
         let array = decode_owned_column(&buffer, &(1..9), &MonetType::Int, 2).unwrap();
         let array = array.as_any().downcast_ref::<Int32Array>().unwrap();
         assert_eq!(array.values(), &[7, 8]);
+
+        let mut bytes = vec![0u8; 64];
+        bytes.extend_from_slice(&7i128.to_le_bytes());
+        bytes.extend_from_slice(&i128::MIN.to_le_bytes());
+        let expected_ptr = bytes.as_ptr().wrapping_add(64) as usize;
+        let buffer = Buffer::from_vec(bytes);
+        let array = decode_owned_column(&buffer, &(64..96), &MonetType::Decimal(38, 2), 2).unwrap();
+        let array = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
+        assert_eq!(array.values().as_ptr() as usize, expected_ptr);
+        assert_eq!(array.iter().collect::<Vec<_>>(), vec![Some(7), None]);
     }
 
     #[test]
@@ -2002,6 +2081,9 @@ mod tests {
         assert!(!adoption_is_worthwhile(74, 100));
         assert!(!adoption_is_worthwhile(0, 0));
         assert!(prefers_owned_types([MonetType::BigInt, MonetType::Real]));
+        assert!(prefers_owned_types([MonetType::HugeInt]));
+        assert!(prefers_owned_types([MonetType::Decimal(19, 2)]));
+        assert!(!prefers_owned_types([MonetType::Decimal(18, 2)]));
         assert!(prefers_owned_types(
             std::iter::repeat_n(MonetType::Real, 9).chain([MonetType::Timestamp])
         ));

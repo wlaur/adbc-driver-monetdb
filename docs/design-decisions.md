@@ -102,10 +102,12 @@ requirements change their premises.
 
 ## Prepared-statement lifetime
 
-- Positional prepared statements are cached per connection under their exact SQL text. A
-  128-entry LRU bounds session memory, while shared entry leases prevent eviction from
-  deallocating a plan still used by a live statement. Statement destruction remains nonblocking;
-  the cache or session owns server cleanup.
+- Positional prepared statements are cached per connection under SQL normalized by trimming
+  surrounding whitespace and trailing semicolons. A 128-entry least-recently-used cache bounds
+  session memory; lookups update a monotonic use counter in constant time, while eviction scans
+  only when inserting a new entry. Shared entry leases prevent eviction from deallocating a plan
+  still used by a live statement. Statement destruction remains nonblocking; the cache or session
+  owns server cleanup.
 - Commit and rollback preserve MonetDB prepared statements. Schema-changing SQL observed on the
   same connection clears the cache before execution. MonetDB can also silently discard a plan
   after DDL from another session; an `EXEC: PREPARED Statement missing` response evicts that exact
@@ -129,12 +131,25 @@ requirements change their premises.
   partial batch to recover; multi-row batches retain the atomic scope. The other structural
   regression was a one-row login reply window, which forced every result of at least two rows into
   an extra fetch. The driver now keeps MonetDB's normal 100-row inline window.
+- Multi-row ExecuteUpdate keeps its atomic transaction/savepoint but sends rendered `EXECUTE`
+  statements in bounded batches of at most 1,024 rows or 8 MiB. The first row remains an
+  individual stale-plan probe so a missing prepared statement can be retried without buffering
+  an arbitrary Arrow stream. On the local 4,096-row benchmark, batching reduced median time from
+  2,480.9 ms for repeated ExecuteQuery calls to 224.2 ms for ExecuteUpdate (11.1×); the public
+  `test_local_executemany_batching` benchmark reproduces the workload.
 - A short row-oriented SELECT may still trail pymonetdb after those protocol round trips are
   removed. pymonetdb constructs Python tuples directly; ADBC constructs a canonical Arrow stream
   across the native boundary and the driver manager then converts it to tuples. That fixed
   schema/buffer/FFI cost cannot be removed without making the DB-API path semantically different
   from the Arrow-native result. `tests/test_local_benchmark.py` keeps the comparison reproducible,
   while performance claims for columnar consumers continue to use Arrow-native fetches.
+- The local point-query benchmark now records the protocol floor and parameterized lookup
+  separately. A five-round, 500-call run measured 110.0 µs versus 107.4 µs for `SELECT 1` and
+  253.2 µs versus 242.6 µs for the parameterized indexed lookup (ADBC versus pymonetdb, a 1.04
+  ratio). This is within the review's 1.05 threshold for recoverable fixed overhead.
+- Wide DECIMAL and HUGEINT result buffers use Arrow's byte-identical little-endian `i128` layout
+  directly after a precision/sentinel validation scan. Unaligned or big-endian buffers retain the
+  checked copying path.
 
 ## Measured optimization rejections
 
