@@ -61,6 +61,13 @@ requirements change their premises.
   change from lazy serial columns improved tall-batch ingest by 8.2–8.5% for about 4.4 MB more
   peak RSS. Use a smaller `adbc.monetdb.write_batch_rows` when a workload values memory over that
   throughput rather than serializing every workload by default.
+- A single-window append inside a caller-managed transaction executes directly because it maps to
+  one atomic MonetDB `COPY` statement. Wrapping every append in a savepoint caused transaction
+  commit to retain and materialize disproportionate storage: 24 appends of 4,096 rows by 786
+  `REAL` columns exhausted a 2 GiB database-farm cap for about 309 MiB of logical input. Direct
+  appends and a single multi-batch reader both completed at about 642 MiB. Multi-window streams
+  retain one operation-level savepoint. Server errors preserve their SQLSTATE and abort the
+  caller transaction until rollback, matching MonetDB's normal DB-API transaction behavior.
 - The prefetch worker fetches complete raw `Xexportbin` frames while the caller decodes the
   previous frame. A worker that both fetches and decodes would serialize those phases and lose the
   overlap.

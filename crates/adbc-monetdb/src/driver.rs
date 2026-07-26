@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fmt,
     num::NonZeroUsize,
     ops::Range,
@@ -1891,7 +1891,7 @@ impl MonetdbStatement {
     }
 
     fn ingest(&mut self) -> Result<Option<i64>> {
-        let mut reader = self
+        let reader = self
             .bound
             .take()
             .ok_or_else(|| error("no Arrow data is bound", Status::InvalidState))?;
@@ -1986,6 +1986,14 @@ impl MonetdbStatement {
                 ""
             }
         );
+        let (mut reader, single_copy_stream) = if matches!(
+            mode,
+            "adbc.ingest.mode.append" | "adbc.ingest.mode.create_append"
+        ) {
+            inspect_ingest_stream(reader, self.write_batch_rows)
+        } else {
+            (reader, false)
+        };
 
         let connection = lock_connection(&self.connection)?;
         if temporary
@@ -2004,7 +2012,21 @@ impl MonetdbStatement {
                 Status::InvalidState,
             ));
         }
-        let (mut cursor, atomic_scope) = begin_atomic(&connection, "ingest", self.timeouts)?;
+        let append_to_existing = mode == "adbc.ingest.mode.append"
+            || (mode == "adbc.ingest.mode.create_append"
+                && table_exists(
+                    &connection,
+                    if temporary { Some("tmp") } else { schema_name },
+                    table,
+                    self.timeouts,
+                )?);
+        let caller_scope = if append_to_existing && single_copy_stream {
+            CallerTransactionScope::Direct
+        } else {
+            CallerTransactionScope::Savepoint
+        };
+        let (mut cursor, atomic_scope) =
+            begin_atomic(&connection, "ingest", caller_scope, self.timeouts)?;
         let result = (|| {
             match mode {
                 "adbc.ingest.mode.create" => cursor.execute(&create).map_err(map_cursor_error)?,
@@ -2136,6 +2158,33 @@ fn encode_batch_rows(batch_rows: usize, configured_rows: Option<usize>) -> usize
         .min(MAX_ENCODE_BATCH_ROWS)
 }
 
+fn inspect_ingest_stream(
+    mut reader: Box<dyn RecordBatchReader + Send>,
+    configured_rows: Option<usize>,
+) -> (Box<dyn RecordBatchReader + Send>, bool) {
+    let schema = reader.schema();
+    let mut prefetched = VecDeque::new();
+    let mut single_copy = true;
+    if let Some(first) = reader.next() {
+        single_copy = first.as_ref().is_ok_and(|batch| {
+            batch.num_rows() <= encode_batch_rows(batch.num_rows(), configured_rows)
+        });
+        prefetched.push_back(first);
+        if let Some(second) = reader.next() {
+            single_copy = false;
+            prefetched.push_back(second);
+        }
+    }
+    (
+        Box::new(PrefetchedRecordBatchReader {
+            schema,
+            prefetched,
+            reader,
+        }),
+        single_copy,
+    )
+}
+
 fn validate_record_batch(batch: &RecordBatch) -> Result<()> {
     for (index, column) in batch.columns().iter().enumerate() {
         column.to_data().validate_full().map_err(|value| {
@@ -2146,6 +2195,26 @@ fn validate_record_batch(batch: &RecordBatch) -> Result<()> {
         })?;
     }
     Ok(())
+}
+
+struct PrefetchedRecordBatchReader {
+    schema: SchemaRef,
+    prefetched: VecDeque<std::result::Result<RecordBatch, ArrowError>>,
+    reader: Box<dyn RecordBatchReader + Send>,
+}
+
+impl Iterator for PrefetchedRecordBatchReader {
+    type Item = std::result::Result<RecordBatch, ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.prefetched.pop_front().or_else(|| self.reader.next())
+    }
+}
+
+impl RecordBatchReader for PrefetchedRecordBatchReader {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
 }
 
 fn validate_append_schema(
@@ -3148,15 +3217,23 @@ fn execute_update_script(
 
 enum AtomicScope {
     Autocommit,
+    CallerTransaction,
     Savepoint {
         name: String,
         retain_until_transaction_end: bool,
     },
 }
 
+#[derive(Clone, Copy)]
+enum CallerTransactionScope {
+    Direct,
+    Savepoint,
+}
+
 fn begin_atomic(
     connection: &monetdb::Connection,
     purpose: &str,
+    caller_scope: CallerTransactionScope,
     timeouts: Timeouts,
 ) -> Result<(monetdb::Cursor, AtomicScope)> {
     let originally_autocommit = connection
@@ -3171,11 +3248,14 @@ fn begin_atomic(
         cursor.set_timeouts(timeouts);
         return Ok((cursor, AtomicScope::Autocommit));
     }
+    let mut cursor = connection.cursor();
+    cursor.set_timeouts(timeouts);
+    if matches!(caller_scope, CallerTransactionScope::Direct) {
+        return Ok((cursor, AtomicScope::CallerTransaction));
+    }
     let retain_until_transaction_end =
         delete_on_commit_temporary_table_exists(connection, None, timeouts)?;
     let savepoint = savepoint_name(purpose);
-    let mut cursor = connection.cursor();
-    cursor.set_timeouts(timeouts);
     cursor
         .execute(&format!("SAVEPOINT {savepoint}"))
         .map_err(map_cursor_error)?;
@@ -3186,6 +3266,30 @@ fn begin_atomic(
             retain_until_transaction_end,
         },
     ))
+}
+
+fn table_exists(
+    connection: &monetdb::Connection,
+    schema_name: Option<&str>,
+    table_name: &str,
+    timeouts: Timeouts,
+) -> Result<bool> {
+    let schema_filter = schema_name
+        .map(metadata::raw_string_literal)
+        .transpose()?
+        .unwrap_or_else(|| "current_schema".to_owned());
+    let table = metadata::raw_string_literal(table_name)?;
+    let mut cursor = connection.cursor();
+    cursor.set_timeouts(timeouts);
+    cursor
+        .execute(&format!(
+            "SELECT CAST(COUNT(*) AS VARCHAR(32)) \
+             FROM sys.tables AS t \
+             JOIN sys.schemas AS s ON s.id = t.schema_id \
+             WHERE s.name = {schema_filter} AND t.name = {table}"
+        ))
+        .map_err(map_cursor_error)?;
+    count_query_result(&mut cursor, "table")
 }
 
 fn delete_on_commit_temporary_table_exists(
@@ -3209,9 +3313,13 @@ fn delete_on_commit_temporary_table_exists(
              WHERE s.name = 'tmp' AND t.commit_action = 1{table_filter}"
         ))
         .map_err(map_cursor_error)?;
+    count_query_result(&mut cursor, "temporary table")
+}
+
+fn count_query_result(cursor: &mut monetdb::Cursor, object: &str) -> Result<bool> {
     if !cursor.next_row().map_err(map_cursor_error)? {
         return Err(error(
-            "temporary table metadata query returned no row",
+            format!("{object} metadata query returned no row"),
             Status::InvalidData,
         ));
     }
@@ -3222,7 +3330,7 @@ fn delete_on_commit_temporary_table_exists(
         .parse::<u64>()
         .map_err(|value| {
             error(
-                format!("invalid temporary table count: {value}"),
+                format!("invalid {object} count: {value}"),
                 Status::InvalidData,
             )
         })?;
@@ -3259,6 +3367,7 @@ fn finish_atomic<T>(
         Ok(value) => {
             let finalize = match &scope {
                 AtomicScope::Autocommit => cursor.execute("COMMIT"),
+                AtomicScope::CallerTransaction => Ok(()),
                 AtomicScope::Savepoint {
                     name,
                     retain_until_transaction_end,
@@ -3278,6 +3387,7 @@ fn finish_atomic<T>(
     if result.is_err() {
         let recovery = match &scope {
             AtomicScope::Autocommit => cursor.execute("ROLLBACK"),
+            AtomicScope::CallerTransaction => Ok(()),
             AtomicScope::Savepoint {
                 name,
                 retain_until_transaction_end,
@@ -3345,7 +3455,12 @@ fn execute_updates_atomic_from_first(
 ) -> Result<Option<i64>> {
     let first = current_bound_query(connection, &first, timeouts)?;
     let connection_guard = lock_connection(connection)?;
-    let (mut cursor, atomic_scope) = begin_atomic(&connection_guard, "parameter_batch", timeouts)?;
+    let (mut cursor, atomic_scope) = begin_atomic(
+        &connection_guard,
+        "parameter_batch",
+        CallerTransactionScope::Savepoint,
+        timeouts,
+    )?;
     if let Err(root) = cursor.execute(&first.sql).map_err(map_cursor_error) {
         let retryable =
             allow_retry && first.prepared.is_some() && prepared_statement_missing(&root);

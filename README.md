@@ -155,7 +155,7 @@ with dbapi.connect(
             StatementOptions.READ_PREFETCH: "true",
         }
     ) as cursor:
-        frame = pl.read_database("SELECT * FROM trades", cursor)
+        df = pl.read_database("SELECT * FROM trades", cursor)
 ```
 
 `polars.read_database(query, connection)` selects ADBC from the supplied DB-API connection or
@@ -182,6 +182,13 @@ a directly managed cursor. The input Arrow stream remains incremental, but colum
 bounded window are encoded eagerly so they can run in parallel. The protocol library's `lazy`
 upload callback still materializes one complete encoded column and serializes encoding with
 network transfer; it is not a byte-streaming encoder.
+
+A single-window append inside an explicit transaction maps directly to one atomic MonetDB
+`COPY` statement. A multi-window Arrow stream uses one savepoint for the complete ingest. For a
+large incremental source, prefer passing one `RecordBatchReader` to one `adbc_ingest` call. If
+MonetDB reports a server error, its DB-API exception and SQLSTATE propagate unchanged; the
+explicit transaction remains aborted until `rollback()`. Autocommit ingestion rolls back its
+internal transaction and restores the connection automatically.
 
 Positional prepared statements are cached per connection by exact SQL text, so consumers such as
 SQLAlchemy can create a fresh cursor for each execution without making MonetDB compile the same
@@ -275,7 +282,7 @@ from sqlalchemy import Integer, bindparam, cast, select
 
 value = cast(bindparam("value", value=21), Integer)
 compiled = select((value + value).label("value")).compile()
-frame = pl.read_database(
+df = pl.read_database(
     str(compiled),
     conn,
     execute_options={"parameters": compiled.params},
@@ -338,7 +345,7 @@ driver does not expand it to `pl.Struct` because one JSON column can contain obj
 scalars, and JSON `null` with different shapes. Applications that know an object schema can opt in:
 
 ```python
-decoded = frame.with_columns(
+decoded = df.with_columns(
     pl.col("payload").str.json_decode(
         dtype=pl.Struct({"id": pl.Int64, "label": pl.String}),
     )
@@ -402,8 +409,8 @@ with dbapi.connect(
     driver="monetdb",
     db_kwargs={"uri": "monetdb://user:password@localhost:50000/db"},
 ) as conn:
-    frame = pl.read_database("SELECT * FROM trades", connection=conn)
-    frame.write_database("trades_copy", connection=conn, engine="adbc")
+    df = pl.read_database("SELECT * FROM trades", connection=conn)
+    df.write_database("trades_copy", connection=conn, engine="adbc")
 ```
 
 The URI-string conveniences `pl.read_database_uri(..., engine="adbc")` and

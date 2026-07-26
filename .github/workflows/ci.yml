@@ -425,6 +425,8 @@ jobs:
         env:
           MDB_DB_ADMIN_PASS: monetdb
           MDB_CREATE_DBS: test
+        options: >-
+          --tmpfs /var/monetdb5/dbfarm:rw,size=4294967296,mode=0777
       monetdb-remote:
         image: monetdb/monetdb:Dec2025-SP3@sha256:a71e6e8c8402beadc51aebf944b465ee5b185c7ae4a9e6808b5d9133ee921786
         ports:
@@ -432,6 +434,8 @@ jobs:
         env:
           MDB_DB_ADMIN_PASS: monetdb
           MDB_CREATE_DBS: remote
+        options: >-
+          --tmpfs /var/monetdb5/dbfarm:rw,size=4294967296,mode=0777
     env:
       MONETDB_TEST_URI: monetdb://monetdb:monetdb@localhost:50000/test
       MONETDB_REMOTE_TEST_URI: monetdb://monetdb:monetdb@localhost:50001/remote
@@ -478,6 +482,8 @@ jobs:
         # NOT from the workspace: the adbc_driver_monetdb source dir at the repo root
         # would shadow the installed wheel on sys.path (no compiled _native there)
         working-directory: ${{ runner.temp }}
+        env:
+          MONETDB_TEST_CONTAINER: ${{ job.services.monetdb.id }}
         shell: bash
         run: |
           test -n "$MONETDB_TEST_URI"
@@ -519,6 +525,8 @@ jobs:
         env:
           MDB_DB_ADMIN_PASS: monetdb
           MDB_CREATE_DBS: test
+        options: >-
+          --tmpfs /var/monetdb5/dbfarm:rw,size=4294967296,mode=0777
     env:
       MONETDB_TEST_URI: monetdb://monetdb:monetdb@localhost:50000/test
     steps:
@@ -557,6 +565,8 @@ jobs:
         env:
           MDB_DB_ADMIN_PASS: monetdb
           MDB_CREATE_DBS: test
+        options: >-
+          --tmpfs /var/monetdb5/dbfarm:rw,size=4294967296,mode=0777
     env:
       MONETDB_TEST_URI: monetdb://monetdb:monetdb@localhost:50000/test
       MONETDB_EXPECTED_SERVER_VERSION: 11.55.1
@@ -603,6 +613,8 @@ jobs:
       - name: Run the suites against the installed minimum-version wheel
         shell: bash
         working-directory: ${{ runner.temp }}
+        env:
+          MONETDB_TEST_CONTAINER: ${{ job.services.monetdb.id }}
         run: |
           wheel=$(find "$GITHUB_WORKSPACE/wheelhouse" -maxdepth 1 -name 'adbc_driver_monetdb-*.whl' -print -quit)
           uv run --isolated --no-project --python 3.13 \
@@ -628,6 +640,8 @@ jobs:
         env:
           MDB_DB_ADMIN_PASS: monetdb
           MDB_CREATE_DBS: test
+        options: >-
+          --tmpfs /var/monetdb5/dbfarm:rw,size=4294967296,mode=0777
     env:
       MONETDB_TEST_URI: monetdb://monetdb:monetdb@localhost:50000/test
     steps:
@@ -679,6 +693,8 @@ jobs:
         run: cargo test --all-features --test ci
       - name: Run the integration suite against the installed ARM64 wheel
         working-directory: ${{ runner.temp }}
+        env:
+          MONETDB_TEST_CONTAINER: ${{ job.services.monetdb.id }}
         shell: bash
         run: |
           test -n "$MONETDB_TEST_URI"
