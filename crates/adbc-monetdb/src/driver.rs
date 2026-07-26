@@ -1988,6 +1988,22 @@ impl MonetdbStatement {
         );
 
         let connection = lock_connection(&self.connection)?;
+        if temporary
+            && matches!(
+                mode,
+                "adbc.ingest.mode.append" | "adbc.ingest.mode.create_append"
+            )
+            && delete_on_commit_temporary_table_exists(&connection, Some(table), self.timeouts)?
+            && connection
+                .server_info()
+                .map_err(map_cursor_error)?
+                .autocommit
+        {
+            return Err(error(
+                "cannot append to a temporary table declared ON COMMIT DELETE ROWS while autocommit is enabled; disable autocommit or declare ON COMMIT PRESERVE ROWS",
+                Status::InvalidState,
+            ));
+        }
         let (mut cursor, atomic_scope) = begin_atomic(&connection, "ingest", self.timeouts)?;
         let result = (|| {
             match mode {
@@ -3132,7 +3148,10 @@ fn execute_update_script(
 
 enum AtomicScope {
     Autocommit,
-    Savepoint(String),
+    Savepoint {
+        name: String,
+        retain_until_transaction_end: bool,
+    },
 }
 
 fn begin_atomic(
@@ -3152,13 +3171,62 @@ fn begin_atomic(
         cursor.set_timeouts(timeouts);
         return Ok((cursor, AtomicScope::Autocommit));
     }
+    let retain_until_transaction_end =
+        delete_on_commit_temporary_table_exists(connection, None, timeouts)?;
     let savepoint = savepoint_name(purpose);
     let mut cursor = connection.cursor();
     cursor.set_timeouts(timeouts);
     cursor
         .execute(&format!("SAVEPOINT {savepoint}"))
         .map_err(map_cursor_error)?;
-    Ok((cursor, AtomicScope::Savepoint(savepoint)))
+    Ok((
+        cursor,
+        AtomicScope::Savepoint {
+            name: savepoint,
+            retain_until_transaction_end,
+        },
+    ))
+}
+
+fn delete_on_commit_temporary_table_exists(
+    connection: &monetdb::Connection,
+    table_name: Option<&str>,
+    timeouts: Timeouts,
+) -> Result<bool> {
+    let table_filter = table_name
+        .map(|table| {
+            metadata::raw_string_literal(table).map(|table| format!(" AND t.name = {table}"))
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let mut cursor = connection.cursor();
+    cursor.set_timeouts(timeouts);
+    cursor
+        .execute(&format!(
+            "SELECT CAST(COUNT(*) AS VARCHAR(32)) \
+             FROM sys.tables AS t \
+             JOIN sys.schemas AS s ON s.id = t.schema_id \
+             WHERE s.name = 'tmp' AND t.commit_action = 1{table_filter}"
+        ))
+        .map_err(map_cursor_error)?;
+    if !cursor.next_row().map_err(map_cursor_error)? {
+        return Err(error(
+            "temporary table metadata query returned no row",
+            Status::InvalidData,
+        ));
+    }
+    let count = cursor
+        .get_str(0)
+        .map_err(map_cursor_error)?
+        .ok_or_else(|| error("temporary table count is NULL", Status::InvalidData))?
+        .parse::<u64>()
+        .map_err(|value| {
+            error(
+                format!("invalid temporary table count: {value}"),
+                Status::InvalidData,
+            )
+        })?;
+    Ok(count != 0)
 }
 
 fn combine_atomic_error<T>(
@@ -3191,8 +3259,15 @@ fn finish_atomic<T>(
         Ok(value) => {
             let finalize = match &scope {
                 AtomicScope::Autocommit => cursor.execute("COMMIT"),
-                AtomicScope::Savepoint(savepoint) => {
-                    cursor.execute(&format!("RELEASE SAVEPOINT {savepoint}"))
+                AtomicScope::Savepoint {
+                    name,
+                    retain_until_transaction_end,
+                } => {
+                    if *retain_until_transaction_end {
+                        Ok(())
+                    } else {
+                        cursor.execute(&format!("RELEASE SAVEPOINT {name}"))
+                    }
                 }
             };
             finalize.map(|()| value).map_err(map_cursor_error)
@@ -3203,9 +3278,17 @@ fn finish_atomic<T>(
     if result.is_err() {
         let recovery = match &scope {
             AtomicScope::Autocommit => cursor.execute("ROLLBACK"),
-            AtomicScope::Savepoint(savepoint) => cursor
-                .execute(&format!("ROLLBACK TO SAVEPOINT {savepoint}"))
-                .and_then(|()| cursor.execute(&format!("RELEASE SAVEPOINT {savepoint}"))),
+            AtomicScope::Savepoint {
+                name,
+                retain_until_transaction_end,
+            } => {
+                let rollback = cursor.execute(&format!("ROLLBACK TO SAVEPOINT {name}"));
+                if *retain_until_transaction_end {
+                    rollback
+                } else {
+                    rollback.and_then(|()| cursor.execute(&format!("RELEASE SAVEPOINT {name}")))
+                }
+            }
         };
         result = combine_atomic_error(result, recovery, "transaction recovery");
     }
