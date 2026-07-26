@@ -243,7 +243,7 @@ close that connection and open another one before issuing more work.
 Client information is sent at login by default. The `client` value in
 [`sys.sessions`](https://www.monetdb.org/documentation-Dec2025/user-guide/sql-catalog/users-roles-privileges-sessions/)
 identifies this driver and its protocol library, for example
-`adbc_driver_monetdb 0.8.5 / monetdb-rust 0.2.2-wlaur.1`. The Python shim uses the basename of
+`adbc_driver_monetdb 0.8.6 / monetdb-rust 0.2.2-wlaur.1`. The Python shim uses the basename of
 `sys.argv[0]` as the default `application`. Hostname and process id are also sent by default, as
 they are by pymonetdb and libmapi; use `client_info=false` if that host metadata should not leave
 the client.
@@ -455,7 +455,8 @@ docker compose -f compose.yaml up -d
 MONETDB_TEST_URI=monetdb://monetdb:monetdb@localhost:50000/test \
     uv run pytest -m "integration and not local_only"
 
-# manual ~30 GiB logical float32 ingest (8M rows x 1,000 columns, 100k batches):
+# manual ~30 GiB logical float32 ingest (8M rows x 1,000 columns, 100k batches);
+# reports final and peak dbfarm growth plus peak filesystem growth:
 MONETDB_RUN_LOCAL_BENCHMARK=1 \
 MONETDB_TEST_URI=monetdb://monetdb:monetdb@localhost:50000/test \
     uv run pytest tests/test_local_benchmark.py -m local_only -q -s
