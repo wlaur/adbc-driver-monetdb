@@ -146,7 +146,7 @@ def test_execute_query_propagates_known_dml_row_counts(monetdb_uri: str) -> None
             statement.set_sql_query(f"SELECT value FROM {table}")
             stream, rows_affected = statement.execute_query()
             stream.release()
-            assert rows_affected == -1
+            assert rows_affected == 1
         finally:
             cursor.execute(f"DROP TABLE IF EXISTS {table}")
 

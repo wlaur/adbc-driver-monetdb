@@ -104,7 +104,8 @@ class _BlackHoleServer:
                 binary = "BINARY=1:" if self._advertise_binary else ""
                 challenge = f"salt:mserver:9:SHA512:{self._endian}:SHA512:sql=9:{binary}".encode()
                 _write_message(stream, challenge)
-                _read_message(stream)
+                login = _read_message(stream)
+                assert b"reply_size=" not in login
                 _write_message(stream, b"=OK")
                 if self._endian != "LIT" or not self._advertise_binary:
                     while stream.recv(1):
@@ -185,7 +186,8 @@ class _FailureServer:
                 stream.settimeout(5)
                 assert _read_exact(stream, 8) == bytes(8)
                 _write_message(stream, b"salt:mserver:9:SHA512:LIT:SHA512:sql=9:BINARY=1:")
-                _read_message(stream)
+                login = _read_message(stream)
+                assert b"reply_size=" not in login
                 _write_message(stream, b"=OK")
                 assert b"sys.environment" in _read_message(stream)
                 _write_message(
@@ -387,7 +389,7 @@ def test_midstream_error_preserves_sqlstate_and_all_diagnostics() -> None:
             cursor.execute("SELECT value")
 
 
-def test_closing_prefetched_reader_cancels_a_stalled_fetch() -> None:
+def test_closing_prefetched_reader_detaches_a_stalled_fetch() -> None:
     with (
         _FailureServer("stream_stall") as server,
         dbapi.connect(server.uri, autocommit=True) as connection,
@@ -404,7 +406,8 @@ def test_closing_prefetched_reader_cancels_a_stalled_fetch() -> None:
 
         started = monotonic()
         reader.close()
-        assert monotonic() - started < 5
+        assert monotonic() - started < 1
+        cursor.adbc_cancel()
         with pytest.raises(adbc_driver_manager.ProgrammingError):
             cursor.execute("SELECT value")
 

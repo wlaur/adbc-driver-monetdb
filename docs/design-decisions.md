@@ -19,12 +19,14 @@ requirements change their premises.
   results remain explicitly unsupported. Multi-connection range-partitioned reads would be a new
   feature with transaction-consistency semantics, not an implementation detail of the current
   reader.
-- The driver does not fall back to text-protocol result sets. Unsupported binary representations
-  return bounded errors.
+- Results that fit the negotiated inline reply prefix are decoded from that initial MAPI response.
+  Server-resident results use `Xexportbin`; the driver does not issue a second text query as a
+  fallback when a binary representation is unsupported.
 - Optional XDBC fields are not advertised without backend semantics to populate them.
-- Statement destruction remains nonblocking. Callers use cancellation or close the result reader
-  to interrupt network work; prefetched-reader teardown performs its own bounded grace period and
-  cancellation.
+- Statement destruction remains nonblocking. Explicit cancellation interrupts network work and
+  closes the session. Closing a prefetched reader drops its receiver, waits for a bounded grace
+  period, and then detaches a still-running fetch so abandoning a result does not implicitly
+  destroy the session.
 - The driver repository does not maintain a separate changelog. Pull requests, Git history, and
   generated GitHub release notes are the change record.
 - DBC libraries are built directly for each target rather than extracted from Python wheels.
@@ -63,7 +65,9 @@ requirements change their premises.
   previous frame. A worker that both fetches and decodes would serialize those phases and lose the
   overlap.
 - Prefetch can hold about three windows: one decoding, one buffered, and one in flight. Early
-  abandonment can therefore waste up to two fetched windows.
+  abandonment can therefore waste up to two fetched windows. A detached final fetch temporarily
+  retains the connection's protocol operation lock; the next statement waits for that bounded
+  server response or the configured read/operation timeout.
 - MonetDB currently emits plain NUL-terminated strings for `Xexportbin`, not string backreferences.
   The decoder keeps its tested backreference path for forward compatibility, but the current
   two-phase string decoder is optimized for literal output.
@@ -106,9 +110,31 @@ requirements change their premises.
   same connection clears the cache before execution. MonetDB can also silently discard a plan
   after DDL from another session; an `EXEC: PREPARED Statement missing` response evicts that exact
   entry and retries once when doing so cannot roll back user work.
+- MonetDB aborts an explicit transaction when `EXECUTE` reports a missing prepared statement, so
+  the driver retries only in autocommit or inside its own multi-row savepoint. A one-row bound DML
+  statement executes directly to avoid three transaction-control round trips; a rare stale-plan
+  error in an explicit transaction follows the normal database-error contract and requires the
+  caller to roll back.
+- `PREPARE` can narrow declared decimal widths from column statistics. The driver restores
+  declared catalog types when MonetDB supplies an unambiguous table/column origin. Current server
+  metadata omits the origin schema, so identical table and column names in multiple schemas are
+  deliberately left at the `PREPARE` type instead of guessing. Exact restoration in that case
+  would require server metadata or a SQL parser, and the catalog lookup is the necessary extra
+  round trip for accurate unambiguous declarations.
 - On the documented 200-query workload, new-cursor execution fell from 1.944 to 0.342 ms per
   statement. Cache lookup, LRU maintenance, and invalidation bookkeeping added about 0.010 ms over
   the cache-only path and kept the result below the 0.50 ms acceptance threshold.
+- The review's remaining repeated-DML regression was three wire round trips caused by wrapping
+  every parameter batch in a savepoint. One-row DML now executes directly, because there is no
+  partial batch to recover; multi-row batches retain the atomic scope. The other structural
+  regression was a one-row login reply window, which forced every result of at least two rows into
+  an extra fetch. The driver now keeps MonetDB's normal 100-row inline window.
+- A short row-oriented SELECT may still trail pymonetdb after those protocol round trips are
+  removed. pymonetdb constructs Python tuples directly; ADBC constructs a canonical Arrow stream
+  across the native boundary and the driver manager then converts it to tuples. That fixed
+  schema/buffer/FFI cost cannot be removed without making the DB-API path semantically different
+  from the Arrow-native result. `tests/test_local_benchmark.py` keeps the comparison reproducible,
+  while performance claims for columnar consumers continue to use Arrow-native fetches.
 
 ## Measured optimization rejections
 

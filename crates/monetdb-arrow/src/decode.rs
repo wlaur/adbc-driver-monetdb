@@ -204,37 +204,7 @@ pub fn prefers_owned_frame(columns: &[ResultColumn]) -> bool {
 pub fn owned_frame_capacity(columns: &[ResultColumn], rows: usize) -> Option<usize> {
     let mut capacity = 128usize;
     for column in columns {
-        let width = match column.sql_type() {
-            MonetType::Bool | MonetType::TinyInt => 1,
-            MonetType::SmallInt => 2,
-            MonetType::Int | MonetType::Real | MonetType::MonthInterval | MonetType::Date => 4,
-            MonetType::BigInt
-            | MonetType::Oid
-            | MonetType::Double
-            | MonetType::DayInterval
-            | MonetType::SecInterval
-            | MonetType::Time
-            | MonetType::TimeTz => 8,
-            MonetType::Timestamp | MonetType::TimestampTz => 12,
-            MonetType::HugeInt | MonetType::Uuid => 16,
-            MonetType::Decimal(precision, _) => match precision {
-                1..=2 => 1,
-                3..=4 => 2,
-                5..=9 => 4,
-                10..=18 => 8,
-                19..=38 => 16,
-                _ => return None,
-            },
-            MonetType::Varchar(_)
-            | MonetType::Blob
-            | MonetType::Url
-            | MonetType::Inet
-            | MonetType::Inet4
-            | MonetType::Inet6
-            | MonetType::Json
-            | MonetType::Geometry
-            | MonetType::Xml => return None,
-        };
+        let width = crate::wire::fixed_wire_width(*column.sql_type())?;
         capacity = capacity
             .checked_add(31)?
             .checked_add(rows.checked_mul(width)?)?;
@@ -249,27 +219,30 @@ fn prefers_owned_types(types: impl IntoIterator<Item = MonetType>) -> bool {
     let mut adoptable_bytes = 0usize;
     let mut frame_bytes = 0usize;
     for data_type in types {
-        let (width, adoptable) = match data_type {
-            MonetType::Bool | MonetType::TinyInt => (1, data_type == MonetType::TinyInt),
-            MonetType::SmallInt => (2, true),
-            MonetType::Int | MonetType::Real | MonetType::MonthInterval => (4, true),
-            MonetType::BigInt
+        let width = match crate::wire::fixed_wire_width(data_type) {
+            Some(width) => width,
+            None => return false,
+        };
+        let adoptable = match data_type {
+            MonetType::TinyInt
+            | MonetType::SmallInt
+            | MonetType::Int
+            | MonetType::Real
+            | MonetType::MonthInterval
+            | MonetType::BigInt
             | MonetType::Oid
             | MonetType::Double
             | MonetType::DayInterval
-            | MonetType::SecInterval => (8, true),
-            MonetType::HugeInt | MonetType::Uuid => (16, false),
-            MonetType::Decimal(precision, _) => match precision {
-                1..=2 => (1, false),
-                3..=4 => (2, false),
-                5..=9 => (4, false),
-                10..=18 => (8, false),
-                19..=38 => (16, false),
-                _ => return false,
-            },
-            MonetType::Time | MonetType::TimeTz => (8, false),
-            MonetType::Date => (4, false),
-            MonetType::Timestamp | MonetType::TimestampTz => (12, false),
+            | MonetType::SecInterval => true,
+            MonetType::Bool
+            | MonetType::HugeInt
+            | MonetType::Uuid
+            | MonetType::Decimal(_, _)
+            | MonetType::Time
+            | MonetType::TimeTz
+            | MonetType::Date
+            | MonetType::Timestamp
+            | MonetType::TimestampTz => false,
             MonetType::Varchar(_)
             | MonetType::Blob
             | MonetType::Url
@@ -278,7 +251,7 @@ fn prefers_owned_types(types: impl IntoIterator<Item = MonetType>) -> bool {
             | MonetType::Inet6
             | MonetType::Json
             | MonetType::Geometry
-            | MonetType::Xml => return false,
+            | MonetType::Xml => unreachable!("variable-width types were handled above"),
         };
         frame_bytes = frame_bytes.saturating_add(width);
         if adoptable {

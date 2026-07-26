@@ -6,7 +6,7 @@ members = ["crates/monetdb-arrow", "crates/adbc-monetdb"]
 exclude = ["monetdb-rust"]
 
 [workspace.package]
-version = "0.8.3"
+version = "0.8.4"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/wlaur/adbc-driver-monetdb"
@@ -22,7 +22,7 @@ arrow-buffer = "58"
 arrow-schema = "58"
 chrono = "0.4"
 memchr = "2"
-monetdb = { path = "monetdb-rust", features = ["rustls"] }
+monetdb = { path = "monetdb-rust" }
 monetdb-arrow = { path = "crates/monetdb-arrow" }
 pyo3 = "0.29"
 percent-encoding = "2"

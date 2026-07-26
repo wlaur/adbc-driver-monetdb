@@ -597,7 +597,9 @@ def test_cached_prepared_statement_recovers_after_same_connection_ddl(
 
 
 @pytest.mark.integration
-def test_cached_prepared_statement_retries_external_ddl_once(monetdb_uri: str) -> None:
+def test_cached_prepared_select_survives_external_ddl_when_server_keeps_plan(
+    monetdb_uri: str,
+) -> None:
     table = "prepared_cache_external_ddl"
     query = f"SELECT value FROM {table} WHERE id = ?"
     with (
@@ -626,7 +628,7 @@ def test_cached_prepared_statement_retries_external_ddl_once(monetdb_uri: str) -
 
 
 @pytest.mark.integration
-def test_cached_prepared_dml_recovers_external_ddl_in_transaction(
+def test_cached_prepared_dml_survives_external_ddl_when_server_keeps_plan(
     monetdb_uri: str,
 ) -> None:
     table = "prepared_cache_external_dml"
@@ -653,6 +655,20 @@ def test_cached_prepared_dml_recovers_external_ddl_in_transaction(
             with owner.cursor() as cursor:
                 cursor.execute(f"DROP TABLE IF EXISTS {table}")
                 owner.commit()
+
+
+@pytest.mark.integration
+def test_missing_prepared_statement_aborts_explicit_transaction(monetdb_uri: str) -> None:
+    with dbapi.connect(monetdb_uri) as conn, conn.cursor() as cursor:
+        cursor.execute("SELECT 1")
+        assert cursor.fetchone() == (1,)
+        with pytest.raises(adbc_driver_manager.ProgrammingError, match="PREPARED Statement missing"):
+            cursor.execute("EXECUTE 999999999()")
+        with pytest.raises(adbc_driver_manager.ProgrammingError, match="aborted"):
+            cursor.execute("SELECT 2")
+        conn.rollback()
+        cursor.execute("SELECT 3")
+        assert cursor.fetchone() == (3,)
 
 
 @pytest.mark.integration

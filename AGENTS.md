@@ -92,7 +92,7 @@ covers the conventions that are easy to get wrong.
 ## CI, branch protection, release
 
 - `main` takes pull requests only (0 approvals required, `enforce_admins` on — applies
-  to everyone): branch → PR → all 19 required checks green → merge. Delete merged
+  to everyone): branch → PR → every configured required check green → merge. Delete merged
   branches.
 - Required status checks are matched by exact job name; renaming a job in
   `.github/workflows/ci.yml` requires updating the branch-protection rule in the same

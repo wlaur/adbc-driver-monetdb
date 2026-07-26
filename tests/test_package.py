@@ -63,6 +63,8 @@ def test_dbapi_module_surface() -> None:
         converted = dbapi.Binary(value)
         assert type(converted) is bytes
         assert converted == b"\x00binary"
+    with pytest.raises(TypeError):
+        dbapi.Binary("not bytes")  # pyright: ignore[reportArgumentType]
     assert dbapi.Connection is manager_dbapi.Connection
     assert dbapi.Error is manager_dbapi.Error
     assert adbc_driver_monetdbs.ENTRYPOINT == adbc_driver_monetdb.ENTRYPOINT

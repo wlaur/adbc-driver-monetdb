@@ -43,6 +43,7 @@ const MAX_ENCODE_BATCH_ROWS: usize = 131_072;
 const PREPARED_CACHE_CAPACITY: usize = 128;
 const PREFETCH_DROP_GRACE: Duration = Duration::from_millis(250);
 const METADATA_REPLY_ROWS: usize = 1024;
+const INLINE_REPLY_ROWS: i64 = 100;
 const READ_BATCH_ROWS_OPTION: &str = "adbc.monetdb.read_batch_rows";
 const READ_PREFETCH_OPTION: &str = "adbc.monetdb.read_prefetch";
 const WRITE_BATCH_ROWS_OPTION: &str = "adbc.monetdb.write_batch_rows";
@@ -348,16 +349,45 @@ fn unknown_option(key: &str) -> Error {
     error(format!("unknown or unset option '{key}'"), Status::NotFound)
 }
 
+fn quote_raw_string(value: &str) -> String {
+    format!("R'{}'", value.replace('\'', "''"))
+}
+
 fn map_display(error: impl fmt::Display, status: Status) -> Error {
     Error::with_message_and_status(error.to_string(), status)
 }
 
-fn lock_connection(
-    connection: &Arc<Mutex<monetdb::Connection>>,
-) -> Result<MutexGuard<'_, monetdb::Connection>> {
-    Ok(connection
+struct DriverConnection {
+    inner: Mutex<monetdb::Connection>,
+    pending_deallocations: Mutex<Vec<u64>>,
+}
+
+impl DriverConnection {
+    fn new(connection: monetdb::Connection) -> Self {
+        Self {
+            inner: Mutex::new(connection),
+            pending_deallocations: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+type SharedConnection = Arc<DriverConnection>;
+
+fn lock_connection(connection: &SharedConnection) -> Result<MutexGuard<'_, monetdb::Connection>> {
+    let connection_guard = connection
+        .inner
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner))
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let pending = connection
+        .pending_deallocations
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .drain(..)
+        .collect::<Vec<_>>();
+    for id in pending {
+        connection_guard.try_deallocate(id);
+    }
+    Ok(connection_guard)
 }
 
 fn map_cursor_error(value: CursorError) -> Error {
@@ -702,10 +732,10 @@ impl Database for MonetdbDatabase {
                 ));
             }
         }
-        // A reply size of one minimizes the inline text prefix. Multi-row results remain open
-        // for Xexportbin; a complete scalar row is decoded directly.
+        // Small results are cheapest when MonetDB returns them inline. Larger results remain
+        // server-resident and switch to Xexportbin after this prefix.
         parameters
-            .set_replysize(1)
+            .set_replysize(INLINE_REPLY_ROWS)
             .map_err(|value| map_display(value, Status::InvalidArguments))?;
         parameters
             .set_binary("on")
@@ -775,7 +805,7 @@ impl Database for MonetdbDatabase {
         }
 
         let cancel = connection.cancel_handle();
-        let inner = Arc::new(Mutex::new(connection));
+        let inner = Arc::new(DriverConnection::new(connection));
         let current_schema = scalar_string(
             &inner,
             "SELECT current_schema AS \"__adbc_current_schema\"",
@@ -869,7 +899,7 @@ fn uri_without_userinfo(uri: &str) -> Result<String> {
 }
 
 pub struct MonetdbConnection {
-    inner: Arc<Mutex<monetdb::Connection>>,
+    inner: SharedConnection,
     prepared_cache: Arc<Mutex<PreparedCache>>,
     cancel: CancelHandle,
     timeouts: Timeouts,
@@ -888,11 +918,11 @@ struct PreparedEntry {
     id: u64,
     parameters: Schema,
     result: Schema,
-    connection: Weak<Mutex<monetdb::Connection>>,
+    connection: Weak<DriverConnection>,
 }
 
 impl PreparedEntry {
-    fn new(metadata: PreparedMetadata, connection: &Arc<Mutex<monetdb::Connection>>) -> Self {
+    fn new(metadata: PreparedMetadata, connection: &SharedConnection) -> Self {
         Self {
             id: metadata.id,
             parameters: metadata.parameters,
@@ -907,14 +937,20 @@ impl Drop for PreparedEntry {
         let Some(connection) = self.connection.upgrade() else {
             return;
         };
-        match connection.try_lock() {
+        match connection.inner.try_lock() {
             Ok(connection) => {
                 connection.try_deallocate(self.id);
             }
             Err(std::sync::TryLockError::Poisoned(poisoned)) => {
                 poisoned.into_inner().try_deallocate(self.id);
             }
-            Err(std::sync::TryLockError::WouldBlock) => {}
+            Err(std::sync::TryLockError::WouldBlock) => {
+                connection
+                    .pending_deallocations
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(self.id);
+            }
         }
     }
 }
@@ -1276,7 +1312,7 @@ fn parse_bool_option(value: &str) -> Result<bool> {
 }
 
 pub struct MonetdbStatement {
-    connection: Arc<Mutex<monetdb::Connection>>,
+    connection: SharedConnection,
     prepared_cache: SharedPreparedCache,
     cancel: CancelHandle,
     timeouts: Timeouts,
@@ -2258,7 +2294,7 @@ fn prepared_statement_missing(value: &Error) -> bool {
 }
 
 fn current_bound_query(
-    connection: &Arc<Mutex<monetdb::Connection>>,
+    connection: &SharedConnection,
     query: &BoundQuery,
     timeouts: Timeouts,
 ) -> Result<BoundQuery> {
@@ -2296,7 +2332,7 @@ fn current_bound_query(
 }
 
 fn retry_bound_query(
-    connection: &Arc<Mutex<monetdb::Connection>>,
+    connection: &SharedConnection,
     query: &BoundQuery,
     timeouts: Timeouts,
 ) -> Result<BoundQuery> {
@@ -2458,7 +2494,7 @@ struct PreparedMetadata {
 }
 
 fn prepare_cached(
-    connection: &Arc<Mutex<monetdb::Connection>>,
+    connection: &SharedConnection,
     cache: &SharedPreparedCache,
     query: &str,
     parameter_count: usize,
@@ -2488,7 +2524,7 @@ struct PreparedField {
 }
 
 fn prepare_query(
-    connection: &Arc<Mutex<monetdb::Connection>>,
+    connection: &SharedConnection,
     query: &str,
     parameter_count: usize,
     timeouts: Timeouts,
@@ -2497,7 +2533,7 @@ fn prepare_query(
 }
 
 fn prepare_query_allowing_any(
-    connection: &Arc<Mutex<monetdb::Connection>>,
+    connection: &SharedConnection,
     query: &str,
     parameter_count: usize,
     timeouts: Timeouts,
@@ -2506,7 +2542,7 @@ fn prepare_query_allowing_any(
 }
 
 fn prepare_query_inner(
-    connection: &Arc<Mutex<monetdb::Connection>>,
+    connection: &SharedConnection,
     query: &str,
     parameter_count: usize,
     allow_any: bool,
@@ -2697,36 +2733,38 @@ fn restore_declared_result_types(
     }
 
     for field in fields {
-        let (Some(table), Some(column)) = (field.origin_table.as_deref(), field.name.as_deref())
-        else {
-            continue;
-        };
-        let mut candidate = None;
-        let mut ambiguous = false;
-        for ((schema, declared_table, declared_column), data_type) in &declared {
-            if declared_table != table
-                || declared_column != column
-                || field
-                    .origin_schema
-                    .as_deref()
-                    .is_some_and(|origin| origin != schema)
-            {
-                continue;
-            }
-            match candidate {
-                None => candidate = Some(*data_type),
-                Some(previous) if previous == *data_type => {}
-                Some(_) => {
-                    ambiguous = true;
-                    break;
-                }
-            }
-        }
-        if !ambiguous && let Some(data_type) = candidate {
+        if let Some(data_type) = declared_result_type(field, &declared) {
             field.data_type = data_type;
         }
     }
     Ok(())
+}
+
+fn declared_result_type(
+    field: &PreparedField,
+    declared: &HashMap<(String, String, String), MonetType>,
+) -> Option<MonetType> {
+    let (Some(table), Some(column)) = (field.origin_table.as_deref(), field.name.as_deref()) else {
+        return None;
+    };
+    let mut candidate = None;
+    for ((schema, declared_table, declared_column), data_type) in declared {
+        if declared_table != table
+            || declared_column != column
+            || field
+                .origin_schema
+                .as_deref()
+                .is_some_and(|origin| origin != schema)
+        {
+            continue;
+        }
+        match candidate {
+            None => candidate = Some(*data_type),
+            Some(previous) if previous == *data_type => {}
+            Some(_) => return None,
+        }
+    }
+    candidate
 }
 
 fn prepared_monet_type(code: &str, digits: i32, scale: i32) -> Result<MonetType> {
@@ -2762,7 +2800,7 @@ fn prepared_arrow_field(name: String, data_type: &MonetType) -> Result<Field> {
 }
 
 fn query_reader_with_timeouts(
-    connection: &Arc<Mutex<monetdb::Connection>>,
+    connection: &SharedConnection,
     query: &str,
     batch_rows: usize,
     read_prefetch: bool,
@@ -2773,7 +2811,7 @@ fn query_reader_with_timeouts(
 }
 
 fn query_result_with_timeouts(
-    connection: &Arc<Mutex<monetdb::Connection>>,
+    connection: &SharedConnection,
     query: &str,
     batch_rows: usize,
     read_prefetch: bool,
@@ -2797,6 +2835,7 @@ fn query_result_with_timeouts(
     }
     let result = cursor.binary_result().map_err(map_cursor_error)?;
     let total_rows = result.total_rows;
+    let rows_affected = i64::try_from(total_rows).ok();
     if result.is_server_resident()
         && result
             .columns
@@ -2818,31 +2857,29 @@ fn query_result_with_timeouts(
         if rows == 0 {
             return Ok(StatementResult {
                 reader: Box::new(EmptyReader::new(schema_for_columns(&result.columns)?)),
-                rows_affected: None,
+                rows_affected,
             });
         }
         let batch = monetdb_arrow::decode_inline_rows(&mut cursor, &result.columns, rows)
             .map_err(|value| map_display(value, Status::InvalidData))?;
         return Ok(StatementResult {
-            reader: Box::new(SingleBatchReader::new(batch)),
-            rows_affected: None,
+            reader: Box::new(SlicedBatchReader::new(batch, batch_rows)),
+            rows_affected,
         });
     }
     let schema = schema_for_columns(&result.columns)?;
     if total_rows == 0 {
         return Ok(StatementResult {
             reader: Box::new(EmptyReader::new(schema)),
-            rows_affected: None,
+            rows_affected,
         });
     }
     let adopt_frame = monetdb_arrow::prefers_owned_frame(&result.columns);
-    let cancel = connection_guard.cancel_handle();
     drop(connection_guard);
     if read_prefetch && total_rows > batch_rows as u64 {
         return Ok(StatementResult {
             reader: Box::new(PrefetchedBinaryReader::new(
                 cursor,
-                cancel,
                 PrefetchPlan {
                     result_id: result.result_id,
                     columns: result.columns,
@@ -2852,7 +2889,7 @@ fn query_result_with_timeouts(
                     adopt_frame,
                 },
             )?),
-            rows_affected: None,
+            rows_affected,
         });
     }
     Ok(StatementResult {
@@ -2868,7 +2905,7 @@ fn query_result_with_timeouts(
             adopt_frame,
             finished: false,
         }),
-        rows_affected: None,
+        rows_affected,
     })
 }
 
@@ -2951,7 +2988,7 @@ fn validate_unbound_query(query: &str) -> Result<()> {
 }
 
 fn parameter_query_reader(
-    connection: &Arc<Mutex<monetdb::Connection>>,
+    connection: &SharedConnection,
     mut queries: BoundQueryStream,
     batch_rows: usize,
     read_prefetch: bool,
@@ -2977,7 +3014,7 @@ fn parameter_query_reader(
 }
 
 fn bound_query_reader_with_retry(
-    connection: &Arc<Mutex<monetdb::Connection>>,
+    connection: &SharedConnection,
     query: &BoundQuery,
     batch_rows: usize,
     read_prefetch: bool,
@@ -3000,11 +3037,7 @@ fn bound_query_reader_with_retry(
     }
 }
 
-fn scalar_string(
-    connection: &Arc<Mutex<monetdb::Connection>>,
-    query: &str,
-    timeouts: Timeouts,
-) -> Result<String> {
+fn scalar_string(connection: &SharedConnection, query: &str, timeouts: Timeouts) -> Result<String> {
     let mut reader = query_reader_with_timeouts(connection, query, 1, false, timeouts)?;
     let batch = reader
         .next()
@@ -3023,7 +3056,7 @@ fn scalar_string(
 }
 
 fn execute_update(
-    connection: &Arc<Mutex<monetdb::Connection>>,
+    connection: &SharedConnection,
     query: &str,
     timeouts: Timeouts,
 ) -> Result<Option<i64>> {
@@ -3045,7 +3078,7 @@ fn execute_update(
 }
 
 fn execute_update_script(
-    connection: &Arc<Mutex<monetdb::Connection>>,
+    connection: &SharedConnection,
     query: &str,
     timeouts: Timeouts,
 ) -> Result<Option<i64>> {
@@ -3167,18 +3200,41 @@ fn finish_atomic<T>(
 }
 
 fn execute_updates_atomic(
-    connection: &Arc<Mutex<monetdb::Connection>>,
+    connection: &SharedConnection,
     queries: &mut BoundQueryStream,
     timeouts: Timeouts,
 ) -> Result<Option<i64>> {
     let Some(first) = queries.next().transpose()? else {
         return Ok(Some(0));
     };
+    if queries.is_empty()? {
+        return execute_single_bound_update(connection, &first, timeouts);
+    }
     execute_updates_atomic_from_first(connection, queries, first, timeouts, true)
 }
 
+fn execute_single_bound_update(
+    connection: &SharedConnection,
+    query: &BoundQuery,
+    timeouts: Timeouts,
+) -> Result<Option<i64>> {
+    let query = current_bound_query(connection, query, timeouts)?;
+    let can_retry = query.prepared.is_some()
+        && lock_connection(connection)?
+            .server_info()
+            .map_err(map_cursor_error)?
+            .autocommit;
+    match execute_update(connection, &query.sql, timeouts) {
+        Err(value) if can_retry && prepared_statement_missing(&value) => {
+            let retry = retry_bound_query(connection, &query, timeouts)?;
+            execute_update(connection, &retry.sql, timeouts)
+        }
+        result => result,
+    }
+}
+
 fn execute_updates_atomic_from_first(
-    connection: &Arc<Mutex<monetdb::Connection>>,
+    connection: &SharedConnection,
     queries: &mut BoundQueryStream,
     first: BoundQuery,
     timeouts: Timeouts,
@@ -3268,12 +3324,11 @@ struct PrefetchedBinaryReader {
     receiver: Option<std::sync::mpsc::Receiver<BinaryFrameResult>>,
     completion: std::sync::mpsc::Receiver<()>,
     worker: Option<std::thread::JoinHandle<()>>,
-    cancel: CancelHandle,
     finished: bool,
 }
 
 impl PrefetchedBinaryReader {
-    fn new(cursor: monetdb::Cursor, cancel: CancelHandle, plan: PrefetchPlan) -> Result<Self> {
+    fn new(cursor: monetdb::Cursor, plan: PrefetchPlan) -> Result<Self> {
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         let (completion_sender, completion) = std::sync::mpsc::sync_channel(1);
         let worker_columns = plan.columns.clone();
@@ -3314,7 +3369,6 @@ impl PrefetchedBinaryReader {
             receiver: Some(receiver),
             completion,
             worker: Some(worker),
-            cancel,
             finished: false,
         })
     }
@@ -3412,10 +3466,9 @@ impl RecordBatchReader for PrefetchedBinaryReader {
 impl Drop for PrefetchedBinaryReader {
     fn drop(&mut self) {
         self.receiver.take();
-        if let Some(worker) = self.worker.take() {
-            if self.completion.recv_timeout(PREFETCH_DROP_GRACE).is_err() {
-                let _ = self.cancel.cancel();
-            }
+        if let Some(worker) = self.worker.take()
+            && self.completion.recv_timeout(PREFETCH_DROP_GRACE).is_ok()
+        {
             let _ = worker.join();
         }
     }
@@ -3599,7 +3652,7 @@ impl RecordBatchReader for BinaryReader {
 }
 
 struct ParameterQueryReader {
-    connection: Arc<Mutex<monetdb::Connection>>,
+    connection: SharedConnection,
     queries: BoundQueryStream,
     current: Option<Box<dyn RecordBatchReader + Send + 'static>>,
     schema: SchemaRef,
@@ -3690,6 +3743,46 @@ impl Iterator for SingleBatchReader {
 }
 
 impl RecordBatchReader for SingleBatchReader {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+}
+
+struct SlicedBatchReader {
+    batch: RecordBatch,
+    schema: SchemaRef,
+    offset: usize,
+    batch_rows: usize,
+}
+
+impl SlicedBatchReader {
+    fn new(batch: RecordBatch, batch_rows: usize) -> Self {
+        debug_assert!(batch_rows > 0);
+        let schema = batch.schema();
+        Self {
+            batch,
+            schema,
+            offset: 0,
+            batch_rows: batch_rows.max(1),
+        }
+    }
+}
+
+impl Iterator for SlicedBatchReader {
+    type Item = std::result::Result<RecordBatch, ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.offset >= self.batch.num_rows() {
+            return None;
+        }
+        let rows = self.batch_rows.min(self.batch.num_rows() - self.offset);
+        let batch = self.batch.slice(self.offset, rows);
+        self.offset += rows;
+        Some(Ok(batch))
+    }
+}
+
+impl RecordBatchReader for SlicedBatchReader {
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -4154,10 +4247,61 @@ mod tests {
     }
 
     #[test]
+    fn slices_inline_batches_at_the_configured_read_size() {
+        let batch = RecordBatch::try_from_iter([(
+            "value",
+            Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])) as ArrayRef,
+        )])
+        .unwrap();
+        let rows = SlicedBatchReader::new(batch, 2)
+            .map(|batch| batch.unwrap().num_rows())
+            .collect::<Vec<_>>();
+        assert_eq!(rows, [2, 2, 1]);
+    }
+
+    #[test]
     fn maps_legacy_clob_prepare_metadata_to_string() {
         assert_eq!(
             prepared_monet_type("clob", 1024, 0).unwrap(),
             MonetType::Varchar(1024)
+        );
+    }
+
+    #[test]
+    fn declared_type_restoration_never_guesses_across_schemas() {
+        let mut declared = HashMap::from([
+            (
+                ("first".into(), "shared".into(), "value".into()),
+                MonetType::Decimal(10, 2),
+            ),
+            (
+                ("second".into(), "shared".into(), "value".into()),
+                MonetType::Decimal(18, 4),
+            ),
+        ]);
+        let mut field = PreparedField {
+            data_type: MonetType::Decimal(3, 2),
+            undetermined: false,
+            name: Some("value".into()),
+            origin_schema: None,
+            origin_table: Some("shared".into()),
+        };
+        assert_eq!(declared_result_type(&field, &declared), None);
+
+        field.origin_schema = Some("first".into());
+        assert_eq!(
+            declared_result_type(&field, &declared),
+            Some(MonetType::Decimal(10, 2))
+        );
+
+        field.origin_schema = None;
+        declared.insert(
+            ("second".into(), "shared".into(), "value".into()),
+            MonetType::Decimal(10, 2),
+        );
+        assert_eq!(
+            declared_result_type(&field, &declared),
+            Some(MonetType::Decimal(10, 2))
         );
     }
 

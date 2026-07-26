@@ -22,7 +22,7 @@ adbc_ffi.workspace = true
 arrow-array.workspace = true
 arrow-schema.workspace = true
 chrono.workspace = true
-monetdb.workspace = true
+monetdb = { workspace = true, features = ["rustls"] }
 monetdb-arrow.workspace = true
 pyo3 = { workspace = true, optional = true }
 percent-encoding.workspace = true
