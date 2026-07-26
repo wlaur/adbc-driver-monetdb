@@ -116,3 +116,34 @@ def test_single_copy_append_server_error_rolls_back_internal_autocommit_transact
                 assert cursor.fetchall() == [(1,)]
         finally:
             connection.execute("DROP TABLE IF EXISTS ingest_autocommit_error")
+
+
+@pytest.mark.integration
+def test_multi_batch_append_server_error_rolls_back_to_operation_savepoint(
+    monetdb_uri: str,
+) -> None:
+    with dbapi.connect(monetdb_uri, autocommit=True) as setup:
+        setup.execute("DROP TABLE IF EXISTS ingest_stream_error")
+        setup.execute("CREATE TABLE ingest_stream_error(value INT PRIMARY KEY)")
+
+    try:
+        batches = [
+            pa.record_batch({"value": pa.array([2], type=pa.int32())}),
+            pa.record_batch({"value": pa.array([3, 3], type=pa.int32())}),
+        ]
+        reader = pa.RecordBatchReader.from_batches(batches[0].schema, batches)
+        with dbapi.connect(monetdb_uri) as connection, connection.cursor() as cursor:
+            cursor.execute("INSERT INTO ingest_stream_error VALUES (1)")
+            with pytest.raises(adbc_driver_manager.IntegrityError) as caught:
+                cursor.adbc_ingest("ingest_stream_error", reader, mode="append")
+            assert caught.value.status_code == adbc_driver_manager.AdbcStatusCode.INTEGRITY
+            assert caught.value.sqlstate == "40002"
+            cursor.execute("SELECT value FROM ingest_stream_error")
+            assert cursor.fetchall() == [(1,)]
+            connection.commit()
+
+        with dbapi.connect(monetdb_uri, autocommit=True) as audit:
+            assert audit.execute("SELECT value FROM ingest_stream_error").fetchall() == [(1,)]
+    finally:
+        with dbapi.connect(monetdb_uri, autocommit=True) as cleanup:
+            cleanup.execute("DROP TABLE IF EXISTS ingest_stream_error")

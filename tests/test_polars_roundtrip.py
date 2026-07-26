@@ -932,10 +932,19 @@ def test_append_to_delete_on_commit_temporary_table_stays_in_caller_transaction(
         cursor.execute("CREATE LOCAL TEMPORARY TABLE ingest_preserve_on_commit(value BIGINT) ON COMMIT PRESERVE ROWS")
 
         assert cursor.adbc_ingest("ingest_delete_on_commit", df, mode="append", temporary=True) == 3
+        assert (
+            cursor.adbc_ingest(
+                "ingest_delete_on_commit",
+                pl.DataFrame({"value": [4]}),
+                mode="create_append",
+                temporary=True,
+            )
+            == 1
+        )
         assert cursor.adbc_ingest("ingest_preserve_on_commit", df, mode="append", temporary=True) == 3
 
         cursor.execute("SELECT COUNT(*) FROM ingest_delete_on_commit")
-        assert cursor.fetchone() == (3,)
+        assert cursor.fetchone() == (4,)
         cursor.execute("SELECT COUNT(*) FROM ingest_preserve_on_commit")
         assert cursor.fetchone() == (3,)
 
@@ -946,7 +955,7 @@ def test_append_to_delete_on_commit_temporary_table_stays_in_caller_transaction(
                 mode="replace",
             )
         cursor.execute("SELECT COUNT(*) FROM ingest_delete_on_commit")
-        assert cursor.fetchone() == (3,)
+        assert cursor.fetchone() == (4,)
 
         conn.commit()
 
