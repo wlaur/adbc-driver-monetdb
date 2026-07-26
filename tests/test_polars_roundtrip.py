@@ -570,6 +570,18 @@ def test_native_prepared_statements_are_cached_per_connection(monetdb_uri: str) 
 
 
 @pytest.mark.integration
+def test_prepared_cache_normalizes_outer_whitespace_and_semicolons(monetdb_uri: str) -> None:
+    with dbapi.connect(monetdb_uri, autocommit=True) as conn:
+        for query in ["SELECT ? + 100 AS value", "  SELECT ? + 100 AS value;  "]:
+            with conn.cursor() as cursor:
+                cursor.execute(query, (1,))
+                assert cursor.fetchone() == (101,)
+        with conn.cursor() as audit:
+            audit.execute("SELECT COUNT(*) FROM sys.prepared_statements")
+            assert audit.fetchone() == (1,)
+
+
+@pytest.mark.integration
 def test_cached_prepared_statement_recovers_after_same_connection_ddl(
     monetdb_uri: str,
 ) -> None:
@@ -782,6 +794,10 @@ def test_multi_statement_queries_are_rejected_and_update_scripts_are_split_safel
             assert cursor.adbc_statement.execute_update() == 3
             cursor.execute("SELECT value FROM injection_multi_guard ORDER BY value")
             assert cursor.fetchall() == [(1,), (2,), (3,)]
+
+            cursor.adbc_statement.set_sql_query("SELECT ? AS value")
+            cursor.adbc_statement.bind(pa.record_batch({"0": [1, 2, 3]}))
+            assert cursor.adbc_statement.execute_update() == -1
         finally:
             cursor.execute("DROP TABLE IF EXISTS injection_multi_guard")
 
@@ -1100,15 +1116,34 @@ def test_executemany_is_atomic_in_autocommit_mode(monetdb_uri: str) -> None:
     with dbapi.connect(monetdb_uri, autocommit=True) as conn, conn.cursor() as cursor:
         try:
             cursor.execute("CREATE TABLE atomic_rows(value INT PRIMARY KEY)")
-            with pytest.raises(adbc_driver_manager.Error):
+            with pytest.raises(adbc_driver_manager.IntegrityError) as caught:
                 cursor.executemany(
                     "INSERT INTO atomic_rows VALUES (?)",
                     [(1,), (2,), (1,)],
                 )
+            assert caught.value.status_code == adbc_driver_manager.AdbcStatusCode.INTEGRITY
+            assert caught.value.sqlstate == "40002"
             cursor.execute("SELECT COUNT(*) FROM atomic_rows")
             assert cursor.fetchone() == (0,)
+            cursor.execute("INSERT INTO atomic_rows VALUES (3)")
+            cursor.execute("SELECT value FROM atomic_rows")
+            assert cursor.fetchone() == (3,)
         finally:
             cursor.execute("DROP TABLE IF EXISTS atomic_rows")
+
+
+@pytest.mark.integration
+def test_executemany_batches_large_parameter_streams(monetdb_uri: str) -> None:
+    rows = 2_050
+    with dbapi.connect(monetdb_uri, autocommit=True) as conn, conn.cursor() as cursor:
+        try:
+            cursor.execute("CREATE TABLE batched_rows(value INT)")
+            cursor.executemany("INSERT INTO batched_rows VALUES (?)", [(value,) for value in range(rows)])
+            assert cursor.rowcount == rows
+            cursor.execute("SELECT COUNT(*), SUM(value) FROM batched_rows")
+            assert cursor.fetchone() == (rows, rows * (rows - 1) // 2)
+        finally:
+            cursor.execute("DROP TABLE IF EXISTS batched_rows")
 
 
 @pytest.mark.integration

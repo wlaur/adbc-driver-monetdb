@@ -3,7 +3,11 @@
 //! Layouts follow MonetDB's `sql_bincopyconvert.c`, `copybinary.h`, and
 //! `bincopy-backref.rst`.
 
-use std::{collections::HashMap, fmt};
+use std::{
+    collections::HashMap,
+    fmt,
+    net::{Ipv4Addr, Ipv6Addr},
+};
 
 use arrow_array::{
     Array, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
@@ -156,17 +160,7 @@ pub fn sql_type_for_field(field: &Field) -> Result<String, EncodeError> {
 /// `field.data_type()` and `array.data_type()` must describe the same logical
 /// type; extension metadata on `field` selects MonetDB-specific wire types.
 pub fn encode_column(field: &Field, array: &dyn Array) -> Result<Vec<u8>, EncodeError> {
-    if matches!(
-        array.data_type(),
-        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
-    ) && matches!(
-        monet_type_for_field(field)?,
-        MonetType::Inet | MonetType::Inet4 | MonetType::Inet6
-    ) {
-        return Err(EncodeError::UnsupportedMonetType(monet_type_for_field(
-            field,
-        )?));
-    }
+    let monet_type = monet_type_for_field(field)?;
     let mut out = Vec::new();
     if let Some(width) = fixed_wire_width(field, array.data_type())? {
         let bytes = array
@@ -181,6 +175,66 @@ pub fn encode_column(field: &Field, array: &dyn Array) -> Result<Vec<u8>, Encode
                 row: 0,
                 message: "encoded column is too large",
             })?;
+    }
+    match (array.data_type(), monet_type) {
+        (DataType::Utf8, MonetType::Inet4) => {
+            encode_addresses(
+                downcast::<StringArray>(array, DataType::Utf8)?.iter(),
+                &mut out,
+                |value| value.parse::<Ipv4Addr>().map(|address| address.octets()),
+                "value is not a valid IPv4 address",
+            )?;
+            return Ok(out);
+        }
+        (DataType::LargeUtf8, MonetType::Inet4) => {
+            encode_addresses(
+                downcast::<LargeStringArray>(array, DataType::LargeUtf8)?.iter(),
+                &mut out,
+                |value| value.parse::<Ipv4Addr>().map(|address| address.octets()),
+                "value is not a valid IPv4 address",
+            )?;
+            return Ok(out);
+        }
+        (DataType::Utf8View, MonetType::Inet4) => {
+            encode_addresses(
+                downcast::<StringViewArray>(array, DataType::Utf8View)?.iter(),
+                &mut out,
+                |value| value.parse::<Ipv4Addr>().map(|address| address.octets()),
+                "value is not a valid IPv4 address",
+            )?;
+            return Ok(out);
+        }
+        (DataType::Utf8, MonetType::Inet6) => {
+            encode_addresses(
+                downcast::<StringArray>(array, DataType::Utf8)?.iter(),
+                &mut out,
+                |value| value.parse::<Ipv6Addr>().map(|address| address.octets()),
+                "value is not a valid IPv6 address",
+            )?;
+            return Ok(out);
+        }
+        (DataType::LargeUtf8, MonetType::Inet6) => {
+            encode_addresses(
+                downcast::<LargeStringArray>(array, DataType::LargeUtf8)?.iter(),
+                &mut out,
+                |value| value.parse::<Ipv6Addr>().map(|address| address.octets()),
+                "value is not a valid IPv6 address",
+            )?;
+            return Ok(out);
+        }
+        (DataType::Utf8View, MonetType::Inet6) => {
+            encode_addresses(
+                downcast::<StringViewArray>(array, DataType::Utf8View)?.iter(),
+                &mut out,
+                |value| value.parse::<Ipv6Addr>().map(|address| address.octets()),
+                "value is not a valid IPv6 address",
+            )?;
+            return Ok(out);
+        }
+        (DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View, MonetType::Inet) => {
+            return Err(EncodeError::UnsupportedMonetType(MonetType::Inet));
+        }
+        _ => {}
     }
     macro_rules! signed {
         ($array:ty, $type:ty, $variant:expr) => {{
@@ -292,6 +346,31 @@ pub fn encode_column(field: &Field, array: &dyn Array) -> Result<Vec<u8>, Encode
         data_type => return Err(EncodeError::Unsupported(data_type.clone())),
     }
     Ok(out)
+}
+
+fn encode_addresses<'a, const WIDTH: usize, E>(
+    values: impl Iterator<Item = Option<&'a str>>,
+    out: &mut Vec<u8>,
+    parse: impl Fn(&str) -> Result<[u8; WIDTH], E>,
+    invalid_message: &'static str,
+) -> Result<(), EncodeError> {
+    for (row, value) in values.enumerate() {
+        let octets = match value {
+            None => [0; WIDTH],
+            Some(value) => parse(value).map_err(|_| EncodeError::InvalidValue {
+                row,
+                message: invalid_message,
+            })?,
+        };
+        if value.is_some() && octets.iter().all(|&byte| byte == 0) {
+            return Err(EncodeError::InvalidValue {
+                row,
+                message: "address collides with MonetDB's NULL sentinel",
+            });
+        }
+        out.extend_from_slice(&octets);
+    }
+    Ok(())
 }
 
 fn fixed_wire_width(field: &Field, data_type: &DataType) -> Result<Option<usize>, EncodeError> {
@@ -1180,10 +1259,14 @@ mod tests {
             .into(),
         );
         assert_eq!(monet_type_for_field(&inet4).unwrap(), MonetType::Inet4);
-        assert!(matches!(
-            encode_column(&inet4, &LargeStringArray::from(vec!["127.0.0.1"])),
-            Err(EncodeError::UnsupportedMonetType(MonetType::Inet4))
-        ));
+        assert_eq!(
+            encode_column(
+                &inet4,
+                &LargeStringArray::from(vec![Some("127.0.0.1"), None])
+            )
+            .unwrap(),
+            [127, 0, 0, 1, 0, 0, 0, 0]
+        );
 
         let inet6 = Field::new("inet6", DataType::Utf8View, true).with_metadata(
             [(
@@ -1193,10 +1276,31 @@ mod tests {
             .into(),
         );
         assert_eq!(monet_type_for_field(&inet6).unwrap(), MonetType::Inet6);
-        assert!(matches!(
-            encode_column(&inet6, &StringViewArray::from(vec!["::1"])),
-            Err(EncodeError::UnsupportedMonetType(MonetType::Inet6))
-        ));
+        assert_eq!(
+            encode_column(&inet6, &StringViewArray::from(vec![Some("::1"), None])).unwrap(),
+            [
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0,
+            ]
+        );
+        for (field, values) in [
+            (
+                &inet4,
+                Arc::new(LargeStringArray::from(vec!["0.0.0.0"])) as Arc<dyn Array>,
+            ),
+            (
+                &inet6,
+                Arc::new(StringViewArray::from(vec!["::"])) as Arc<dyn Array>,
+            ),
+        ] {
+            assert!(matches!(
+                encode_column(field, values.as_ref()),
+                Err(EncodeError::InvalidValue {
+                    message: "address collides with MonetDB's NULL sentinel",
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]

@@ -71,6 +71,9 @@ def test_local_short_query_latency_against_pymonetdb(monetdb_uri: str) -> None:
         for table in ("latency_adbc", "latency_pymonetdb"):
             adbc_cursor.execute(f"DROP TABLE IF EXISTS {table}")
             adbc_cursor.execute(f"CREATE TABLE {table}(a INT, b INT)")
+        adbc_cursor.execute("DROP TABLE IF EXISTS latency_point")
+        adbc_cursor.execute("CREATE TABLE latency_point(id INT PRIMARY KEY)")
+        adbc_cursor.execute("INSERT INTO latency_point SELECT value FROM sys.generate_series(0, 100000)")
 
         def adbc_insert(count: int) -> None:
             for value in range(count):
@@ -97,6 +100,32 @@ def test_local_short_query_latency_against_pymonetdb(monetdb_uri: str) -> None:
                     "SELECT value FROM sys.generate_series(1, 11)"
                 )
                 assert len(pymonetdb_cursor.fetchall()) == 10  # pyright: ignore[reportUnknownArgumentType]
+
+        def adbc_select_one(count: int) -> None:
+            for _ in range(count):
+                adbc_cursor.execute("SELECT 1")
+                assert adbc_cursor.fetchone() == (1,)
+
+        def pymonetdb_select_one(count: int) -> None:
+            for _ in range(count):
+                pymonetdb_cursor.execute("SELECT 1")  # pyright: ignore[reportUnknownMemberType]
+                assert pymonetdb_cursor.fetchone() == (1,)
+
+        def adbc_point_query(count: int) -> None:
+            for value in range(count):
+                adbc_cursor.execute(
+                    "SELECT id FROM latency_point WHERE id = ?",
+                    (value % 100_000,),
+                )
+                assert adbc_cursor.fetchone() == (value % 100_000,)
+
+        def pymonetdb_point_query(count: int) -> None:
+            for value in range(count):
+                pymonetdb_cursor.execute(  # pyright: ignore[reportUnknownMemberType]
+                    "SELECT id FROM latency_point WHERE id = %s",
+                    (value % 100_000,),
+                )
+                assert pymonetdb_cursor.fetchone() == (value % 100_000,)
 
         def reset_pymonetdb_insert() -> None:
             pymonetdb_cursor.execute(  # pyright: ignore[reportUnknownMemberType]
@@ -126,11 +155,77 @@ def test_local_short_query_latency_against_pymonetdb(monetdb_uri: str) -> None:
                 rounds=rounds,
                 calls=calls,
             ),
+            "adbc_select_1": _median_microseconds_per_call(
+                adbc_select_one,
+                rounds=rounds,
+                calls=calls,
+            ),
+            "pymonetdb_select_1": _median_microseconds_per_call(
+                pymonetdb_select_one,
+                rounds=rounds,
+                calls=calls,
+            ),
+            "adbc_parameterized_point": _median_microseconds_per_call(
+                adbc_point_query,
+                rounds=rounds,
+                calls=calls,
+            ),
+            "pymonetdb_parameterized_point": _median_microseconds_per_call(
+                pymonetdb_point_query,
+                rounds=rounds,
+                calls=calls,
+            ),
         }
         for table in ("latency_adbc", "latency_pymonetdb"):
             adbc_cursor.execute(f"DROP TABLE {table}")
+        adbc_cursor.execute("DROP TABLE latency_point")
 
     print("\n" + " ".join(f"{name}={microseconds:.1f}us" for name, microseconds in measurements.items()))
+
+
+@pytest.mark.integration
+@pytest.mark.local_only
+def test_local_executemany_batching(monetdb_uri: str) -> None:
+    if os.environ.get("MONETDB_RUN_LATENCY_BENCHMARK") != "1":
+        pytest.skip("set MONETDB_RUN_LATENCY_BENCHMARK=1 to run the latency benchmark")
+
+    rounds = _positive_environment_integer("MONETDB_BENCH_ROUNDS", 7)
+    rows = _positive_environment_integer("MONETDB_BENCH_ROWS", 4_096)
+    parameters = [(value, value + 1) for value in range(rows)]
+    with dbapi.connect(monetdb_uri, autocommit=True) as connection, connection.cursor() as cursor:
+        cursor.execute("DROP TABLE IF EXISTS executemany_latency")
+        cursor.execute("CREATE TABLE executemany_latency(a INT, b INT)")
+
+        def reset() -> None:
+            cursor.execute("TRUNCATE TABLE executemany_latency")
+
+        def repeated_execute(_: int) -> None:
+            for row in parameters:
+                cursor.execute("INSERT INTO executemany_latency VALUES (?, ?)", row)
+
+        def batched_executemany(_: int) -> None:
+            cursor.executemany("INSERT INTO executemany_latency VALUES (?, ?)", parameters)
+
+        repeated = _median_microseconds_per_call(
+            repeated_execute,
+            rounds=rounds,
+            calls=1,
+            reset=reset,
+        )
+        batched = _median_microseconds_per_call(
+            batched_executemany,
+            rounds=rounds,
+            calls=1,
+            reset=reset,
+        )
+        cursor.execute("SELECT COUNT(*), SUM(a), SUM(b) FROM executemany_latency")
+        assert cursor.fetchone() == (rows, rows * (rows - 1) // 2, rows * (rows + 1) // 2)
+        cursor.execute("DROP TABLE executemany_latency")
+
+    print(
+        f"\nexecutemany_rows={rows} repeated_execute={repeated / 1_000:.1f}ms "
+        f"batched_executemany={batched / 1_000:.1f}ms speedup={repeated / batched:.1f}x"
+    )
 
 
 def _stage_parquet(

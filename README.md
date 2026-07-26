@@ -328,7 +328,8 @@ itself does not support. Polars' announced future unknown-extension behavior is 
 HUGEINT and TIMETZ remain round-trippable when loaded as extension types. The
 `monetdb.hugeint` extension uses Arrow `Decimal128(38, 0)`, so its supported domain is
 −(10^38−1) through 10^38−1; wider values in MonetDB's signed 128-bit domain return a bounded
-conversion error instead of silently changing the public Arrow type.
+conversion error instead of silently changing the public Arrow type. Cast those wider values to
+`VARCHAR` in SQL when their full textual representation is required.
 
 MonetDB `JSON` query results use Arrow's canonical
 [`arrow.json`](https://arrow.apache.org/docs/format/CanonicalExtensions.html#json) extension with
@@ -356,11 +357,13 @@ Backend-specific type boundaries are explicit:
 |---|---|---|---|
 | GEOMETRY | Cast to `VARCHAR` in SQL | Not implemented | Not implemented |
 | Legacy INET | Cast to `VARCHAR` in SQL | Not implemented | `NotImplemented` |
-| INET4 / INET6 | UTF-8 Arrow extension values | Supported | `NotImplemented` |
+| INET4 / INET6 | UTF-8 Arrow extension values | Supported | Supported |
 | OID | One-row results; multi-row results require a `VARCHAR` cast | Supported as bounded `UInt64` | `NotImplemented` |
 
-MonetDB does not expose compatible `Xexportbin` or `COPY BINARY` representations for the waived
-paths. The driver returns bounded errors instead of adding a lossy text-protocol fallback.
+`Date64` ingest accepts only whole-day millisecond values; intra-day values must use an Arrow
+timestamp type. MonetDB does not expose compatible `Xexportbin` or `COPY BINARY` representations
+for the remaining waived paths. The driver returns bounded errors instead of adding a lossy
+text-protocol fallback.
 
 ## dbc packages and driver-manager loading
 
