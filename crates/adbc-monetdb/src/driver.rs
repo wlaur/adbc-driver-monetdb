@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     fmt,
     num::NonZeroUsize,
     ops::Range,
@@ -39,7 +39,7 @@ use parameters::{
 };
 
 const DEFAULT_READ_BATCH_ROWS: usize = 131_072;
-const MAX_ENCODE_BATCH_ROWS: usize = 131_072;
+const DEFAULT_ENCODE_BATCH_ROWS: usize = 131_072;
 const PREPARED_CACHE_CAPACITY: usize = 128;
 const PREFETCH_DROP_GRACE: Duration = Duration::from_millis(250);
 const METADATA_REPLY_ROWS: usize = 1024;
@@ -1986,14 +1986,7 @@ impl MonetdbStatement {
                 ""
             }
         );
-        let (mut reader, single_copy_stream) = if matches!(
-            mode,
-            "adbc.ingest.mode.append" | "adbc.ingest.mode.create_append"
-        ) {
-            inspect_ingest_stream(reader, self.write_batch_rows)
-        } else {
-            (reader, false)
-        };
+        let mut reader = reader;
 
         let connection = lock_connection(&self.connection)?;
         if temporary
@@ -2020,7 +2013,7 @@ impl MonetdbStatement {
                     table,
                     self.timeouts,
                 )?);
-        let caller_scope = if append_to_existing && single_copy_stream {
+        let caller_scope = if append_to_existing {
             CallerTransactionScope::Direct
         } else {
             CallerTransactionScope::Savepoint
@@ -2154,35 +2147,8 @@ fn batch_ranges(rows: usize, batch_rows: usize) -> impl Iterator<Item = Range<us
 
 fn encode_batch_rows(batch_rows: usize, configured_rows: Option<usize>) -> usize {
     configured_rows
-        .unwrap_or(batch_rows)
-        .min(MAX_ENCODE_BATCH_ROWS)
-}
-
-fn inspect_ingest_stream(
-    mut reader: Box<dyn RecordBatchReader + Send>,
-    configured_rows: Option<usize>,
-) -> (Box<dyn RecordBatchReader + Send>, bool) {
-    let schema = reader.schema();
-    let mut prefetched = VecDeque::new();
-    let mut single_copy = true;
-    if let Some(first) = reader.next() {
-        single_copy = first.as_ref().is_ok_and(|batch| {
-            batch.num_rows() <= encode_batch_rows(batch.num_rows(), configured_rows)
-        });
-        prefetched.push_back(first);
-        if let Some(second) = reader.next() {
-            single_copy = false;
-            prefetched.push_back(second);
-        }
-    }
-    (
-        Box::new(PrefetchedRecordBatchReader {
-            schema,
-            prefetched,
-            reader,
-        }),
-        single_copy,
-    )
+        .unwrap_or(DEFAULT_ENCODE_BATCH_ROWS)
+        .min(batch_rows)
 }
 
 fn validate_record_batch(batch: &RecordBatch) -> Result<()> {
@@ -2195,26 +2161,6 @@ fn validate_record_batch(batch: &RecordBatch) -> Result<()> {
         })?;
     }
     Ok(())
-}
-
-struct PrefetchedRecordBatchReader {
-    schema: SchemaRef,
-    prefetched: VecDeque<std::result::Result<RecordBatch, ArrowError>>,
-    reader: Box<dyn RecordBatchReader + Send>,
-}
-
-impl Iterator for PrefetchedRecordBatchReader {
-    type Item = std::result::Result<RecordBatch, ArrowError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.prefetched.pop_front().or_else(|| self.reader.next())
-    }
-}
-
-impl RecordBatchReader for PrefetchedRecordBatchReader {
-    fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
-    }
 }
 
 fn validate_append_schema(
@@ -4590,11 +4536,11 @@ mod tests {
             [0..100_000, 100_000..200_000, 200_000..250_001]
         );
         assert!(batch_ranges(0, 100_000).next().is_none());
-        assert_eq!(encode_batch_rows(10_000_000, None), MAX_ENCODE_BATCH_ROWS);
         assert_eq!(
-            encode_batch_rows(10_000_000, Some(1_000_000)),
-            MAX_ENCODE_BATCH_ROWS
+            encode_batch_rows(10_000_000, None),
+            DEFAULT_ENCODE_BATCH_ROWS
         );
+        assert_eq!(encode_batch_rows(10_000_000, Some(1_000_000)), 1_000_000);
         assert_eq!(encode_batch_rows(10_000_000, Some(100_000)), 100_000);
         assert_eq!(encode_batch_rows(100_000, None), 100_000);
     }
