@@ -51,9 +51,11 @@ requirements change their premises.
 
 ## Result scheduling and memory
 
-- The default read window and maximum parallel encode/COPY window are both 131,072 rows. A sweep
-  from 32,768 through 262,144 rows found no better general default. Smaller write windows remain
-  configurable.
+- The default read and parallel encode/COPY windows are both 131,072 rows. A sweep from 32,768
+  through 262,144 rows found no better general default. Write windows remain configurable in
+  either direction because repeated COPY statements can make large wide ingests slower and leave
+  more persistent storage allocated; larger windows trade additional client memory for fewer COPY
+  statements.
 - Bulk ingest is lazy across the bound Arrow stream but eager within each bounded COPY window.
   The generic protocol library's lazy upload callback defers production until MonetDB requests a
   named file, but it still returns one complete `Vec<u8>` and therefore is not a streaming encoder.
@@ -61,13 +63,13 @@ requirements change their premises.
   change from lazy serial columns improved tall-batch ingest by 8.2–8.5% for about 4.4 MB more
   peak RSS. Use a smaller `adbc.monetdb.write_batch_rows` when a workload values memory over that
   throughput rather than serializing every workload by default.
-- A single-window append inside a caller-managed transaction executes directly because it maps to
-  one atomic MonetDB `COPY` statement. Wrapping every append in a savepoint caused transaction
-  commit to retain and materialize disproportionate storage: 24 appends of 4,096 rows by 786
-  `REAL` columns exhausted a 2 GiB database-farm cap for about 309 MiB of logical input. Direct
-  appends and a single multi-batch reader both completed at about 642 MiB. Multi-window streams
-  retain one operation-level savepoint. Server errors preserve their SQLSTATE and abort the
-  caller transaction until rollback, matching MonetDB's normal DB-API transaction behavior.
+- Appends to an existing table inside a caller-managed transaction execute directly for every
+  COPY window. Operation savepoints caused MonetDB to retain and materialize disproportionate
+  storage for large, wide streams even after the savepoint was released. A server error aborts
+  the caller transaction until rollback, matching MonetDB's normal DB-API transaction behavior.
+  Autocommit still wraps the complete stream in an internal transaction so failed streams leave
+  no partial append. Create and replace modes retain their operation savepoint because their DDL
+  must be recovered without discarding unrelated caller work.
 - The prefetch worker fetches complete raw `Xexportbin` frames while the caller decodes the
   previous frame. A worker that both fetches and decodes would serialize those phases and lose the
   overlap.
