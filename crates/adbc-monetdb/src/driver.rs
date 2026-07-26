@@ -2863,7 +2863,7 @@ fn query_result_with_timeouts(
         let batch = monetdb_arrow::decode_inline_rows(&mut cursor, &result.columns, rows)
             .map_err(|value| map_display(value, Status::InvalidData))?;
         return Ok(StatementResult {
-            reader: Box::new(SingleBatchReader::new(batch)),
+            reader: Box::new(SlicedBatchReader::new(batch, batch_rows)),
             rows_affected,
         });
     }
@@ -3748,6 +3748,46 @@ impl RecordBatchReader for SingleBatchReader {
     }
 }
 
+struct SlicedBatchReader {
+    batch: RecordBatch,
+    schema: SchemaRef,
+    offset: usize,
+    batch_rows: usize,
+}
+
+impl SlicedBatchReader {
+    fn new(batch: RecordBatch, batch_rows: usize) -> Self {
+        debug_assert!(batch_rows > 0);
+        let schema = batch.schema();
+        Self {
+            batch,
+            schema,
+            offset: 0,
+            batch_rows: batch_rows.max(1),
+        }
+    }
+}
+
+impl Iterator for SlicedBatchReader {
+    type Item = std::result::Result<RecordBatch, ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.offset >= self.batch.num_rows() {
+            return None;
+        }
+        let rows = self.batch_rows.min(self.batch.num_rows() - self.offset);
+        let batch = self.batch.slice(self.offset, rows);
+        self.offset += rows;
+        Some(Ok(batch))
+    }
+}
+
+impl RecordBatchReader for SlicedBatchReader {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+}
+
 struct EmptyReader {
     schema: SchemaRef,
 }
@@ -4204,6 +4244,19 @@ mod tests {
         let empty = info_batch((11, 55, 7), Some(HashSet::new())).unwrap();
         assert_eq!(empty.schema(), GET_INFO_SCHEMA.clone());
         assert_eq!(empty.num_rows(), 0);
+    }
+
+    #[test]
+    fn slices_inline_batches_at_the_configured_read_size() {
+        let batch = RecordBatch::try_from_iter([(
+            "value",
+            Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])) as ArrayRef,
+        )])
+        .unwrap();
+        let rows = SlicedBatchReader::new(batch, 2)
+            .map(|batch| batch.unwrap().num_rows())
+            .collect::<Vec<_>>();
+        assert_eq!(rows, [2, 2, 1]);
     }
 
     #[test]
