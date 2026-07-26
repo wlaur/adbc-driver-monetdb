@@ -425,8 +425,17 @@ jobs:
         env:
           MDB_DB_ADMIN_PASS: monetdb
           MDB_CREATE_DBS: test
+      monetdb-remote:
+        image: monetdb/monetdb:Dec2025-SP3@sha256:a71e6e8c8402beadc51aebf944b465ee5b185c7ae4a9e6808b5d9133ee921786
+        ports:
+          - 50001:50000
+        env:
+          MDB_DB_ADMIN_PASS: monetdb
+          MDB_CREATE_DBS: remote
     env:
       MONETDB_TEST_URI: monetdb://monetdb:monetdb@localhost:50000/test
+      MONETDB_REMOTE_TEST_URI: monetdb://monetdb:monetdb@localhost:50001/remote
+      MONETDB_REMOTE_SERVER_URI: mapi:monetdb://monetdb-remote:50000/remote
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
