@@ -923,6 +923,69 @@ def test_ingest_modes_and_temporary_table(monetdb_uri: str) -> None:
 
 
 @pytest.mark.integration
+def test_append_to_delete_on_commit_temporary_table_stays_in_caller_transaction(
+    monetdb_uri: str,
+) -> None:
+    df = pl.DataFrame({"value": [1, 2, 3]})
+    with dbapi.connect(monetdb_uri) as conn, conn.cursor() as cursor:
+        cursor.execute("CREATE LOCAL TEMPORARY TABLE ingest_delete_on_commit(value BIGINT)")
+        cursor.execute("CREATE LOCAL TEMPORARY TABLE ingest_preserve_on_commit(value BIGINT) ON COMMIT PRESERVE ROWS")
+
+        assert cursor.adbc_ingest("ingest_delete_on_commit", df, mode="append", temporary=True) == 3
+        assert (
+            cursor.adbc_ingest(
+                "ingest_delete_on_commit",
+                pl.DataFrame({"value": [4]}),
+                mode="create_append",
+                temporary=True,
+            )
+            == 1
+        )
+        assert cursor.adbc_ingest("ingest_preserve_on_commit", df, mode="append", temporary=True) == 3
+
+        cursor.execute("SELECT COUNT(*) FROM ingest_delete_on_commit")
+        assert cursor.fetchone() == (4,)
+        cursor.execute("SELECT COUNT(*) FROM ingest_preserve_on_commit")
+        assert cursor.fetchone() == (3,)
+
+        with pytest.raises(adbc_driver_manager.DataError, match="non-finite"):
+            cursor.adbc_ingest(
+                "ingest_failure_with_temporary_rows",
+                pl.DataFrame({"value": [float("inf")]}),
+                mode="replace",
+            )
+        cursor.execute("SELECT COUNT(*) FROM ingest_delete_on_commit")
+        assert cursor.fetchone() == (4,)
+
+        conn.commit()
+
+        cursor.execute("SELECT COUNT(*) FROM ingest_delete_on_commit")
+        assert cursor.fetchone() == (0,)
+        cursor.execute("SELECT COUNT(*) FROM ingest_preserve_on_commit")
+        assert cursor.fetchone() == (3,)
+
+
+@pytest.mark.integration
+def test_autocommit_rejects_append_to_delete_on_commit_temporary_table(
+    monetdb_uri: str,
+) -> None:
+    with dbapi.connect(monetdb_uri, autocommit=True) as conn, conn.cursor() as cursor:
+        cursor.execute("CREATE LOCAL TEMPORARY TABLE ingest_autocommit_delete(value BIGINT)")
+        with pytest.raises(
+            adbc_driver_manager.ProgrammingError,
+            match="ON COMMIT DELETE ROWS",
+        ):
+            cursor.adbc_ingest(
+                "ingest_autocommit_delete",
+                pl.DataFrame({"value": [1]}),
+                mode="append",
+                temporary=True,
+            )
+        cursor.execute("SELECT COUNT(*) FROM ingest_autocommit_delete")
+        assert cursor.fetchone() == (0,)
+
+
+@pytest.mark.integration
 def test_temporary_ingest_never_mutates_same_named_permanent_table(
     monetdb_uri: str,
 ) -> None:

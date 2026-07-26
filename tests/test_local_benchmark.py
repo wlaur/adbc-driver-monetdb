@@ -3,10 +3,13 @@ import gc
 import multiprocessing
 import os
 import statistics
+import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable, Iterator
 from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
@@ -16,6 +19,48 @@ import pymonetdb
 import pytest
 
 from adbc_driver_monetdb import ConnectionOptions, StatementOptions, dbapi
+
+
+@dataclass(frozen=True)
+class DatabaseDiskUsage:
+    farm_bytes: int
+    filesystem_used_bytes: int
+
+
+def _benchmark_container() -> str:
+    configured = os.environ.get("MONETDB_BENCH_CONTAINER")
+    if configured is not None:
+        return configured
+    result = subprocess.run(
+        ["docker", "compose", "ps", "-q", "monetdb"],
+        cwd=Path(__file__).parents[1],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    container = result.stdout.strip()
+    if not container:
+        raise RuntimeError("the local MonetDB Compose service is not running; start it or set MONETDB_BENCH_CONTAINER")
+    return container
+
+
+def _database_disk_usage(container: str) -> DatabaseDiskUsage:
+    farm = subprocess.run(
+        ["docker", "exec", container, "du", "-sb", "/var/monetdb5/dbfarm"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    filesystem = subprocess.run(
+        ["docker", "exec", container, "df", "-B1", "--output=used", "/var/monetdb5/dbfarm"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return DatabaseDiskUsage(
+        farm_bytes=int(farm.stdout.split()[0]),
+        filesystem_used_bytes=int(filesystem.stdout.splitlines()[-1]),
+    )
 
 
 def _positive_environment_integer(name: str, default: int) -> int:
@@ -380,6 +425,14 @@ def test_local_30_gib_staged_parquet_ingest(
         ).result()
 
     parquet_file = pq.ParquetFile(parquet)
+    benchmark_container = _benchmark_container()
+    disk_baseline = _database_disk_usage(benchmark_container)
+    disk_samples = [disk_baseline]
+    stop_disk_sampling = threading.Event()
+
+    def sample_disk_usage() -> None:
+        while not stop_disk_sampling.wait(0.25):
+            disk_samples.append(_database_disk_usage(benchmark_container))
 
     def record_batches() -> Iterator[pa.RecordBatch]:
         for batch in parquet_file.iter_batches(  # pyright: ignore[reportUnknownMemberType]
@@ -399,14 +452,21 @@ def test_local_30_gib_staged_parquet_ingest(
     ) as connection:
         connection.execute("DROP TABLE IF EXISTS local_large_ingest_benchmark")
         try:
+            disk_sampler = threading.Thread(target=sample_disk_usage, daemon=True)
+            disk_sampler.start()
             ingest_started = time.perf_counter()
-            with connection.cursor() as cursor:
-                affected = cursor.adbc_ingest(
-                    "local_large_ingest_benchmark",
-                    reader,
-                    mode="create",
-                )
-            ingest_seconds = time.perf_counter() - ingest_started
+            try:
+                with connection.cursor() as cursor:
+                    affected = cursor.adbc_ingest(
+                        "local_large_ingest_benchmark",
+                        reader,
+                        mode="create",
+                    )
+                ingest_seconds = time.perf_counter() - ingest_started
+            finally:
+                stop_disk_sampling.set()
+                disk_sampler.join()
+                disk_samples.append(_database_disk_usage(benchmark_container))
             result = connection.execute(
                 f"""
                 SELECT COUNT(*), MIN(v0000), MAX(v{columns - 1:04d}),
@@ -426,10 +486,17 @@ def test_local_30_gib_staged_parquet_ingest(
     peak_rss = _peak_rss_bytes()
     stage_rss_text = "unavailable" if stage_peak_rss is None else f"{stage_peak_rss / 2**30:.2f} GiB"
     ingest_rss_text = "unavailable" if peak_rss is None else f"{peak_rss / 2**30:.2f} GiB"
+    peak_farm_bytes = max(sample.farm_bytes for sample in disk_samples)
+    peak_filesystem_bytes = max(sample.filesystem_used_bytes for sample in disk_samples)
+    final_disk = disk_samples[-1]
     print(
         f"\nlogical={logical_bytes / 2**30:.2f} GiB "
         f"parquet={parquet.stat().st_size / 2**20:.1f} MiB "
         f"batches={expected_batches} stage={stage_seconds:.2f}s "
         f"ingest={ingest_seconds:.2f}s peak_stage_rss={stage_rss_text} "
-        f"peak_ingest_rss={ingest_rss_text}"
+        f"peak_ingest_rss={ingest_rss_text} "
+        f"farm_growth={(final_disk.farm_bytes - disk_baseline.farm_bytes) / 2**30:.2f} GiB "
+        f"peak_farm_growth={(peak_farm_bytes - disk_baseline.farm_bytes) / 2**30:.2f} GiB "
+        f"peak_filesystem_growth="
+        f"{(peak_filesystem_bytes - disk_baseline.filesystem_used_bytes) / 2**30:.2f} GiB"
     )

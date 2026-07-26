@@ -8,6 +8,8 @@ services:
     environment:
       MDB_DB_ADMIN_PASS: monetdb
       MDB_CREATE_DBS: test
+    tmpfs:
+      - /var/monetdb5/dbfarm:rw,size=${MONETDB_DISK_LIMIT:-4g},mode=0777
 
   monetdb-remote:
     image: wlaur/monetdb-container:11.55.7-2@sha256:22dd41bd10fd7136ca1ef6afaec5cf0c1670f16a84b80785a5fee12aac480eb4
@@ -17,3 +19,5 @@ services:
     environment:
       MDB_DB_ADMIN_PASS: monetdb
       MDB_CREATE_DBS: remote
+    tmpfs:
+      - /var/monetdb5/dbfarm:rw,size=${MONETDB_DISK_LIMIT:-4g},mode=0777
