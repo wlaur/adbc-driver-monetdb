@@ -17,6 +17,7 @@
 mod decode;
 mod encode;
 pub mod exportbin;
+mod wire;
 
 pub use decode::{
     DecodeError, data_type_for_monet_type, decode_column, decode_frame, decode_frame_owned,
@@ -24,3 +25,4 @@ pub use decode::{
     field_for_monet_type, owned_frame_capacity, prefers_owned_frame,
 };
 pub use encode::{EncodeError, encode_column, monet_type_for_field, sql_type_for_field};
+pub use wire::date_from_unix_days;

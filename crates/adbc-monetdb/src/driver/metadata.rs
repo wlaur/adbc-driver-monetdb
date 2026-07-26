@@ -1,7 +1,4 @@
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-};
+use std::{collections::HashMap, sync::Arc};
 
 use adbc_core::error::{Error, Result, Status};
 use adbc_core::options::ObjectDepth;
@@ -14,7 +11,9 @@ use arrow_array::{Array, BooleanArray, Int32Array, RecordBatch, StringArray};
 use arrow_schema::Schema;
 use monetdb::Timeouts;
 
-use super::{error, prepared_arrow_field, prepared_monet_type, query_reader_with_timeouts};
+use super::{
+    SharedConnection, error, prepared_arrow_field, prepared_monet_type, query_reader_with_timeouts,
+};
 
 #[derive(Debug)]
 pub(super) struct ObjectSchema {
@@ -58,7 +57,7 @@ struct ConstraintUsage {
 }
 
 pub(super) fn load_objects(
-    connection: &Arc<Mutex<monetdb::Connection>>,
+    connection: &SharedConnection,
     depth: ObjectDepth,
     schema_filter: Option<&str>,
     table_filter: Option<&str>,
@@ -215,7 +214,7 @@ pub(super) fn load_objects(
 }
 
 fn load_schemas(
-    connection: &Arc<Mutex<monetdb::Connection>>,
+    connection: &SharedConnection,
     schema_filter: Option<&str>,
     timeouts: Timeouts,
 ) -> Result<Vec<ObjectSchema>> {
@@ -245,7 +244,7 @@ fn load_schemas(
 }
 
 fn load_tables(
-    connection: &Arc<Mutex<monetdb::Connection>>,
+    connection: &SharedConnection,
     schema_filter: Option<&str>,
     table_filter: Option<&str>,
     table_types: Option<&[&str]>,
@@ -312,7 +311,7 @@ fn load_tables(
 }
 
 pub(super) fn table_schema(
-    connection: &Arc<Mutex<monetdb::Connection>>,
+    connection: &SharedConnection,
     schema_name: &str,
     table_name: &str,
     timeouts: Timeouts,
@@ -363,7 +362,7 @@ pub(super) fn table_schema(
 }
 
 fn load_constraints(
-    connection: &Arc<Mutex<monetdb::Connection>>,
+    connection: &SharedConnection,
     schemas: &mut [ObjectSchema],
     schema_filter: Option<&str>,
     table_filter: Option<&str>,
@@ -548,7 +547,7 @@ pub(super) fn raw_string_literal(value: &str) -> Result<String> {
             Status::InvalidArguments,
         ));
     }
-    Ok(format!("R'{}'", value.replace('\'', "''")))
+    Ok(super::quote_raw_string(value))
 }
 
 fn validate_like_pattern(pattern: &str) -> Result<()> {

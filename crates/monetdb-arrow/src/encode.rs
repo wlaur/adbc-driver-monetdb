@@ -22,7 +22,7 @@ use arrow_array::{
 #[cfg(target_endian = "little")]
 use arrow_buffer::ToByteSlice;
 use arrow_schema::{DataType, Field, TimeUnit};
-use chrono::{Datelike, NaiveDate, TimeDelta};
+use chrono::{Datelike, NaiveDate};
 use monetdb::MonetType;
 
 #[derive(Debug)]
@@ -298,37 +298,7 @@ fn fixed_wire_width(field: &Field, data_type: &DataType) -> Result<Option<usize>
     if *data_type == DataType::Null {
         return Ok(Some(2));
     }
-    Ok(match monet_type_for_field(field)? {
-        MonetType::Bool | MonetType::TinyInt => Some(1),
-        MonetType::SmallInt => Some(2),
-        MonetType::Int | MonetType::Real | MonetType::MonthInterval | MonetType::Date => Some(4),
-        MonetType::BigInt
-        | MonetType::Oid
-        | MonetType::Double
-        | MonetType::DayInterval
-        | MonetType::SecInterval
-        | MonetType::Time
-        | MonetType::TimeTz => Some(8),
-        MonetType::HugeInt | MonetType::Uuid => Some(16),
-        MonetType::Decimal(precision, _) => match precision {
-            1..=2 => Some(1),
-            3..=4 => Some(2),
-            5..=9 => Some(4),
-            10..=18 => Some(8),
-            19..=38 => Some(16),
-            _ => None,
-        },
-        MonetType::Timestamp | MonetType::TimestampTz => Some(12),
-        MonetType::Varchar(_)
-        | MonetType::Blob
-        | MonetType::Url
-        | MonetType::Inet
-        | MonetType::Inet4
-        | MonetType::Inet6
-        | MonetType::Json
-        | MonetType::Geometry
-        | MonetType::Xml => None,
-    })
+    Ok(crate::wire::fixed_wire_width(monet_type_for_field(field)?))
 }
 
 fn downcast<T: 'static>(array: &dyn Array, expected: DataType) -> Result<&T, EncodeError> {
@@ -347,7 +317,7 @@ fn encode_primitive<T: ArrowPrimitiveType>(
     out: &mut Vec<u8>,
 ) -> Result<(), EncodeError>
 where
-    T::Native: PartialEq,
+    T::Native: PartialEq + WireInteger,
 {
     for row in 0..array.len() {
         if !array.is_null(row) && array.value(row) == null {
@@ -366,10 +336,30 @@ where
         } else {
             array.value(row)
         };
-        out.extend_from_slice(value.to_le_bytes().as_ref());
+        value.append_le(out);
     }
     Ok(())
 }
+
+trait WireInteger {
+    #[cfg(target_endian = "big")]
+    fn append_le(self, out: &mut Vec<u8>);
+}
+
+macro_rules! wire_integer {
+    ($($type:ty),+ $(,)?) => {
+        $(
+            impl WireInteger for $type {
+                #[cfg(target_endian = "big")]
+                fn append_le(self, out: &mut Vec<u8>) {
+                    out.extend_from_slice(&self.to_le_bytes());
+                }
+            }
+        )+
+    };
+}
+
+wire_integer!(i8, i16, i32, i64);
 
 #[cfg(target_endian = "little")]
 fn copy_native_with_nulls<T: ArrowPrimitiveType>(
@@ -988,20 +978,10 @@ where
 }
 
 fn date_from_days(days: i64, row: usize) -> Result<NaiveDate, EncodeError> {
-    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).ok_or(EncodeError::InvalidValue {
+    crate::wire::date_from_unix_days(days).ok_or(EncodeError::InvalidValue {
         row,
-        message: "could not construct Unix epoch date",
-    })?;
-    let delta = TimeDelta::try_days(days).ok_or(EncodeError::InvalidValue {
-        row,
-        message: "date offset is outside chrono's range",
-    })?;
-    epoch
-        .checked_add_signed(delta)
-        .ok_or(EncodeError::InvalidValue {
-            row,
-            message: "date is outside chrono's range",
-        })
+        message: "date is outside chrono's range",
+    })
 }
 
 #[cfg(test)]

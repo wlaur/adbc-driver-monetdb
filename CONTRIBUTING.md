@@ -50,6 +50,27 @@ MONETDB_TEST_URI=monetdb://monetdb:monetdb@localhost:50000/test uv run pytest -m
 Changes are accepted under the repository's MIT and MPL-2.0 license boundary described in
 `AGENTS.md` and `NOTICE`.
 
+## Review matrix
+
+A green happy-path test is not evidence for neighboring states. Review behavior changes against
+the applicable dimensions below and add a regression for every mechanism the change relies on:
+
+- zero, one, and many parameter rows; zero, inline, and server-resident result rows;
+- autocommit and explicit transactions, including failure, rollback, and retry;
+- complete consumption, early reader close, explicit cancellation, timeout, and server error;
+- cache hit, eviction while idle, eviction while the connection is busy, and session close;
+- same-session and external DDL, distinguishing “the server kept the plan” from actual
+  invalidation;
+- Linux, macOS, Windows, and compile-time little-/big-endian branches;
+- the ownership boundary between MAPI, Arrow/ADBC, the Python shim, and downstream SQLAlchemy.
+
+Treat test names, documentation claims, support metadata, and release settings as assertions that
+must have executable gates. Dependency changes require the released dependency revision, the
+driver wheel must be exercised by the downstream dialect before release, and tag builds must
+repeat the required matrix against the exact release ref. Performance changes need repeated
+before/after measurements of the affected end-to-end workload; isolated codec improvements are
+not enough when network or server time dominates.
+
 ## Release recovery
 
 The first PyPI release uses the pending Trusted Publisher configured for owner `wlaur`, repository

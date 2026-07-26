@@ -19,7 +19,7 @@ use arrow_array::{
     },
 };
 use arrow_schema::{DataType, Field, TimeUnit};
-use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 
 use super::error;
 
@@ -808,7 +808,7 @@ fn quote_string(value: &str) -> Result<String> {
             Status::InvalidData,
         ));
     }
-    Ok(format!("R'{}'", value.replace('\'', "''")))
+    Ok(super::quote_raw_string(value))
 }
 
 fn blob_literal(value: &[u8]) -> String {
@@ -1070,12 +1070,7 @@ fn dictionary_value<K: ArrowDictionaryKeyType>(
 }
 
 fn date_from_days(days: i64) -> Result<NaiveDate> {
-    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1)
-        .ok_or_else(|| error("could not construct Unix epoch date", Status::Internal))?;
-    let delta = TimeDelta::try_days(days)
-        .ok_or_else(|| error("date parameter is out of range", Status::InvalidData))?;
-    epoch
-        .checked_add_signed(delta)
+    monetdb_arrow::date_from_unix_days(days)
         .ok_or_else(|| error("date parameter is out of range", Status::InvalidData))
 }
 

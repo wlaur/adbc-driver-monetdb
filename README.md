@@ -169,8 +169,12 @@ ingestion arguments rather than connection or timeout options. The read batch de
 rows, matching PyArrow Dataset Scanner's default. Read prefetch is enabled by default and can hold
 up to about three windows at once: one decoding, one buffered, and one in flight. Abandoning a
 stream can therefore waste up to two fetched windows; increasing `read_batch_rows` also increases
-this memory bound. Set `adbc.monetdb.read_prefetch` to `"false"` to use the sequential diagnostic
-path. Ingestion caps parallel encode/COPY windows at 131,072 rows to bound memory. Setting
+this memory bound. Closing a reader waits briefly for its worker and then detaches a fetch that is
+still in flight; it does not implicitly cancel and permanently close the session. The next
+statement on that connection may wait for the detached fetch or its configured read/operation
+timeout. Use `adbc_cancel()` when session destruction is intended, or set
+`adbc.monetdb.read_prefetch` to `"false"` when prompt pool reuse matters more than fetch/decode
+overlap. Ingestion caps parallel encode/COPY windows at 131,072 rows to bound memory. Setting
 `adbc.monetdb.write_batch_rows` to a smaller positive value zero-copy slices larger input batches
 further; zero keeps upstream boundaries only up to the internal cap. Set it through `conn_kwargs`
 as above when `DataFrame.write_database` creates its own cursor, or through `adbc_stmt_kwargs` for
@@ -185,7 +189,37 @@ plan again. The least-recently-used cache holds at most 128 plans; eviction queu
 deallocation, and closing the connection releases the session and every remaining plan.
 Whitespace variants are intentionally different keys. Schema-changing statements issued through
 the connection invalidate the cache, and externally invalidated plans are prepared again and
-retried once when MonetDB can recover without rolling back a user transaction.
+retried once when MonetDB can recover without rolling back user work. MonetDB aborts an explicit
+transaction when `EXECUTE` reports a missing prepared plan, so a stale plan in that state follows
+the normal database-error contract: roll back before retrying. One-row bound DML executes directly;
+multi-row bound DML retains a savepoint so the whole parameter batch remains atomic.
+
+`dbapi.Binary` accepts bytes-like values (`bytes`, `bytearray`, and `memoryview`) and returns
+`bytes`. Text is rejected with `TypeError`; encode text explicitly before binding it as binary.
+
+## Performance expectations
+
+The Arrow-native path is designed for columnar reads and bulk ingestion. A one-row parameterized
+DML execution takes the direct prepared-statement path; parameter batches with two or more rows
+use a savepoint so the complete batch stays atomic. The login keeps MonetDB's normal inline reply
+window, so small result sets are decoded from the initial response instead of forcing another
+fetch.
+
+Very small queries can still be slower than pymonetdb. pymonetdb returns Python tuples directly,
+whereas an ADBC query must build an Arrow schema and buffers across the native boundary before the
+driver manager converts those buffers back to DB-API tuples. That fixed Arrow/FFI cost is inherent
+when a caller asks an Arrow-native ADBC driver for row-oriented Python objects; bypassing it would
+make DB-API results disagree with the native ADBC stream. Prefer Arrow consumers such as Polars,
+pandas with the PyArrow backend, or `fetch_arrow_table()` when result size makes that fixed cost
+material.
+
+The small-query comparison is reproducible against the same server and host:
+
+```sh
+MONETDB_TEST_URI=monetdb://monetdb:monetdb@localhost:50000/test \
+MONETDB_RUN_LATENCY_BENCHMARK=1 \
+uv run pytest tests/test_local_benchmark.py::test_local_short_query_latency_against_pymonetdb -q -s
+```
 
 The examples use strings because `adbc-driver-manager` publishes string-valued type hints for
 database and connection option mappings. Statement options also accept native integers through the
@@ -202,7 +236,7 @@ close that connection and open another one before issuing more work.
 Client information is sent at login by default. The `client` value in
 [`sys.sessions`](https://www.monetdb.org/documentation-Dec2025/user-guide/sql-catalog/users-roles-privileges-sessions/)
 identifies this driver and its protocol library, for example
-`adbc_driver_monetdb 0.8.3 / monetdb-rust 0.2.1`. The Python shim uses the basename of
+`adbc_driver_monetdb 0.8.4 / monetdb-rust 0.2.2-wlaur.1`. The Python shim uses the basename of
 `sys.argv[0]` as the default `application`. Hostname and process id are also sent by default, as
 they are by pymonetdb and libmapi; use `client_info=false` if that host metadata should not leave
 the client.

@@ -1,14 +1,16 @@
 import gc
 import multiprocessing
 import os
+import statistics
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pymonetdb
 import pytest
 
 from adbc_driver_monetdb import ConnectionOptions, StatementOptions, dbapi
@@ -28,6 +30,107 @@ def _peak_rss_bytes() -> int | None:
 
     rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     return rss if sys.platform == "darwin" else rss * 1024
+
+
+def _median_microseconds_per_call(
+    call: Callable[[int], None],
+    *,
+    rounds: int,
+    calls: int,
+    reset: Callable[[], object] | None = None,
+) -> float:
+    call(25)
+    samples: list[float] = []
+    gc.disable()
+    try:
+        for _ in range(rounds):
+            if reset is not None:
+                reset()
+            started = time.perf_counter_ns()
+            call(calls)
+            samples.append((time.perf_counter_ns() - started) / calls / 1_000)
+    finally:
+        gc.enable()
+    return statistics.median(samples)
+
+
+@pytest.mark.integration
+@pytest.mark.local_only
+def test_local_short_query_latency_against_pymonetdb(monetdb_uri: str) -> None:
+    if os.environ.get("MONETDB_RUN_LATENCY_BENCHMARK") != "1":
+        pytest.skip("set MONETDB_RUN_LATENCY_BENCHMARK=1 to run the latency benchmark")
+
+    rounds = _positive_environment_integer("MONETDB_BENCH_ROUNDS", 7)
+    calls = _positive_environment_integer("MONETDB_BENCH_CALLS", 500)
+    with (
+        dbapi.connect(monetdb_uri, autocommit=True) as adbc_connection,
+        pymonetdb.connect(monetdb_uri, autocommit=True) as pymonetdb_connection,
+    ):
+        adbc_cursor = adbc_connection.cursor()
+        pymonetdb_cursor = pymonetdb_connection.cursor()
+        for table in ("latency_adbc", "latency_pymonetdb"):
+            adbc_cursor.execute(f"DROP TABLE IF EXISTS {table}")
+            adbc_cursor.execute(f"CREATE TABLE {table}(a INT, b INT)")
+
+        def adbc_insert(count: int) -> None:
+            for value in range(count):
+                adbc_cursor.execute(
+                    "INSERT INTO latency_adbc VALUES (?, ?)",
+                    (value, value + 1),
+                )
+
+        def pymonetdb_insert(count: int) -> None:
+            for value in range(count):
+                pymonetdb_cursor.execute(  # pyright: ignore[reportUnknownMemberType]
+                    "INSERT INTO latency_pymonetdb VALUES (%s, %s)",
+                    (value, value + 1),
+                )
+
+        def adbc_select(count: int) -> None:
+            for _ in range(count):
+                adbc_cursor.execute("SELECT value FROM sys.generate_series(1, 11)")
+                assert len(adbc_cursor.fetchall()) == 10
+
+        def pymonetdb_select(count: int) -> None:
+            for _ in range(count):
+                pymonetdb_cursor.execute(  # pyright: ignore[reportUnknownMemberType]
+                    "SELECT value FROM sys.generate_series(1, 11)"
+                )
+                assert len(pymonetdb_cursor.fetchall()) == 10  # pyright: ignore[reportUnknownArgumentType]
+
+        def reset_pymonetdb_insert() -> None:
+            pymonetdb_cursor.execute(  # pyright: ignore[reportUnknownMemberType]
+                "TRUNCATE TABLE latency_pymonetdb"
+            )
+
+        measurements = {
+            "adbc_insert_2param": _median_microseconds_per_call(
+                adbc_insert,
+                rounds=rounds,
+                calls=calls,
+                reset=lambda: adbc_cursor.execute("TRUNCATE TABLE latency_adbc"),
+            ),
+            "pymonetdb_insert_2param": _median_microseconds_per_call(
+                pymonetdb_insert,
+                rounds=rounds,
+                calls=calls,
+                reset=reset_pymonetdb_insert,
+            ),
+            "adbc_select_10": _median_microseconds_per_call(
+                adbc_select,
+                rounds=rounds,
+                calls=calls,
+            ),
+            "pymonetdb_select_10": _median_microseconds_per_call(
+                pymonetdb_select,
+                rounds=rounds,
+                calls=calls,
+            ),
+        }
+        for table in ("latency_adbc", "latency_pymonetdb"):
+            adbc_cursor.execute(f"DROP TABLE {table}")
+
+    print("\n" + " ".join(f"{name}={microseconds:.1f}us" for name, microseconds in measurements.items()))
 
 
 def _stage_parquet(
