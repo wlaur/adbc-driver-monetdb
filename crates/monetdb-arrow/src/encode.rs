@@ -7,6 +7,7 @@ use std::{
     collections::HashMap,
     fmt,
     net::{Ipv4Addr, Ipv6Addr},
+    num::NonZeroUsize,
 };
 
 use arrow_array::{
@@ -64,6 +65,106 @@ impl fmt::Display for EncodeError {
 }
 
 impl std::error::Error for EncodeError {}
+
+#[derive(Debug)]
+pub enum ChunkedEncodeError<E> {
+    Encode(EncodeError),
+    Sink(E),
+}
+
+/// Estimate a column's encoded size before string backreferences.
+pub fn estimated_encoded_size(field: &Field, array: &dyn Array) -> Result<usize, EncodeError> {
+    if let Some(width) = fixed_wire_width(field, array.data_type())? {
+        return checked_encoded_size(array.len(), width);
+    }
+    let size = match array.data_type() {
+        DataType::Utf8 => estimated_strings(
+            downcast::<StringArray>(array, DataType::Utf8)?.iter(),
+            array.len(),
+        ),
+        DataType::LargeUtf8 => estimated_strings(
+            downcast::<LargeStringArray>(array, DataType::LargeUtf8)?.iter(),
+            array.len(),
+        ),
+        DataType::Utf8View => estimated_strings(
+            downcast::<StringViewArray>(array, DataType::Utf8View)?.iter(),
+            array.len(),
+        ),
+        DataType::Dictionary(key, _) => estimated_dictionary_strings(array, key),
+        DataType::Binary => estimated_blobs(
+            downcast::<BinaryArray>(array, DataType::Binary)?.iter(),
+            array.len(),
+        ),
+        DataType::LargeBinary => estimated_blobs(
+            downcast::<LargeBinaryArray>(array, DataType::LargeBinary)?.iter(),
+            array.len(),
+        ),
+        DataType::BinaryView => estimated_blobs(
+            downcast::<BinaryViewArray>(array, DataType::BinaryView)?.iter(),
+            array.len(),
+        ),
+        DataType::FixedSizeBinary(_) => {
+            let values = downcast::<FixedSizeBinaryArray>(array, array.data_type().clone())?;
+            estimated_blobs(
+                (0..values.len()).map(|row| (!values.is_null(row)).then(|| values.value(row))),
+                values.len(),
+            )
+        }
+        data_type => Err(EncodeError::Unsupported(data_type.clone())),
+    }?;
+    Ok(size)
+}
+
+/// Encode one logical column from any number of Arrow chunks and emit bounded
+/// wire-format pieces without concatenating them.
+pub fn encode_column_chunks<E>(
+    field: &Field,
+    arrays: &[&dyn Array],
+    target_bytes: NonZeroUsize,
+    mut emit: impl FnMut(&[u8]) -> Result<(), E>,
+) -> Result<usize, ChunkedEncodeError<E>> {
+    let mut total = 0usize;
+    for array in arrays {
+        let estimated =
+            estimated_encoded_size(field, *array).map_err(ChunkedEncodeError::Encode)?;
+        let rows_per_chunk = if estimated == 0 {
+            array.len().max(1)
+        } else {
+            target_bytes
+                .get()
+                .saturating_mul(array.len())
+                .checked_div(estimated)
+                .unwrap_or(0)
+                .clamp(1, array.len().max(1))
+        };
+        for start in (0..array.len()).step_by(rows_per_chunk) {
+            let len = (array.len() - start).min(rows_per_chunk);
+            let slice = array.slice(start, len);
+            if let Some(bytes) =
+                borrowed_wire_bytes(field, slice.as_ref()).map_err(ChunkedEncodeError::Encode)?
+            {
+                total = total.checked_add(bytes.len()).ok_or_else(|| {
+                    ChunkedEncodeError::Encode(EncodeError::InvalidValue {
+                        row: 0,
+                        message: "encoded column length overflows",
+                    })
+                })?;
+                emit(bytes).map_err(ChunkedEncodeError::Sink)?;
+            } else {
+                let bytes =
+                    encode_column(field, slice.as_ref()).map_err(ChunkedEncodeError::Encode)?;
+                total = total.checked_add(bytes.len()).ok_or_else(|| {
+                    ChunkedEncodeError::Encode(EncodeError::InvalidValue {
+                        row: 0,
+                        message: "encoded column length overflows",
+                    })
+                })?;
+                emit(&bytes).map_err(ChunkedEncodeError::Sink)?;
+            }
+        }
+    }
+    Ok(total)
+}
 
 pub fn monet_type_for_field(field: &Field) -> Result<MonetType, EncodeError> {
     let extension = field
@@ -378,6 +479,166 @@ fn fixed_wire_width(field: &Field, data_type: &DataType) -> Result<Option<usize>
         return Ok(Some(2));
     }
     Ok(crate::wire::fixed_wire_width(monet_type_for_field(field)?))
+}
+
+fn checked_encoded_size(rows: usize, width: usize) -> Result<usize, EncodeError> {
+    rows.checked_mul(width).ok_or(EncodeError::InvalidValue {
+        row: 0,
+        message: "encoded column length overflows",
+    })
+}
+
+fn estimated_strings<'a>(
+    mut values: impl Iterator<Item = Option<&'a str>>,
+    rows: usize,
+) -> Result<usize, EncodeError> {
+    values.try_fold(0usize, |total, value| {
+        let bytes = value.map_or(2, |value| value.len().saturating_add(1));
+        total.checked_add(bytes).ok_or(EncodeError::InvalidValue {
+            row: rows,
+            message: "encoded string column length overflows",
+        })
+    })
+}
+
+fn estimated_dictionary_strings(array: &dyn Array, key: &DataType) -> Result<usize, EncodeError> {
+    macro_rules! keys {
+        ($type:ty) => {{
+            let values = downcast::<DictionaryArray<$type>>(array, array.data_type().clone())?;
+            estimated_dictionary_values(values)
+        }};
+    }
+    match key {
+        DataType::Int8 => keys!(Int8Type),
+        DataType::Int16 => keys!(Int16Type),
+        DataType::Int32 => keys!(Int32Type),
+        DataType::Int64 => keys!(Int64Type),
+        DataType::UInt8 => keys!(UInt8Type),
+        DataType::UInt16 => keys!(UInt16Type),
+        DataType::UInt32 => keys!(UInt32Type),
+        DataType::UInt64 => keys!(UInt64Type),
+        _ => Err(EncodeError::Unsupported(array.data_type().clone())),
+    }
+}
+
+fn estimated_dictionary_values<K: ArrowDictionaryKeyType>(
+    array: &DictionaryArray<K>,
+) -> Result<usize, EncodeError> {
+    macro_rules! values {
+        ($array:ty) => {{
+            let values = array
+                .values()
+                .as_any()
+                .downcast_ref::<$array>()
+                .ok_or_else(|| EncodeError::Unsupported(array.data_type().clone()))?;
+            for row in 0..array.len() {
+                if array.key(row).is_some_and(|key| key >= values.len()) {
+                    return Err(EncodeError::InvalidValue {
+                        row,
+                        message: "dictionary key is outside the dictionary values",
+                    });
+                }
+            }
+            estimated_strings(
+                (0..array.len()).map(|row| {
+                    array
+                        .key(row)
+                        .filter(|&key| !values.is_null(key))
+                        .map(|key| values.value(key))
+                }),
+                array.len(),
+            )
+        }};
+    }
+    match array.values().data_type() {
+        DataType::Utf8 => values!(StringArray),
+        DataType::LargeUtf8 => values!(LargeStringArray),
+        DataType::Utf8View => values!(StringViewArray),
+        _ => Err(EncodeError::Unsupported(array.data_type().clone())),
+    }
+}
+
+fn estimated_blobs<'a>(
+    mut values: impl Iterator<Item = Option<&'a [u8]>>,
+    rows: usize,
+) -> Result<usize, EncodeError> {
+    values.try_fold(0usize, |total, value| {
+        let bytes = 8usize.saturating_add(value.map_or(0, <[u8]>::len));
+        total.checked_add(bytes).ok_or(EncodeError::InvalidValue {
+            row: rows,
+            message: "encoded BLOB column length overflows",
+        })
+    })
+}
+
+#[cfg(target_endian = "little")]
+fn borrowed_wire_bytes<'a>(
+    field: &Field,
+    array: &'a dyn Array,
+) -> Result<Option<&'a [u8]>, EncodeError> {
+    macro_rules! signed {
+        ($array:ty, $type:ty, $variant:expr) => {{
+            let values = downcast::<$array>(array, $variant)?;
+            for row in 0..values.len() {
+                if values.value(row) == <$type>::MIN {
+                    return if values.is_null(row) {
+                        Ok(None)
+                    } else {
+                        Err(EncodeError::InvalidValue {
+                            row,
+                            message: "value collides with MonetDB's NULL sentinel",
+                        })
+                    };
+                }
+            }
+            if values.null_count() == 0 {
+                Some(values.values().inner().as_slice())
+            } else {
+                None
+            }
+        }};
+    }
+    let bytes = match array.data_type() {
+        DataType::Int8 => signed!(Int8Array, i8, DataType::Int8),
+        DataType::Int16 => signed!(Int16Array, i16, DataType::Int16),
+        DataType::Int32 => signed!(Int32Array, i32, DataType::Int32),
+        DataType::Int64 => signed!(Int64Array, i64, DataType::Int64),
+        DataType::Float32 => {
+            let values = downcast::<Float32Array>(array, DataType::Float32)?;
+            for row in 0..values.len() {
+                if !values.is_null(row) && !values.value(row).is_finite() {
+                    return Err(EncodeError::InvalidValue {
+                        row,
+                        message: "non-finite floats are outside MonetDB's supported value domain",
+                    });
+                }
+            }
+            (values.null_count() == 0).then(|| values.values().inner().as_slice())
+        }
+        DataType::Float64 => {
+            let values = downcast::<Float64Array>(array, DataType::Float64)?;
+            for row in 0..values.len() {
+                if !values.is_null(row) && !values.value(row).is_finite() {
+                    return Err(EncodeError::InvalidValue {
+                        row,
+                        message: "non-finite floats are outside MonetDB's supported value domain",
+                    });
+                }
+            }
+            (values.null_count() == 0).then(|| values.values().inner().as_slice())
+        }
+        _ => None,
+    };
+    let _ = field;
+    Ok(bytes)
+}
+
+#[cfg(target_endian = "big")]
+fn borrowed_wire_bytes<'a>(
+    _field: &Field,
+    _array: &'a dyn Array,
+) -> Result<Option<&'a [u8]>, EncodeError> {
+    Ok(None)
 }
 
 fn downcast<T: 'static>(array: &dyn Array, expected: DataType) -> Result<&T, EncodeError> {
@@ -1111,6 +1372,42 @@ mod tests {
         ]
         .concat();
         assert_eq!(encode_column(&field, &array).unwrap(), expected);
+    }
+
+    #[test]
+    fn chunked_encoding_spans_arrays_without_concatenating_them() {
+        let field = Field::new("i", DataType::Int32, false);
+        let first: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
+        let second: ArrayRef = Arc::new(Int32Array::from(vec![4, 5]));
+        let arrays = [first.as_ref(), second.as_ref()];
+        let mut emitted = Vec::new();
+        let bytes = encode_column_chunks(&field, &arrays, NonZeroUsize::new(8).unwrap(), |chunk| {
+            emitted.extend_from_slice(chunk);
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+
+        let expected = [1i32, 2, 3, 4, 5]
+            .into_iter()
+            .flat_map(i32::to_le_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(bytes, expected.len());
+        assert_eq!(emitted, expected);
+    }
+
+    #[test]
+    fn estimated_variable_width_size_bounds_chunked_output() {
+        let field = Field::new("s", DataType::Utf8, true);
+        let array = StringArray::from(vec![Some("repeated"), None, Some("repeated"), Some("")]);
+        let estimate = estimated_encoded_size(&field, &array).unwrap();
+        let mut emitted = Vec::new();
+        encode_column_chunks(&field, &[&array], NonZeroUsize::new(10).unwrap(), |chunk| {
+            emitted.extend_from_slice(chunk);
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+        assert!(estimate >= emitted.len());
+        assert_eq!(decode_strings(&emitted, array.len()).unwrap(), array);
     }
 
     #[test]

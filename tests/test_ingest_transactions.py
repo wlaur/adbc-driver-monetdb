@@ -1,11 +1,13 @@
+import json
 import os
 import subprocess
+from collections.abc import Iterator
 
 import adbc_driver_manager
 import pyarrow as pa
 import pytest
 
-from adbc_driver_monetdb import dbapi
+from adbc_driver_monetdb import StatementOptions, dbapi
 
 
 def _database_farm_bytes() -> int | None:
@@ -19,6 +21,141 @@ def _database_farm_bytes() -> int | None:
         text=True,
     )
     return int(result.stdout.split()[0])
+
+
+def _reader_that_fails_after(batch: pa.RecordBatch) -> pa.RecordBatchReader:
+    def batches() -> Iterator[pa.RecordBatch]:
+        yield batch
+        raise RuntimeError("intentional upstream failure")
+
+    return pa.RecordBatchReader.from_batches(batch.schema, batches())
+
+
+@pytest.mark.integration
+def test_upstream_failure_after_copy_blocks_commit_until_rollback(monetdb_uri: str) -> None:
+    with dbapi.connect(monetdb_uri, autocommit=True) as setup:
+        setup.execute("DROP TABLE IF EXISTS ingest_partial_append")
+        setup.execute("CREATE TABLE ingest_partial_append(value INT)")
+        setup.execute("INSERT INTO ingest_partial_append VALUES (1)")
+
+    try:
+        batch = pa.record_batch({"value": pa.array([3, 4], type=pa.int32())})
+        with (
+            dbapi.connect(monetdb_uri) as connection,
+            connection.cursor(adbc_stmt_kwargs={StatementOptions.WRITE_BATCH_ROWS: "2"}) as cursor,
+        ):
+            cursor.execute("INSERT INTO ingest_partial_append VALUES (2)")
+            with pytest.raises(Exception, match="intentional upstream failure"):
+                cursor.adbc_ingest(
+                    "ingest_partial_append",
+                    _reader_that_fails_after(batch),
+                    mode="append",
+                )
+            cursor.execute("SELECT value FROM ingest_partial_append ORDER BY value")
+            assert cursor.fetchall() == [(1,), (2,), (3,), (4,)]
+            with pytest.raises(adbc_driver_manager.ProgrammingError, match="ROLLBACK is required") as caught:
+                connection.commit()
+            assert caught.value.status_code == adbc_driver_manager.AdbcStatusCode.INVALID_STATE
+            stats = json.loads(cursor.adbc_statement.get_option(str(StatementOptions.INGEST_STATS)))
+            assert stats["copy_count"] == 1
+            assert stats["poisoned"] is True
+            connection.rollback()
+            cursor.execute("INSERT INTO ingest_partial_append VALUES (5)")
+            connection.commit()
+
+        with dbapi.connect(monetdb_uri, autocommit=True) as audit:
+            assert audit.execute("SELECT value FROM ingest_partial_append ORDER BY value").fetchall() == [(1,), (5,)]
+    finally:
+        with dbapi.connect(monetdb_uri, autocommit=True) as cleanup:
+            cleanup.execute("DROP TABLE IF EXISTS ingest_partial_append")
+
+
+@pytest.mark.integration
+def test_savepoint_atomicity_preserves_prior_caller_work(monetdb_uri: str) -> None:
+    with dbapi.connect(monetdb_uri, autocommit=True) as setup:
+        setup.execute("DROP TABLE IF EXISTS ingest_savepoint_append")
+        setup.execute("CREATE TABLE ingest_savepoint_append(value INT)")
+
+    try:
+        batch = pa.record_batch({"value": pa.array([2, 3], type=pa.int32())})
+        options: dict[str, object] = {
+            str(StatementOptions.WRITE_BATCH_ROWS): "2",
+            str(StatementOptions.INGEST_ATOMICITY): "savepoint",
+        }
+        with dbapi.connect(monetdb_uri) as connection, connection.cursor(adbc_stmt_kwargs=options) as cursor:
+            cursor.execute("INSERT INTO ingest_savepoint_append VALUES (1)")
+            with pytest.raises(Exception, match="intentional upstream failure"):
+                cursor.adbc_ingest(
+                    "ingest_savepoint_append",
+                    _reader_that_fails_after(batch),
+                    mode="append",
+                )
+            cursor.execute("SELECT value FROM ingest_savepoint_append")
+            assert cursor.fetchall() == [(1,)]
+            connection.commit()
+
+        with dbapi.connect(monetdb_uri, autocommit=True) as audit:
+            assert audit.execute("SELECT value FROM ingest_savepoint_append").fetchall() == [(1,)]
+    finally:
+        with dbapi.connect(monetdb_uri, autocommit=True) as cleanup:
+            cleanup.execute("DROP TABLE IF EXISTS ingest_savepoint_append")
+
+
+@pytest.mark.integration
+def test_allow_partial_escape_hatch_leaves_commit_under_caller_control(
+    monetdb_uri: str,
+) -> None:
+    with dbapi.connect(monetdb_uri, autocommit=True) as setup:
+        setup.execute("DROP TABLE IF EXISTS ingest_allow_partial")
+        setup.execute("CREATE TABLE ingest_allow_partial(value INT)")
+
+    try:
+        batch = pa.record_batch({"value": pa.array([2, 3], type=pa.int32())})
+        options: dict[str, object] = {
+            str(StatementOptions.WRITE_BATCH_ROWS): "2",
+            str(StatementOptions.INGEST_PARTIAL): "allow",
+        }
+        with dbapi.connect(monetdb_uri) as connection, connection.cursor(adbc_stmt_kwargs=options) as cursor:
+            cursor.execute("INSERT INTO ingest_allow_partial VALUES (1)")
+            with pytest.raises(Exception, match="intentional upstream failure"):
+                cursor.adbc_ingest(
+                    "ingest_allow_partial",
+                    _reader_that_fails_after(batch),
+                    mode="append",
+                )
+            stats = json.loads(cursor.adbc_statement.get_option(str(StatementOptions.INGEST_STATS)))
+            assert stats["copy_count"] == 1
+            assert stats["poisoned"] is False
+            connection.commit()
+
+        with dbapi.connect(monetdb_uri, autocommit=True) as audit:
+            assert audit.execute("SELECT value FROM ingest_allow_partial ORDER BY value").fetchall() == [
+                (1,),
+                (2,),
+                (3,),
+            ]
+    finally:
+        with dbapi.connect(monetdb_uri, autocommit=True) as cleanup:
+            cleanup.execute("DROP TABLE IF EXISTS ingest_allow_partial")
+
+
+@pytest.mark.integration
+def test_default_scheduler_coalesces_small_upstream_batches(monetdb_uri: str) -> None:
+    batches = [
+        pa.record_batch({"value": pa.array(range(start, start + 1_000), type=pa.int32())})
+        for start in range(0, 10_000, 1_000)
+    ]
+    reader = pa.RecordBatchReader.from_batches(batches[0].schema, batches)
+    with dbapi.connect(monetdb_uri) as connection, connection.cursor() as cursor:
+        try:
+            assert cursor.adbc_ingest("ingest_coalesced_batches", reader, mode="replace") == 10_000
+            stats = json.loads(cursor.adbc_statement.get_option(str(StatementOptions.INGEST_STATS)))
+            assert stats["input_batches"] == 10
+            assert stats["coalesced_windows"] == 1
+            assert stats["copy_count"] == 1
+            assert stats["encoded_bytes"] == 40_000
+        finally:
+            cursor.execute("DROP TABLE IF EXISTS ingest_coalesced_batches")
 
 
 @pytest.mark.integration

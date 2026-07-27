@@ -145,7 +145,6 @@ with dbapi.connect(
     conn_kwargs={
         ConnectionOptions.READ_TIMEOUT: "30",
         ConnectionOptions.READ_PREFETCH: "true",
-        ConnectionOptions.WRITE_BATCH_ROWS: "100000",
     },
 ) as conn:
     with conn.cursor(
@@ -174,23 +173,39 @@ still in flight; it does not implicitly cancel and permanently close the session
 statement on that connection may wait for the detached fetch or its configured read/operation
 timeout. Use `adbc_cancel()` when session destruction is intended, or set
 `adbc.monetdb.read_prefetch` to `"false"` when prompt pool reuse matters more than fetch/decode
-overlap. Ingestion defaults parallel encode/COPY windows to 131,072 rows to bound memory. Setting
-`adbc.monetdb.write_batch_rows` to a positive value chooses a different window size; zero restores
-the default. Set it through `conn_kwargs` as above when `DataFrame.write_database` creates its own
-cursor, or through `adbc_stmt_kwargs` for a directly managed cursor. Larger windows use more
-memory but can avoid repeated COPY overhead and persistent storage allocation for large, wide
-ingests. The input Arrow stream remains incremental, but columns within each bounded window are
-encoded eagerly so they can run in parallel. The protocol library's `lazy` upload callback still
-materializes one complete encoded column and serializes encoding with network transfer; it is not
-a byte-streaming encoder.
+overlap.
+
+Ingestion automatically chooses the fewest COPY windows that fit a 128 MiB encoded-byte budget.
+The driver estimates wire bytes per row from the first 4,096 rows, coalesces small upstream Arrow
+batches, splits large ones without copying their buffers, and adapts after each window. Target
+windows stay between 4,096 and 4,194,304 rows. On Linux the default budget is reduced when a
+cgroup memory limit requires it. Each requested column is then encoded directly into bounded
+16 MiB upload messages; null-free signed integers and 32/64-bit floats borrow their Arrow value
+buffers after validation instead of copying them. Peak encoding memory is therefore bounded by
+the upload buffers rather than the logical window size.
+
+`adbc.monetdb.write_window_bytes` changes the byte budget; zero selects the automatic default.
+`adbc.monetdb.write_batch_rows` remains a diagnostic row-count override and disables adaptation.
+Both options can be set on a connection or statement, with statement values taking precedence.
+Applications normally need neither: producer batch boundaries do not define COPY boundaries.
+After an ingest, the read-only statement option `adbc.monetdb.ingest_stats` returns JSON containing
+the input-batch and COPY counts, coalesced/split window counts, encoded bytes, bounded in-flight
+bytes, window trajectories, transaction scope, and poison state.
 
 An append to an existing table inside an explicit transaction executes directly for every Arrow
-stream window. This avoids MonetDB retaining a full table version for an operation savepoint. For
-a large incremental source, prefer passing one `RecordBatchReader` to one `adbc_ingest` call. If
-MonetDB reports a server error, its DB-API exception and SQLSTATE propagate unchanged; the
-explicit transaction remains aborted until `rollback()`. Autocommit ingestion wraps the complete
-stream in an internal transaction, rolls it back on error, and restores the connection
-automatically.
+stream window. This avoids MonetDB retaining and replaying a full table version for an operation
+savepoint. If a client-side stream or encoding error occurs after one or more completed COPY
+windows, subsequent reads remain available but `commit()` raises `InvalidState` until
+`rollback()` removes the partial append. Server errors retain their DB-API exception and SQLSTATE;
+MonetDB itself leaves that transaction aborted until rollback. Autocommit ingestion wraps the
+complete stream in an internal transaction, rolls it back on error, and restores the connection.
+
+Two advanced statement or connection options change that contract. Setting
+`adbc.monetdb.ingest_atomicity` to `"savepoint"` preserves earlier caller work and rolls back only
+the failed ingest, but MonetDB Dec2025 may write an extra full copy of a sub-million-row append to
+its WAL. The default `"transaction"` scope avoids that amplification and blocks commit after a
+partial client-side failure. Setting `adbc.monetdb.ingest_partial` to `"allow"` permits committing
+completed windows after such a failure; the default `"block"` is the safe behavior.
 
 Positional prepared statements are cached per connection by exact SQL text, so consumers such as
 SQLAlchemy can create a fresh cursor for each execution without making MonetDB compile the same
@@ -245,7 +260,7 @@ close that connection and open another one before issuing more work.
 Client information is sent at login by default. The `client` value in
 [`sys.sessions`](https://www.monetdb.org/documentation-Dec2025/user-guide/sql-catalog/users-roles-privileges-sessions/)
 identifies this driver and its protocol library, for example
-`adbc_driver_monetdb 0.8.7 / monetdb-rust 0.2.2-wlaur.1`. The Python shim uses the basename of
+`adbc_driver_monetdb 0.8.8 / monetdb-rust 0.2.2-wlaur.1`. The Python shim uses the basename of
 `sys.argv[0]` as the default `application`. Hostname and process id are also sent by default, as
 they are by pymonetdb and libmapi; use `client_info=false` if that host metadata should not leave
 the client.

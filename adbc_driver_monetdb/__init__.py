@@ -32,6 +32,9 @@ class ConnectionOptions(StrEnum):
     READ_BATCH_ROWS = "adbc.monetdb.read_batch_rows"
     READ_PREFETCH = "adbc.monetdb.read_prefetch"
     WRITE_BATCH_ROWS = "adbc.monetdb.write_batch_rows"
+    WRITE_WINDOW_BYTES = "adbc.monetdb.write_window_bytes"
+    INGEST_PARTIAL = "adbc.monetdb.ingest_partial"
+    INGEST_ATOMICITY = "adbc.monetdb.ingest_atomicity"
 
 
 class StatementOptions(StrEnum):
@@ -41,6 +44,10 @@ class StatementOptions(StrEnum):
     READ_BATCH_ROWS = "adbc.monetdb.read_batch_rows"
     READ_PREFETCH = "adbc.monetdb.read_prefetch"
     WRITE_BATCH_ROWS = "adbc.monetdb.write_batch_rows"
+    WRITE_WINDOW_BYTES = "adbc.monetdb.write_window_bytes"
+    INGEST_PARTIAL = "adbc.monetdb.ingest_partial"
+    INGEST_ATOMICITY = "adbc.monetdb.ingest_atomicity"
+    INGEST_STATS = "adbc.monetdb.ingest_stats"
 
 
 def driver_path() -> str:

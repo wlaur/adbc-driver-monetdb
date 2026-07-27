@@ -51,25 +51,27 @@ requirements change their premises.
 
 ## Result scheduling and memory
 
-- The default read and parallel encode/COPY windows are both 131,072 rows. A sweep from 32,768
-  through 262,144 rows found no better general default. Write windows remain configurable in
-  either direction because repeated COPY statements can make large wide ingests slower and leave
-  more persistent storage allocated; larger windows trade additional client memory for fewer COPY
-  statements.
-- Bulk ingest is lazy across the bound Arrow stream but eager within each bounded COPY window.
-  The generic protocol library's lazy upload callback defers production until MonetDB requests a
-  named file, but it still returns one complete `Vec<u8>` and therefore is not a streaming encoder.
-  Encoding every column in the current window first permits parallel encoding; the measured
-  change from lazy serial columns improved tall-batch ingest by 8.2–8.5% for about 4.4 MB more
-  peak RSS. Use a smaller `adbc.monetdb.write_batch_rows` when a workload values memory over that
-  throughput rather than serializing every workload by default.
+- The read default remains 131,072 rows. Write scheduling is byte-based: a 128 MiB encoded budget,
+  bounded to 4,096–4,194,304 rows and reduced under constrained Linux cgroups. The first 4,096
+  rows establish the wire-byte estimate; later windows use a 70/30 actual/prior update. This makes
+  COPY boundaries independent of producer batching while retaining a diagnostic exact-row
+  override.
+- The protocol fork exposes a generic streaming upload sink. The driver serves each requested
+  column in bounded 16 MiB pieces, so an encoded window is never materialized as one `Vec<u8>`.
+  Null-free signed integer and float layouts borrow validated Arrow buffers directly; other types
+  use one bounded scratch piece while the protocol layer owns one framed piece. A 2M-row
+  single-column replay improved from 52.3 to 23.8 ms for BIGINT, 127.6 to 53.0 ms for VARCHAR, and
+  105.7 to 42.5 ms for TIMESTAMP on the documented local Dec2025 harness because adaptive
+  coalescing also removed repeated COPY round trips.
 - Appends to an existing table inside a caller-managed transaction execute directly for every
   COPY window. Operation savepoints caused MonetDB to retain and materialize disproportionate
-  storage for large, wide streams even after the savepoint was released. A server error aborts
-  the caller transaction until rollback, matching MonetDB's normal DB-API transaction behavior.
-  Autocommit still wraps the complete stream in an internal transaction so failed streams leave
-  no partial append. Create and replace modes retain their operation savepoint because their DDL
-  must be recovered without discarding unrelated caller work.
+  storage for large, wide streams even after the savepoint was released. A server error aborts the
+  caller transaction until rollback. A client-side error after a completed window marks the
+  connection rollback-only: reads remain available, but commit is blocked until rollback. This
+  preserves caller ownership without silently discarding earlier work. Explicit savepoint and
+  partial-commit modes remain advanced opt-ins. Autocommit still wraps the complete stream in an
+  internal transaction; create and replace modes retain their operation savepoint because their
+  DDL must be recovered without discarding unrelated caller work.
 - The prefetch worker fetches complete raw `Xexportbin` frames while the caller decodes the
   previous frame. A worker that both fetches and decodes would serialize those phases and lose the
   overlap.
@@ -177,7 +179,8 @@ be reviewed and reproduced.
 | Unconditional dedup-map pre-sizing or a 2,048-row sample | Rejected in favor of the adaptive 4,096-row sample. |
 | Disabling dedup adaptively | Rejected; the best case was about 2%, with a 2–5× downside on a wrong guess. |
 | Temporal, decimal, or primitive encode rewrites | Rejected; they were at parity or slower. The chrono removal helped decode because decode had validation and intermediate-allocation costs that encode does not have. |
-| Cross-batch backreferences, COPY double-buffering, or write-side pipelining | Deferred unless a measured workload puts encoding back on the critical path; server COPY time currently dominates. |
+| Cross-window string backreferences | Deferred; keeping windows independent bounds state, while adaptive coalescing already avoids upstream-batch resets. |
+| Asynchronous COPY double-buffering | Rejected for the sequential ON CLIENT protocol; synchronous bounded encode/send already holds at most one scratch and one framed chunk. |
 | A worker that fetches and decodes | Rejected because it cannot overlap the two phases. |
 | Performance-only protocol-fork primitives | Rejected unless a genuinely generic MAPI operation is missing. |
 
