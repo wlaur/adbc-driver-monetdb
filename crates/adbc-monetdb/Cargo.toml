@@ -21,12 +21,12 @@ adbc_core.workspace = true
 adbc_ffi.workspace = true
 arrow-array.workspace = true
 arrow-schema.workspace = true
+arrow-select.workspace = true
 chrono.workspace = true
 monetdb = { workspace = true, features = ["rustls"] }
 monetdb-arrow.workspace = true
 pyo3 = { workspace = true, optional = true }
 percent-encoding.workspace = true
-rayon.workspace = true
 url.workspace = true
 
 [build-dependencies]

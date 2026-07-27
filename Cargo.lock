@@ -4,13 +4,14 @@ version = 4
 
 [[package]]
 name = "adbc-monetdb"
-version = "0.8.7"
+version = "0.8.8"
 dependencies = [
  "adbc_core",
  "adbc_ffi",
  "arrow-array",
  "arrow-buffer",
  "arrow-schema",
+ "arrow-select",
  "cargo-lock",
  "chrono",
  "libloading",
@@ -19,7 +20,6 @@ dependencies = [
  "percent-encoding",
  "proptest",
  "pyo3",
- "rayon",
  "url",
 ]
 
@@ -121,6 +121,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f633dbfdf39c039ada1bf9e34c694816eb71fbb7dc78f613993b7245e078a1ed"
 dependencies = [
  "bitflags",
+]
+
+[[package]]
+name = "arrow-select"
+version = "58.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8cd065c54172ac787cf3f2f8d4107e0d3fdc26edba76fdf4f4cc170258942222"
+dependencies = [
+ "ahash",
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-data",
+ "arrow-schema",
+ "num-traits",
 ]
 
 [[package]]
@@ -835,7 +849,7 @@ dependencies = [
 
 [[package]]
 name = "monetdb-arrow"
-version = "0.8.7"
+version = "0.8.8"
 dependencies = [
  "arrow-array",
  "arrow-buffer",

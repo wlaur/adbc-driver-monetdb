@@ -1,9 +1,9 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fmt,
     num::NonZeroUsize,
-    ops::Range,
     os::raw::c_char,
+    path::Path,
     sync::{
         Arc, Mutex, MutexGuard, Weak,
         atomic::{AtomicU64, Ordering},
@@ -24,11 +24,11 @@ use arrow_array::{
     UInt32Array, UnionArray, new_empty_array,
 };
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
+use arrow_select::concat::concat_batches;
 use monetdb::{
     CancelHandle, CursorError, Endian, MonetType, Parameters, ResultColumn, Timeouts, parms::Parm,
 };
 use percent_encoding::percent_decode_str;
-use rayon::prelude::*;
 
 mod metadata;
 mod parameters;
@@ -39,7 +39,15 @@ use parameters::{
 };
 
 const DEFAULT_READ_BATCH_ROWS: usize = 131_072;
-const DEFAULT_ENCODE_BATCH_ROWS: usize = 131_072;
+const DEFAULT_WRITE_WINDOW_BYTES: usize = 512 * 1024 * 1024;
+const CONSTRAINED_WRITE_WINDOW_BYTES: usize = 1usize << 31;
+const NARROW_CONSTRAINED_ROW_BYTES: usize = 16;
+const MIN_WRITE_WINDOW_BYTES: usize = 4 * 1024 * 1024;
+const MIN_WRITE_WINDOW_ROWS: usize = 4_096;
+const WRITE_ESTIMATE_SAMPLE_ROWS: usize = 4_096;
+const ENCODE_CHUNK_BYTES: usize = 1024 * 1024;
+const MAX_PENDING_BATCHES: usize = 1_024;
+const PENDING_BATCH_COMPACTION: usize = MAX_PENDING_BATCHES / 2;
 const PREPARED_CACHE_CAPACITY: usize = 128;
 const PREFETCH_DROP_GRACE: Duration = Duration::from_millis(250);
 const METADATA_REPLY_ROWS: usize = 1024;
@@ -47,6 +55,10 @@ const INLINE_REPLY_ROWS: i64 = 100;
 const READ_BATCH_ROWS_OPTION: &str = "adbc.monetdb.read_batch_rows";
 const READ_PREFETCH_OPTION: &str = "adbc.monetdb.read_prefetch";
 const WRITE_BATCH_ROWS_OPTION: &str = "adbc.monetdb.write_batch_rows";
+const WRITE_WINDOW_BYTES_OPTION: &str = "adbc.monetdb.write_window_bytes";
+const INGEST_PARTIAL_OPTION: &str = "adbc.monetdb.ingest_partial";
+const INGEST_ATOMICITY_OPTION: &str = "adbc.monetdb.ingest_atomicity";
+const INGEST_STATS_OPTION: &str = "adbc.monetdb.ingest_stats";
 const BIND_BY_NAME_OPTION: &str = "adbc.statement.bind_by_name";
 const CONNECT_TIMEOUT_OPTION: &str = "adbc.monetdb.connect_timeout_seconds";
 const READ_TIMEOUT_OPTION: &str = "adbc.monetdb.read_timeout_seconds";
@@ -241,6 +253,89 @@ fn write_batch_rows_option(value: &OptionValue) -> Result<Option<usize>> {
     })
 }
 
+fn write_window_bytes_option(value: &OptionValue) -> Result<Option<usize>> {
+    let bytes = integer_option(WRITE_WINDOW_BYTES_OPTION, value)?;
+    if bytes == 0 {
+        return Ok(None);
+    }
+    usize::try_from(bytes)
+        .ok()
+        .filter(|bytes| *bytes >= MIN_WRITE_WINDOW_BYTES)
+        .map(Some)
+        .ok_or_else(|| {
+            error(
+                format!(
+                    "option '{WRITE_WINDOW_BYTES_OPTION}' must be 0 or at least {MIN_WRITE_WINDOW_BYTES}"
+                ),
+                Status::InvalidArguments,
+            )
+        })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IngestPartial {
+    Block,
+    Allow,
+}
+
+impl IngestPartial {
+    fn parse(value: &OptionValue) -> Result<Self> {
+        let OptionValue::String(value) = value else {
+            return Err(error(
+                format!("option '{INGEST_PARTIAL_OPTION}' must be a string"),
+                Status::InvalidArguments,
+            ));
+        };
+        match value.as_str() {
+            "block" => Ok(Self::Block),
+            "allow" => Ok(Self::Allow),
+            _ => Err(error(
+                format!("option '{INGEST_PARTIAL_OPTION}' must be 'block' or 'allow'"),
+                Status::InvalidArguments,
+            )),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Block => "block",
+            Self::Allow => "allow",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IngestAtomicity {
+    Transaction,
+    Savepoint,
+}
+
+impl IngestAtomicity {
+    fn parse(value: &OptionValue) -> Result<Self> {
+        let OptionValue::String(value) = value else {
+            return Err(error(
+                format!("option '{INGEST_ATOMICITY_OPTION}' must be a string"),
+                Status::InvalidArguments,
+            ));
+        };
+        match value.as_str() {
+            "transaction" => Ok(Self::Transaction),
+            "savepoint" => Ok(Self::Savepoint),
+            _ => Err(error(
+                format!("option '{INGEST_ATOMICITY_OPTION}' must be 'transaction' or 'savepoint'"),
+                Status::InvalidArguments,
+            )),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Transaction => "transaction",
+            Self::Savepoint => "savepoint",
+        }
+    }
+}
+
 fn apply_parameter_timeout(
     parameters: &mut Parameters,
     timeout: TimeoutOption,
@@ -360,6 +455,7 @@ fn map_display(error: impl fmt::Display, status: Status) -> Error {
 struct DriverConnection {
     inner: Mutex<monetdb::Connection>,
     pending_deallocations: Mutex<Vec<u64>>,
+    ingest_poison: Mutex<Option<IngestPoison>>,
 }
 
 impl DriverConnection {
@@ -367,8 +463,53 @@ impl DriverConnection {
         Self {
             inner: Mutex::new(connection),
             pending_deallocations: Mutex::new(Vec::new()),
+            ingest_poison: Mutex::new(None),
         }
     }
+
+    fn poison_ingest(&self, target: &str, windows: usize) {
+        let mut poison = self
+            .ingest_poison
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if poison.is_none() {
+            *poison = Some(IngestPoison {
+                target: target.to_owned(),
+                windows,
+            });
+        }
+    }
+
+    fn commit_error(&self) -> Option<Error> {
+        self.ingest_poison
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|poison| {
+                let mut result = error(
+                    format!(
+                        "ingest into {} failed after {} COPY windows; the transaction contains a partial append; ROLLBACK is required",
+                        poison.target, poison.windows
+                    ),
+                    Status::InvalidState,
+                );
+                result.sqlstate =
+                    parse_sqlstate("25000").expect("the rollback-only SQLSTATE is valid");
+                result
+            })
+    }
+
+    fn clear_ingest_poison(&self) {
+        *self
+            .ingest_poison
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+}
+
+struct IngestPoison {
+    target: String,
+    windows: usize,
 }
 
 type SharedConnection = Arc<DriverConnection>;
@@ -825,6 +966,9 @@ impl Database for MonetdbDatabase {
             read_batch_rows: DEFAULT_READ_BATCH_ROWS,
             read_prefetch: true,
             write_batch_rows: None,
+            write_window_bytes: None,
+            ingest_partial: IngestPartial::Block,
+            ingest_atomicity: IngestAtomicity::Transaction,
             options,
             version,
             catalog,
@@ -906,6 +1050,9 @@ pub struct MonetdbConnection {
     read_batch_rows: usize,
     read_prefetch: bool,
     write_batch_rows: Option<usize>,
+    write_window_bytes: Option<usize>,
+    ingest_partial: IngestPartial,
+    ingest_atomicity: IngestAtomicity,
     options: Options,
     version: (u16, u16, u16),
     catalog: String,
@@ -1056,9 +1203,27 @@ impl Optionable for MonetdbConnection {
             self.options.set(key, value);
             return Ok(());
         }
+        if key.as_ref() == WRITE_WINDOW_BYTES_OPTION {
+            self.write_window_bytes = write_window_bytes_option(&value)?;
+            self.options.set(key, value);
+            return Ok(());
+        }
+        if key.as_ref() == INGEST_PARTIAL_OPTION {
+            self.ingest_partial = IngestPartial::parse(&value)?;
+            self.options.set(key, value);
+            return Ok(());
+        }
+        if key.as_ref() == INGEST_ATOMICITY_OPTION {
+            self.ingest_atomicity = IngestAtomicity::parse(&value)?;
+            self.options.set(key, value);
+            return Ok(());
+        }
         match &key {
             OptionConnection::AutoCommit => {
                 let enabled = option_bool(&value)?;
+                if enabled && let Some(poison) = self.inner.commit_error() {
+                    return Err(poison);
+                }
                 let connection = lock_connection(&self.inner)?;
                 let current = connection
                     .server_info()
@@ -1136,6 +1301,15 @@ impl Optionable for MonetdbConnection {
         if key.as_ref() == WRITE_BATCH_ROWS_OPTION {
             return Ok(self.write_batch_rows.unwrap_or(0).to_string());
         }
+        if key.as_ref() == WRITE_WINDOW_BYTES_OPTION {
+            return Ok(self.write_window_bytes.unwrap_or(0).to_string());
+        }
+        if key.as_ref() == INGEST_PARTIAL_OPTION {
+            return Ok(self.ingest_partial.as_str().to_owned());
+        }
+        if key.as_ref() == INGEST_ATOMICITY_OPTION {
+            return Ok(self.ingest_atomicity.as_str().to_owned());
+        }
         self.options.get_string(key)
     }
 
@@ -1155,6 +1329,14 @@ impl Optionable for MonetdbConnection {
                 .transpose()
                 .map_err(|_| error("write_batch_rows exceeds i64", Status::Internal))
                 .map(|rows| rows.unwrap_or(0));
+        }
+        if key.as_ref() == WRITE_WINDOW_BYTES_OPTION {
+            return self
+                .write_window_bytes
+                .map(i64::try_from)
+                .transpose()
+                .map_err(|_| error("write_window_bytes exceeds i64", Status::Internal))
+                .map(|bytes| bytes.unwrap_or(0));
         }
         self.options.get_int(key)
     }
@@ -1180,6 +1362,10 @@ impl Connection for MonetdbConnection {
             read_batch_rows: self.read_batch_rows,
             read_prefetch: self.read_prefetch,
             write_batch_rows: self.write_batch_rows,
+            write_window_bytes: self.write_window_bytes,
+            ingest_partial: self.ingest_partial,
+            ingest_atomicity: self.ingest_atomicity,
+            ingest_stats: None,
             bound: None,
             prepared: false,
             prepared_entry: None,
@@ -1293,11 +1479,16 @@ impl Connection for MonetdbConnection {
     }
 
     fn commit(&mut self) -> Result<()> {
+        if let Some(poison) = self.inner.commit_error() {
+            return Err(poison);
+        }
         execute_update(&self.inner, "COMMIT", self.timeouts).map(|_| ())
     }
 
     fn rollback(&mut self) -> Result<()> {
-        execute_update(&self.inner, "ROLLBACK", self.timeouts).map(|_| ())
+        execute_update(&self.inner, "ROLLBACK", self.timeouts).map(|_| {
+            self.inner.clear_ingest_poison();
+        })
     }
 
     fn read_partition(
@@ -1339,6 +1530,10 @@ pub struct MonetdbStatement {
     read_batch_rows: usize,
     read_prefetch: bool,
     write_batch_rows: Option<usize>,
+    write_window_bytes: Option<usize>,
+    ingest_partial: IngestPartial,
+    ingest_atomicity: IngestAtomicity,
+    ingest_stats: Option<String>,
     bound: Option<Box<dyn RecordBatchReader + Send>>,
     prepared: bool,
     prepared_entry: Option<PreparedSlot>,
@@ -1370,6 +1565,27 @@ impl Optionable for MonetdbStatement {
             self.write_batch_rows = write_batch_rows_option(&value)?;
             self.options.set(key, value);
             return Ok(());
+        }
+        if key.as_ref() == WRITE_WINDOW_BYTES_OPTION {
+            self.write_window_bytes = write_window_bytes_option(&value)?;
+            self.options.set(key, value);
+            return Ok(());
+        }
+        if key.as_ref() == INGEST_PARTIAL_OPTION {
+            self.ingest_partial = IngestPartial::parse(&value)?;
+            self.options.set(key, value);
+            return Ok(());
+        }
+        if key.as_ref() == INGEST_ATOMICITY_OPTION {
+            self.ingest_atomicity = IngestAtomicity::parse(&value)?;
+            self.options.set(key, value);
+            return Ok(());
+        }
+        if key.as_ref() == INGEST_STATS_OPTION {
+            return Err(error(
+                format!("option '{INGEST_STATS_OPTION}' is read-only"),
+                Status::InvalidArguments,
+            ));
         }
         if key.as_ref() == BIND_BY_NAME_OPTION {
             self.bind_by_name = option_bool(&value)?;
@@ -1445,6 +1661,21 @@ impl Optionable for MonetdbStatement {
         if key.as_ref() == WRITE_BATCH_ROWS_OPTION {
             return Ok(self.write_batch_rows.unwrap_or(0).to_string());
         }
+        if key.as_ref() == WRITE_WINDOW_BYTES_OPTION {
+            return Ok(self.write_window_bytes.unwrap_or(0).to_string());
+        }
+        if key.as_ref() == INGEST_PARTIAL_OPTION {
+            return Ok(self.ingest_partial.as_str().to_owned());
+        }
+        if key.as_ref() == INGEST_ATOMICITY_OPTION {
+            return Ok(self.ingest_atomicity.as_str().to_owned());
+        }
+        if key.as_ref() == INGEST_STATS_OPTION {
+            return self
+                .ingest_stats
+                .clone()
+                .ok_or_else(|| unknown_option(INGEST_STATS_OPTION));
+        }
         if key == OptionStatement::IngestMode {
             return Ok(self
                 .options
@@ -1478,6 +1709,14 @@ impl Optionable for MonetdbStatement {
                 .transpose()
                 .map_err(|_| error("write_batch_rows exceeds i64", Status::Internal))
                 .map(|rows| rows.unwrap_or(0));
+        }
+        if key.as_ref() == WRITE_WINDOW_BYTES_OPTION {
+            return self
+                .write_window_bytes
+                .map(i64::try_from)
+                .transpose()
+                .map_err(|_| error("write_window_bytes exceeds i64", Status::Internal))
+                .map(|bytes| bytes.unwrap_or(0));
         }
         self.options.get_int(key)
     }
@@ -1891,6 +2130,7 @@ impl MonetdbStatement {
     }
 
     fn ingest(&mut self) -> Result<Option<i64>> {
+        self.ingest_stats = None;
         let reader = self
             .bound
             .take()
@@ -2013,13 +2253,36 @@ impl MonetdbStatement {
                     table,
                     self.timeouts,
                 )?);
-        let caller_scope = if append_to_existing {
-            CallerTransactionScope::Direct
-        } else {
-            CallerTransactionScope::Savepoint
-        };
+        let constrained_append = append_to_existing
+            && table_has_constraints(
+                &connection,
+                if temporary { Some("tmp") } else { schema_name },
+                table,
+                self.timeouts,
+            )?;
+        let narrow_constrained_append = constrained_append
+            && fixed_encoded_row_width(&schema)?
+                .is_some_and(|width| width <= NARROW_CONSTRAINED_ROW_BYTES);
+        let caller_scope =
+            if append_to_existing && self.ingest_atomicity == IngestAtomicity::Transaction {
+                CallerTransactionScope::Direct
+            } else {
+                CallerTransactionScope::Savepoint
+            };
         let (mut cursor, atomic_scope) =
             begin_atomic(&connection, "ingest", caller_scope, self.timeouts)?;
+        let caller_transaction = matches!(&atomic_scope, AtomicScope::CallerTransaction);
+        let scope_name = atomic_scope.name();
+        let window_budget = self
+            .write_window_bytes
+            .unwrap_or_else(|| automatic_write_window_bytes(narrow_constrained_append));
+        let mut scheduler = IngestWindowScheduler::new(
+            reader.as_mut(),
+            Arc::clone(&schema),
+            window_budget,
+            self.write_batch_rows,
+        );
+        let mut stats = IngestStats::new(window_budget, scope_name);
         let result = (|| {
             match mode {
                 "adbc.ingest.mode.create" => cursor.execute(&create).map_err(map_cursor_error)?,
@@ -2063,60 +2326,62 @@ impl MonetdbStatement {
             let copy =
                 format!("COPY LITTLE ENDIAN BINARY INTO {operation_target} FROM {files} ON CLIENT");
             let mut rows = 0i64;
-            for batch in &mut reader {
-                let batch = batch.map_err(Error::from)?;
-                validate_record_batch(&batch)?;
-                if batch.schema() != schema {
+            while let Some(window) = scheduler.next_window()? {
+                let window_rows = window.iter().map(RecordBatch::num_rows).sum::<usize>();
+                let mut window_bytes = 0usize;
+                let mut largest_chunk = 0usize;
+                cursor
+                    .execute_with_streaming_uploads(&copy, |filename, sink| {
+                        let index = upload_column_index(filename, schema.fields().len())?;
+                        let arrays = window
+                            .iter()
+                            .map(|batch| batch.column(index).as_ref())
+                            .collect::<Vec<_>>();
+                        let column_bytes = monetdb_arrow::encode_column_chunks(
+                            &schema.fields()[index],
+                            &arrays,
+                            NonZeroUsize::new(ENCODE_CHUNK_BYTES)
+                                .expect("encode chunk size is positive"),
+                            |chunk| {
+                                largest_chunk = largest_chunk.max(chunk.len());
+                                sink.write_chunk(chunk)
+                            },
+                        )
+                        .map_err(map_chunked_encode_error)?;
+                        window_bytes = window_bytes.checked_add(column_bytes).ok_or_else(|| {
+                            CursorError::FileTransfer("encoded ingest byte count overflows".into())
+                        })?;
+                        Ok(())
+                    })
+                    .map_err(map_cursor_error)?;
+                let server_rows = cursor.affected_rows().ok_or_else(|| {
+                    error(
+                        "MonetDB did not report the COPY row count",
+                        Status::InvalidData,
+                    )
+                })?;
+                let expected_rows = i64::try_from(window_rows)
+                    .map_err(|_| error("window row count exceeds i64", Status::Internal))?;
+                if server_rows != expected_rows {
                     return Err(error(
-                        "record batch schema changed within ingest stream",
+                        format!(
+                            "MonetDB copied {server_rows} rows from a window containing {expected_rows} rows"
+                        ),
                         Status::InvalidData,
                     ));
                 }
-                if batch.num_rows() == 0 {
-                    continue;
-                }
-                let write_batch_rows = encode_batch_rows(batch.num_rows(), self.write_batch_rows);
-                for range in batch_ranges(batch.num_rows(), write_batch_rows) {
-                    let batch = batch.slice(range.start, range.len());
-                    let encoded = schema
-                        .fields()
-                        .par_iter()
-                        .enumerate()
-                        .map(|(index, field)| {
-                            monetdb_arrow::encode_column(field, batch.column(index).as_ref())
-                                .map(|bytes| (format!("c{index}"), bytes))
-                                .map_err(|value| {
-                                    map_cursor_error(CursorError::FileTransfer(value.to_string()))
-                                })
-                        })
-                        .collect::<Vec<_>>();
-                    let uploads = encoded.into_iter().collect::<Result<HashMap<_, _>>>()?;
-                    cursor
-                        .execute_with_binary_uploads(&copy, &uploads)
-                        .map_err(map_cursor_error)?;
-                    let server_rows = cursor.affected_rows().ok_or_else(|| {
-                        error(
-                            "MonetDB did not report the COPY row count",
-                            Status::InvalidData,
-                        )
-                    })?;
-                    let expected_rows = i64::try_from(batch.num_rows())
-                        .map_err(|_| error("batch row count exceeds i64", Status::Internal))?;
-                    if server_rows != expected_rows {
-                        return Err(error(
-                            format!(
-                                "MonetDB copied {server_rows} rows from a batch containing {expected_rows} rows"
-                            ),
-                            Status::InvalidData,
-                        ));
-                    }
-                    rows = rows.checked_add(server_rows).ok_or_else(|| {
-                        error("ingested row count overflows i64", Status::Internal)
-                    })?;
-                }
+                rows = rows
+                    .checked_add(server_rows)
+                    .ok_or_else(|| error("ingested row count overflows i64", Status::Internal))?;
+                scheduler.observe_window(window_rows, window_bytes);
+                stats.record_window(window_rows, window_bytes, largest_chunk);
             }
             Ok(rows)
         })();
+        stats.input_batches = scheduler.input_batches;
+        stats.coalesced_windows = scheduler.coalesced_windows;
+        stats.split_windows = scheduler.split_windows;
+        let operation_failed = result.is_err();
         let result = finish_atomic(
             &connection,
             &mut cursor,
@@ -2125,6 +2390,16 @@ impl MonetdbStatement {
             self.timeouts,
         )
         .map(Some);
+        if operation_failed
+            && caller_transaction
+            && stats.copy_count > 0
+            && self.ingest_partial == IngestPartial::Block
+        {
+            self.connection
+                .poison_ingest(&operation_target, stats.copy_count);
+            stats.poisoned = true;
+        }
+        self.ingest_stats = Some(stats.to_json());
         drop(cursor);
         drop(connection);
         if mode != "adbc.ingest.mode.append" && result.is_ok() {
@@ -2137,18 +2412,303 @@ impl MonetdbStatement {
     }
 }
 
-fn batch_ranges(rows: usize, batch_rows: usize) -> impl Iterator<Item = Range<usize>> {
-    debug_assert!(batch_rows > 0);
-    (0..rows).step_by(batch_rows).map(move |start| {
-        let len = (rows - start).min(batch_rows);
-        start..start + len
-    })
+fn upload_column_index(filename: &str, columns: usize) -> std::result::Result<usize, CursorError> {
+    filename
+        .strip_prefix('c')
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|index| *index < columns)
+        .ok_or_else(|| {
+            CursorError::FileTransfer(format!("server requested unknown file {filename:?}"))
+        })
 }
 
-fn encode_batch_rows(batch_rows: usize, configured_rows: Option<usize>) -> usize {
-    configured_rows
-        .unwrap_or(DEFAULT_ENCODE_BATCH_ROWS)
-        .min(batch_rows)
+fn map_chunked_encode_error(value: monetdb_arrow::ChunkedEncodeError<CursorError>) -> CursorError {
+    match value {
+        monetdb_arrow::ChunkedEncodeError::Encode(value) => {
+            CursorError::FileTransfer(value.to_string())
+        }
+        monetdb_arrow::ChunkedEncodeError::Sink(value) => value,
+    }
+}
+
+struct IngestWindowScheduler<'a> {
+    reader: &'a mut (dyn RecordBatchReader + Send),
+    schema: SchemaRef,
+    pending: VecDeque<RecordBatch>,
+    pending_rows: usize,
+    exhausted: bool,
+    window_budget: usize,
+    configured_rows: Option<usize>,
+    estimated_bytes_per_row: Option<f64>,
+    target_rows: Option<usize>,
+    input_batches: usize,
+    coalesced_windows: usize,
+    split_windows: usize,
+}
+
+impl<'a> IngestWindowScheduler<'a> {
+    fn new(
+        reader: &'a mut (dyn RecordBatchReader + Send),
+        schema: SchemaRef,
+        window_budget: usize,
+        configured_rows: Option<usize>,
+    ) -> Self {
+        Self {
+            reader,
+            schema,
+            pending: VecDeque::new(),
+            pending_rows: 0,
+            exhausted: false,
+            window_budget,
+            configured_rows,
+            estimated_bytes_per_row: None,
+            target_rows: configured_rows,
+            input_batches: 0,
+            coalesced_windows: 0,
+            split_windows: 0,
+        }
+    }
+
+    fn next_window(&mut self) -> Result<Option<Vec<RecordBatch>>> {
+        if self.target_rows.is_none() {
+            self.fill_until(WRITE_ESTIMATE_SAMPLE_ROWS)?;
+            if self.pending_rows == 0 {
+                return Ok(None);
+            }
+            let sample_rows = self.pending_rows.min(WRITE_ESTIMATE_SAMPLE_ROWS);
+            let estimated_bytes = self.estimate_pending(sample_rows)?;
+            self.estimated_bytes_per_row = Some(estimated_bytes.max(1) as f64 / sample_rows as f64);
+            self.update_target_rows();
+        }
+
+        let target_rows = self.target_rows.expect("the window target is initialized");
+        self.fill_until(target_rows)?;
+        if self.pending_rows == 0 {
+            return Ok(None);
+        }
+        let window_rows = self.pending_rows.min(target_rows);
+        let mut remaining = window_rows;
+        let mut window = Vec::new();
+        while remaining > 0 {
+            let batch = self
+                .pending
+                .pop_front()
+                .expect("pending row count matches pending batches");
+            if batch.num_rows() <= remaining {
+                remaining -= batch.num_rows();
+                window.push(batch);
+            } else {
+                window.push(batch.slice(0, remaining));
+                self.pending
+                    .push_front(batch.slice(remaining, batch.num_rows() - remaining));
+                self.split_windows += 1;
+                remaining = 0;
+            }
+        }
+        self.pending_rows -= window_rows;
+        if window.len() > 1 {
+            self.coalesced_windows += 1;
+        }
+        Ok(Some(window))
+    }
+
+    fn observe_window(&mut self, rows: usize, encoded_bytes: usize) {
+        if self.configured_rows.is_some() || rows == 0 {
+            return;
+        }
+        let actual = encoded_bytes as f64 / rows as f64;
+        let prior = self.estimated_bytes_per_row.unwrap_or(actual);
+        self.estimated_bytes_per_row = Some(0.7 * actual + 0.3 * prior);
+        self.update_target_rows();
+    }
+
+    fn update_target_rows(&mut self) {
+        if let Some(rows) = self.configured_rows {
+            self.target_rows = Some(rows);
+            return;
+        }
+        let bytes_per_row = self.estimated_bytes_per_row.unwrap_or(1.0).max(1.0);
+        self.target_rows =
+            Some(((self.window_budget as f64 / bytes_per_row) as usize).max(MIN_WRITE_WINDOW_ROWS));
+    }
+
+    fn fill_until(&mut self, desired_rows: usize) -> Result<()> {
+        while self.pending_rows < desired_rows && !self.exhausted {
+            let Some(batch) = self.reader.next() else {
+                self.exhausted = true;
+                break;
+            };
+            let batch = batch.map_err(Error::from)?;
+            self.input_batches += 1;
+            validate_record_batch(&batch)?;
+            if batch.schema() != self.schema {
+                return Err(error(
+                    "record batch schema changed within ingest stream",
+                    Status::InvalidData,
+                ));
+            }
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            self.pending_rows = self
+                .pending_rows
+                .checked_add(batch.num_rows())
+                .ok_or_else(|| error("pending ingest row count overflows", Status::Internal))?;
+            self.pending.push_back(batch);
+            self.compact_pending_batches()?;
+        }
+        Ok(())
+    }
+
+    fn compact_pending_batches(&mut self) -> Result<()> {
+        if self.pending.len() < MAX_PENDING_BATCHES {
+            return Ok(());
+        }
+        let compacted = self
+            .pending
+            .split_off(self.pending.len() - PENDING_BATCH_COMPACTION);
+        let batch = concat_batches(&self.schema, compacted.iter()).map_err(Error::from)?;
+        self.pending.push_back(batch);
+        Ok(())
+    }
+
+    fn estimate_pending(&self, rows: usize) -> Result<usize> {
+        let mut remaining = rows;
+        let mut total = 0usize;
+        for batch in &self.pending {
+            if remaining == 0 {
+                break;
+            }
+            let batch_rows = remaining.min(batch.num_rows());
+            for (field, column) in self.schema.fields().iter().zip(batch.columns()) {
+                let slice = column.slice(0, batch_rows);
+                let bytes = monetdb_arrow::estimated_encoded_size(field, slice.as_ref()).map_err(
+                    |value| map_cursor_error(CursorError::FileTransfer(value.to_string())),
+                )?;
+                total = total.checked_add(bytes).ok_or_else(|| {
+                    error("estimated ingest byte count overflows", Status::Internal)
+                })?;
+            }
+            remaining -= batch_rows;
+        }
+        Ok(total)
+    }
+}
+
+struct IngestStats {
+    input_batches: usize,
+    coalesced_windows: usize,
+    split_windows: usize,
+    copy_count: usize,
+    encoded_bytes: usize,
+    peak_in_flight_bytes: usize,
+    window_budget_bytes: usize,
+    window_rows: Vec<usize>,
+    window_bytes: Vec<usize>,
+    scope: &'static str,
+    poisoned: bool,
+}
+
+impl IngestStats {
+    fn new(window_budget_bytes: usize, scope: &'static str) -> Self {
+        Self {
+            input_batches: 0,
+            coalesced_windows: 0,
+            split_windows: 0,
+            copy_count: 0,
+            encoded_bytes: 0,
+            peak_in_flight_bytes: 0,
+            window_budget_bytes,
+            window_rows: Vec::new(),
+            window_bytes: Vec::new(),
+            scope,
+            poisoned: false,
+        }
+    }
+
+    fn record_window(&mut self, rows: usize, bytes: usize, largest_chunk: usize) {
+        self.copy_count += 1;
+        self.encoded_bytes = self.encoded_bytes.saturating_add(bytes);
+        self.peak_in_flight_bytes = self
+            .peak_in_flight_bytes
+            .max(largest_chunk.saturating_mul(2));
+        self.window_rows.push(rows);
+        self.window_bytes.push(bytes);
+    }
+
+    fn to_json(&self) -> String {
+        let rows = self
+            .window_rows
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let bytes = self
+            .window_bytes
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            concat!(
+                "{{\"input_batches\":{},\"coalesced_windows\":{},\"split_windows\":{},",
+                "\"copy_count\":{},\"encoded_bytes\":{},\"peak_in_flight_bytes\":{},",
+                "\"window_budget_bytes\":{},\"window_rows\":[{}],\"window_bytes\":[{}],",
+                "\"scope\":\"{}\",\"poisoned\":{}}}"
+            ),
+            self.input_batches,
+            self.coalesced_windows,
+            self.split_windows,
+            self.copy_count,
+            self.encoded_bytes,
+            self.peak_in_flight_bytes,
+            self.window_budget_bytes,
+            rows,
+            bytes,
+            self.scope,
+            self.poisoned,
+        )
+    }
+}
+
+fn fixed_encoded_row_width(schema: &SchemaRef) -> Result<Option<usize>> {
+    schema
+        .fields()
+        .iter()
+        .try_fold(Some(0usize), |total, field| {
+            let Some(total) = total else {
+                return Ok(None);
+            };
+            let Some(width) = monetdb_arrow::fixed_encoded_width(field)
+                .map_err(|value| map_display(value, Status::NotImplemented))?
+            else {
+                return Ok(None);
+            };
+            total
+                .checked_add(width)
+                .map(Some)
+                .ok_or_else(|| error("fixed ingest row width overflows", Status::Internal))
+        })
+}
+
+fn automatic_write_window_bytes(constrained: bool) -> usize {
+    let ceiling = if constrained {
+        CONSTRAINED_WRITE_WINDOW_BYTES
+    } else {
+        DEFAULT_WRITE_WINDOW_BYTES
+    };
+    let cgroup_divisor = if constrained { 4 } else { 8 };
+    let cgroup_limit = [
+        Path::new("/sys/fs/cgroup/memory.max"),
+        Path::new("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+    ]
+    .into_iter()
+    .filter_map(|path| std::fs::read_to_string(path).ok())
+    .filter_map(|value| value.trim().parse::<usize>().ok())
+    .find(|limit| *limit > 0 && *limit < (1usize << (usize::BITS - 2)));
+    cgroup_limit.map_or(ceiling, |limit| {
+        ceiling.min((limit / cgroup_divisor).max(MIN_WRITE_WINDOW_BYTES))
+    })
 }
 
 fn validate_record_batch(batch: &RecordBatch) -> Result<()> {
@@ -2179,7 +2739,7 @@ fn validate_append_schema(
         ));
     }
     for (index, (field, column)) in schema.fields().iter().zip(columns).enumerate() {
-        if field.name() != column.name() {
+        if !append_column_names_match(field.name(), column.name()) {
             return Err(error(
                 format!(
                     "append column {index} is named {:?}, but destination column is named {:?}; append schemas are positional and column order must match",
@@ -2209,6 +2769,10 @@ fn validate_append_schema(
         }
     }
     Ok(())
+}
+
+fn append_column_names_match(source: &str, destination: &str) -> bool {
+    source.eq_ignore_ascii_case(destination)
 }
 
 #[derive(Clone)]
@@ -3170,6 +3734,16 @@ enum AtomicScope {
     },
 }
 
+impl AtomicScope {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Autocommit => "autocommit",
+            Self::CallerTransaction => "transaction",
+            Self::Savepoint { .. } => "savepoint",
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum CallerTransactionScope {
     Direct,
@@ -3236,6 +3810,29 @@ fn table_exists(
         ))
         .map_err(map_cursor_error)?;
     count_query_result(&mut cursor, "table")
+}
+
+fn table_has_constraints(
+    connection: &monetdb::Connection,
+    schema_name: Option<&str>,
+    table_name: &str,
+    timeouts: Timeouts,
+) -> Result<bool> {
+    let schema_filter = schema_name
+        .map(metadata::raw_string_literal)
+        .transpose()?
+        .unwrap_or_else(|| "current_schema".to_owned());
+    let table = metadata::raw_string_literal(table_name)?;
+    let mut cursor = connection.cursor();
+    cursor.set_timeouts(timeouts);
+    cursor
+        .execute(&format!(
+            "SELECT CAST(COUNT(*) AS VARCHAR(32)) \
+             FROM information_schema.table_constraints \
+             WHERE table_schema = {schema_filter} AND table_name = {table}"
+        ))
+        .map_err(map_cursor_error)?;
+    count_query_result(&mut cursor, "table constraint")
 }
 
 fn delete_on_commit_temporary_table_exists(
@@ -4210,7 +4807,7 @@ mod tests {
     }
 
     #[test]
-    fn validates_separate_read_and_write_batch_options() {
+    fn validates_ingest_scheduling_and_failure_options() {
         assert_eq!(
             read_batch_rows_option(&OptionValue::String("131072".into())).unwrap(),
             DEFAULT_READ_BATCH_ROWS
@@ -4225,6 +4822,26 @@ mod tests {
         }
         assert!(write_batch_rows_option(&OptionValue::Int(-1)).is_err());
         assert!(write_batch_rows_option(&OptionValue::Double(1.0)).is_err());
+        assert_eq!(
+            write_window_bytes_option(&OptionValue::Int(0)).unwrap(),
+            None
+        );
+        assert_eq!(
+            write_window_bytes_option(&OptionValue::Int(DEFAULT_WRITE_WINDOW_BYTES as i64))
+                .unwrap(),
+            Some(DEFAULT_WRITE_WINDOW_BYTES)
+        );
+        assert!(write_window_bytes_option(&OptionValue::Int(1)).is_err());
+        assert_eq!(
+            IngestPartial::parse(&OptionValue::String("block".into())).unwrap(),
+            IngestPartial::Block
+        );
+        assert_eq!(
+            IngestAtomicity::parse(&OptionValue::String("savepoint".into())).unwrap(),
+            IngestAtomicity::Savepoint
+        );
+        assert!(IngestPartial::parse(&OptionValue::String("invalid".into())).is_err());
+        assert!(IngestAtomicity::parse(&OptionValue::Int(1)).is_err());
     }
 
     #[test]
@@ -4530,18 +5147,78 @@ mod tests {
     }
 
     #[test]
-    fn ingest_ranges_bound_each_copy_batch() {
-        assert_eq!(
-            batch_ranges(250_001, 100_000).collect::<Vec<_>>(),
-            [0..100_000, 100_000..200_000, 200_000..250_001]
+    fn ingest_scheduler_coalesces_and_splits_upstream_batches() {
+        let batch = RecordBatch::try_from_iter([(
+            "value",
+            Arc::new(Int64Array::from_iter_values(0..250_001)) as ArrayRef,
+        )])
+        .unwrap();
+        let schema = batch.schema();
+        let mut reader = SlicedBatchReader::new(batch, 777);
+        let mut scheduler = IngestWindowScheduler::new(
+            &mut reader,
+            schema,
+            DEFAULT_WRITE_WINDOW_BYTES,
+            Some(100_000),
         );
-        assert!(batch_ranges(0, 100_000).next().is_none());
-        assert_eq!(
-            encode_batch_rows(10_000_000, None),
-            DEFAULT_ENCODE_BATCH_ROWS
+        let mut windows = Vec::new();
+        while let Some(window) = scheduler.next_window().unwrap() {
+            windows.push(window.iter().map(RecordBatch::num_rows).sum::<usize>());
+        }
+
+        assert_eq!(windows, [100_000, 100_000, 50_001]);
+        assert_eq!(scheduler.input_batches, 322);
+        assert_eq!(scheduler.coalesced_windows, 3);
+        assert_eq!(scheduler.split_windows, 2);
+    }
+
+    #[test]
+    fn ingest_scheduler_bounds_metadata_for_one_row_batches() {
+        let batch = RecordBatch::try_from_iter([(
+            "value",
+            Arc::new(Int64Array::from_iter_values(0..20_000)) as ArrayRef,
+        )])
+        .unwrap();
+        let schema = batch.schema();
+        let mut reader = SlicedBatchReader::new(batch, 1);
+        let mut scheduler = IngestWindowScheduler::new(
+            &mut reader,
+            schema,
+            DEFAULT_WRITE_WINDOW_BYTES,
+            Some(20_000),
         );
-        assert_eq!(encode_batch_rows(10_000_000, Some(1_000_000)), 1_000_000);
-        assert_eq!(encode_batch_rows(10_000_000, Some(100_000)), 100_000);
-        assert_eq!(encode_batch_rows(100_000, None), 100_000);
+
+        let window = scheduler.next_window().unwrap().unwrap();
+
+        assert_eq!(
+            window.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            20_000
+        );
+        assert!(window.len() < MAX_PENDING_BATCHES);
+        assert_eq!(scheduler.input_batches, 20_000);
+        assert!(scheduler.next_window().unwrap().is_none());
+    }
+
+    #[test]
+    fn ingest_scheduler_does_not_split_narrow_inputs_by_an_arbitrary_row_cap() {
+        let batch = RecordBatch::try_from_iter([(
+            "value",
+            Arc::new(Int64Array::from_iter_values([1])) as ArrayRef,
+        )])
+        .unwrap();
+        let schema = batch.schema();
+        let mut reader = SlicedBatchReader::new(batch, 1);
+        let mut scheduler =
+            IngestWindowScheduler::new(&mut reader, schema, DEFAULT_WRITE_WINDOW_BYTES, None);
+        scheduler.estimated_bytes_per_row = Some(28.0);
+        scheduler.update_target_rows();
+
+        assert!(scheduler.target_rows.unwrap() > 11_745_000);
+    }
+
+    #[test]
+    fn append_column_names_follow_unquoted_identifier_case_folding() {
+        assert!(append_column_names_match("MixedCase", "mixedcase"));
+        assert!(!append_column_names_match("first", "second"));
     }
 }

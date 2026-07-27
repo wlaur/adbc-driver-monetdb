@@ -24,5 +24,8 @@ pub use decode::{
     decode_frame_owned_with_schema, decode_frame_with_schema, decode_inline_rows, field_for_column,
     field_for_monet_type, owned_frame_capacity, prefers_owned_frame,
 };
-pub use encode::{EncodeError, encode_column, monet_type_for_field, sql_type_for_field};
+pub use encode::{
+    ChunkedEncodeError, EncodeError, encode_column, encode_column_chunks, estimated_encoded_size,
+    fixed_encoded_width, monet_type_for_field, sql_type_for_field,
+};
 pub use wire::date_from_unix_days;

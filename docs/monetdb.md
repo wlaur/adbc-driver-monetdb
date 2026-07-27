@@ -49,6 +49,24 @@ Zero disables any timeout explicitly.
 Timeout and cancellation close the MAPI session. Cancellation is connection-scoped and may
 interrupt whichever statement currently owns the connection; open a new connection afterward.
 
+## Bulk ingestion
+
+The driver coalesces producer batches into adaptive COPY windows using a 512 MiB encoded-byte
+budget, raised to 2 GiB for constrained append targets with fixed-width wire rows no larger than
+16 bytes, then streams each requested column in bounded messages. Producer batch size therefore
+does not need to match the driver window. This avoids repeated index maintenance across tens of
+millions of narrow rows while wide, variable-width, and ordinary append-only tables retain the
+smaller bound. In finite Linux cgroups, the ceilings are reduced to one eighth and one quarter of
+the limit, respectively. The connection and statement option
+`adbc.monetdb.write_window_bytes` changes the byte budget; the diagnostic
+`adbc.monetdb.write_batch_rows` option forces an exact row count instead.
+
+In a caller-managed transaction, a client-side failure after completed COPY windows makes commit
+fail until rollback, so a partial append is not accidentally committed. Advanced callers may set
+`adbc.monetdb.ingest_atomicity=savepoint` to roll back only the ingest, or
+`adbc.monetdb.ingest_partial=allow` to permit a partial commit. Statement option
+`adbc.monetdb.ingest_stats` returns post-execution JSON observability.
+
 ## Client information
 
 Client information is enabled by default. URI parameters `client_application`, `client_remark`,

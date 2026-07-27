@@ -34,3 +34,18 @@ def test_ingest_schema_mismatch_status_depends_on_mode(monetdb_uri: str) -> None
             assert append.value.status_code == adbc_driver_manager.AdbcStatusCode.INVALID_ARGUMENT
         finally:
             cursor.execute(f'DROP TABLE IF EXISTS "{table}"')
+
+
+@pytest.mark.integration
+def test_ingest_accepts_unquoted_identifier_case_folding(monetdb_uri: str) -> None:
+    table = f"adbc_ingest_case_{uuid4().hex}"
+    frame = pl.DataFrame({"MixedCase": [1, 2, 3]})
+
+    with dbapi.connect(monetdb_uri, autocommit=True) as connection, connection.cursor() as cursor:
+        try:
+            cursor.execute(f'CREATE TABLE "{table}" (MixedCase BIGINT)')
+            assert cursor.adbc_ingest(table, frame, mode="append") == 3
+            cursor.execute(f'SELECT mixedcase FROM "{table}" ORDER BY mixedcase')
+            assert cursor.fetch_arrow_table().column("mixedcase").to_pylist() == [1, 2, 3]
+        finally:
+            cursor.execute(f'DROP TABLE IF EXISTS "{table}"')

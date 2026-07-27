@@ -264,10 +264,16 @@ def test_connection_read_prefetch_false_is_inherited_by_statements(monetdb_uri: 
         assert connection.adbc_connection.get_option(str(ConnectionOptions.READ_PREFETCH)) == "false"
         assert connection.adbc_connection.get_option(str(ConnectionOptions.READ_BATCH_ROWS)) == "131072"
         assert connection.adbc_connection.get_option(str(ConnectionOptions.WRITE_BATCH_ROWS)) == "0"
+        assert connection.adbc_connection.get_option(str(ConnectionOptions.WRITE_WINDOW_BYTES)) == "0"
+        assert connection.adbc_connection.get_option(str(ConnectionOptions.INGEST_PARTIAL)) == "block"
+        assert connection.adbc_connection.get_option(str(ConnectionOptions.INGEST_ATOMICITY)) == "transaction"
         with connection.cursor() as cursor:
             assert cursor.adbc_statement.get_option(str(StatementOptions.READ_PREFETCH)) == "false"
             assert cursor.adbc_statement.get_option(str(StatementOptions.READ_BATCH_ROWS)) == "131072"
             assert cursor.adbc_statement.get_option(str(StatementOptions.WRITE_BATCH_ROWS)) == "0"
+            assert cursor.adbc_statement.get_option(str(StatementOptions.WRITE_WINDOW_BYTES)) == "0"
+            assert cursor.adbc_statement.get_option(str(StatementOptions.INGEST_PARTIAL)) == "block"
+            assert cursor.adbc_statement.get_option(str(StatementOptions.INGEST_ATOMICITY)) == "transaction"
 
 
 @pytest.mark.integration
