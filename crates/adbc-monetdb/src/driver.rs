@@ -39,10 +39,9 @@ use parameters::{
 };
 
 const DEFAULT_READ_BATCH_ROWS: usize = 131_072;
-const DEFAULT_WRITE_WINDOW_BYTES: usize = 128 * 1024 * 1024;
+const DEFAULT_WRITE_WINDOW_BYTES: usize = 512 * 1024 * 1024;
 const MIN_WRITE_WINDOW_BYTES: usize = 4 * 1024 * 1024;
 const MIN_WRITE_WINDOW_ROWS: usize = 4_096;
-const MAX_WRITE_WINDOW_ROWS: usize = 4_194_304;
 const WRITE_ESTIMATE_SAMPLE_ROWS: usize = 4_096;
 const UPLOAD_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PENDING_BATCHES: usize = 1_024;
@@ -2517,10 +2516,8 @@ impl<'a> IngestWindowScheduler<'a> {
             return;
         }
         let bytes_per_row = self.estimated_bytes_per_row.unwrap_or(1.0).max(1.0);
-        self.target_rows = Some(
-            ((self.window_budget as f64 / bytes_per_row) as usize)
-                .clamp(MIN_WRITE_WINDOW_ROWS, MAX_WRITE_WINDOW_ROWS),
-        );
+        self.target_rows =
+            Some(((self.window_budget as f64 / bytes_per_row) as usize).max(MIN_WRITE_WINDOW_ROWS));
     }
 
     fn fill_until(&mut self, desired_rows: usize) -> Result<()> {
@@ -5135,5 +5132,22 @@ mod tests {
         assert!(window.len() < MAX_PENDING_BATCHES);
         assert_eq!(scheduler.input_batches, 20_000);
         assert!(scheduler.next_window().unwrap().is_none());
+    }
+
+    #[test]
+    fn ingest_scheduler_does_not_split_narrow_inputs_by_an_arbitrary_row_cap() {
+        let batch = RecordBatch::try_from_iter([(
+            "value",
+            Arc::new(Int64Array::from_iter_values([1])) as ArrayRef,
+        )])
+        .unwrap();
+        let schema = batch.schema();
+        let mut reader = SlicedBatchReader::new(batch, 1);
+        let mut scheduler =
+            IngestWindowScheduler::new(&mut reader, schema, DEFAULT_WRITE_WINDOW_BYTES, None);
+        scheduler.estimated_bytes_per_row = Some(28.0);
+        scheduler.update_target_rows();
+
+        assert!(scheduler.target_rows.unwrap() > 11_745_000);
     }
 }

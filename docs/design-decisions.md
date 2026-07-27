@@ -51,11 +51,14 @@ requirements change their premises.
 
 ## Result scheduling and memory
 
-- The read default remains 131,072 rows. Write scheduling is byte-based: a 128 MiB encoded budget,
-  bounded to 4,096–4,194,304 rows and reduced under constrained Linux cgroups. The first 4,096
-  rows establish the wire-byte estimate; later windows use a 70/30 actual/prior update. This makes
-  COPY boundaries independent of producer batching while retaining a diagnostic exact-row
-  override.
+- The read default remains 131,072 rows. Write scheduling is byte-based: a 512 MiB encoded budget,
+  with a 4,096-row minimum and no independent maximum-row cap, reduced under constrained Linux
+  cgroups. The first 4,096 rows establish the wire-byte estimate; later windows use a 70/30
+  actual/prior update. Full-suite calibration matters here: on Dec2025, repeatedly extending a
+  multi-million-row table can dominate ingest time even when each COPY is fast in smaller
+  microbenchmarks. The byte budget keeps memory bounded while allowing narrow inputs to remain one
+  COPY. Boundaries stay independent of producer batching and an exact-row diagnostic override
+  remains available.
 - The protocol fork exposes a generic streaming upload sink. The driver serves each requested
   column in bounded 16 MiB pieces, so an encoded window is never materialized as one `Vec<u8>`.
   Null-free signed integer and float layouts borrow validated Arrow buffers directly; other types

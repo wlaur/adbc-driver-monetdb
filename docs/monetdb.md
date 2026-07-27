@@ -51,7 +51,7 @@ interrupt whichever statement currently owns the connection; open a new connecti
 
 ## Bulk ingestion
 
-The driver coalesces producer batches into adaptive COPY windows using a 128 MiB encoded-byte
+The driver coalesces producer batches into adaptive COPY windows using a 512 MiB encoded-byte
 budget, then streams each requested column in bounded messages. Producer batch size therefore
 does not need to match the driver window. The connection and statement option
 `adbc.monetdb.write_window_bytes` changes the byte budget; the diagnostic
