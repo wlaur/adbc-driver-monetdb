@@ -71,6 +71,49 @@ def test_upstream_failure_after_copy_blocks_commit_until_rollback(monetdb_uri: s
 
 
 @pytest.mark.integration
+def test_raw_transaction_sql_obeys_and_clears_ingest_poison(monetdb_uri: str) -> None:
+    with dbapi.connect(monetdb_uri, autocommit=True) as setup:
+        setup.execute("DROP TABLE IF EXISTS ingest_raw_transaction")
+        setup.execute("CREATE TABLE ingest_raw_transaction(value INT)")
+
+    try:
+        batch = pa.record_batch({"value": pa.array([1], type=pa.int32())})
+        options: dict[str, object] = {str(StatementOptions.WRITE_BATCH_ROWS): "1"}
+        with dbapi.connect(monetdb_uri) as connection, connection.cursor(adbc_stmt_kwargs=options) as cursor:
+            with pytest.raises(Exception, match="intentional upstream failure"):
+                cursor.adbc_ingest(
+                    "ingest_raw_transaction",
+                    _reader_that_fails_after(batch),
+                    mode="append",
+                )
+
+            cursor.adbc_statement.set_sql_query("-- raw update\nCOMMIT")
+            with pytest.raises(adbc_driver_manager.ProgrammingError, match="ROLLBACK is required"):
+                cursor.adbc_statement.execute_update()
+            cursor.adbc_statement.set_sql_query("/* recover */ ROLLBACK")
+            cursor.adbc_statement.execute_update()
+
+            with pytest.raises(Exception, match="intentional upstream failure"):
+                cursor.adbc_ingest(
+                    "ingest_raw_transaction",
+                    _reader_that_fails_after(batch),
+                    mode="append",
+                )
+            with pytest.raises(adbc_driver_manager.ProgrammingError, match="ROLLBACK is required"):
+                cursor.execute("/* raw query */ COMMIT")
+            cursor.execute("-- recover\nROLLBACK")
+
+            cursor.execute("INSERT INTO ingest_raw_transaction VALUES (2)")
+            connection.commit()
+
+        with dbapi.connect(monetdb_uri, autocommit=True) as audit:
+            assert audit.execute("SELECT value FROM ingest_raw_transaction").fetchall() == [(2,)]
+    finally:
+        with dbapi.connect(monetdb_uri, autocommit=True) as cleanup:
+            cleanup.execute("DROP TABLE IF EXISTS ingest_raw_transaction")
+
+
+@pytest.mark.integration
 def test_savepoint_atomicity_preserves_prior_caller_work(monetdb_uri: str) -> None:
     with dbapi.connect(monetdb_uri, autocommit=True) as setup:
         setup.execute("DROP TABLE IF EXISTS ingest_savepoint_append")
