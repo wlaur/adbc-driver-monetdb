@@ -26,6 +26,6 @@ pub use decode::{
 };
 pub use encode::{
     ChunkedEncodeError, EncodeError, encode_column, encode_column_chunks, estimated_encoded_size,
-    monet_type_for_field, sql_type_for_field,
+    fixed_encoded_width, monet_type_for_field, sql_type_for_field,
 };
 pub use wire::date_from_unix_days;

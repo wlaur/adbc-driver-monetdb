@@ -40,10 +40,12 @@ use parameters::{
 
 const DEFAULT_READ_BATCH_ROWS: usize = 131_072;
 const DEFAULT_WRITE_WINDOW_BYTES: usize = 512 * 1024 * 1024;
+const CONSTRAINED_WRITE_WINDOW_BYTES: usize = 1usize << 31;
+const NARROW_CONSTRAINED_ROW_BYTES: usize = 16;
 const MIN_WRITE_WINDOW_BYTES: usize = 4 * 1024 * 1024;
 const MIN_WRITE_WINDOW_ROWS: usize = 4_096;
 const WRITE_ESTIMATE_SAMPLE_ROWS: usize = 4_096;
-const UPLOAD_CHUNK_BYTES: usize = 16 * 1024 * 1024;
+const ENCODE_CHUNK_BYTES: usize = 1024 * 1024;
 const MAX_PENDING_BATCHES: usize = 1_024;
 const PENDING_BATCH_COMPACTION: usize = MAX_PENDING_BATCHES / 2;
 const PREPARED_CACHE_CAPACITY: usize = 128;
@@ -2251,6 +2253,16 @@ impl MonetdbStatement {
                     table,
                     self.timeouts,
                 )?);
+        let constrained_append = append_to_existing
+            && table_has_constraints(
+                &connection,
+                if temporary { Some("tmp") } else { schema_name },
+                table,
+                self.timeouts,
+            )?;
+        let narrow_constrained_append = constrained_append
+            && fixed_encoded_row_width(&schema)?
+                .is_some_and(|width| width <= NARROW_CONSTRAINED_ROW_BYTES);
         let caller_scope =
             if append_to_existing && self.ingest_atomicity == IngestAtomicity::Transaction {
                 CallerTransactionScope::Direct
@@ -2263,7 +2275,7 @@ impl MonetdbStatement {
         let scope_name = atomic_scope.name();
         let window_budget = self
             .write_window_bytes
-            .unwrap_or_else(automatic_write_window_bytes);
+            .unwrap_or_else(|| automatic_write_window_bytes(narrow_constrained_append));
         let mut scheduler = IngestWindowScheduler::new(
             reader.as_mut(),
             Arc::clone(&schema),
@@ -2328,8 +2340,8 @@ impl MonetdbStatement {
                         let column_bytes = monetdb_arrow::encode_column_chunks(
                             &schema.fields()[index],
                             &arrays,
-                            NonZeroUsize::new(UPLOAD_CHUNK_BYTES)
-                                .expect("upload chunk size is positive"),
+                            NonZeroUsize::new(ENCODE_CHUNK_BYTES)
+                                .expect("encode chunk size is positive"),
                             |chunk| {
                                 largest_chunk = largest_chunk.max(chunk.len());
                                 sink.write_chunk(chunk)
@@ -2659,7 +2671,33 @@ impl IngestStats {
     }
 }
 
-fn automatic_write_window_bytes() -> usize {
+fn fixed_encoded_row_width(schema: &SchemaRef) -> Result<Option<usize>> {
+    schema
+        .fields()
+        .iter()
+        .try_fold(Some(0usize), |total, field| {
+            let Some(total) = total else {
+                return Ok(None);
+            };
+            let Some(width) = monetdb_arrow::fixed_encoded_width(field)
+                .map_err(|value| map_display(value, Status::NotImplemented))?
+            else {
+                return Ok(None);
+            };
+            total
+                .checked_add(width)
+                .map(Some)
+                .ok_or_else(|| error("fixed ingest row width overflows", Status::Internal))
+        })
+}
+
+fn automatic_write_window_bytes(constrained: bool) -> usize {
+    let ceiling = if constrained {
+        CONSTRAINED_WRITE_WINDOW_BYTES
+    } else {
+        DEFAULT_WRITE_WINDOW_BYTES
+    };
+    let cgroup_divisor = if constrained { 4 } else { 8 };
     let cgroup_limit = [
         Path::new("/sys/fs/cgroup/memory.max"),
         Path::new("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
@@ -2668,8 +2706,8 @@ fn automatic_write_window_bytes() -> usize {
     .filter_map(|path| std::fs::read_to_string(path).ok())
     .filter_map(|value| value.trim().parse::<usize>().ok())
     .find(|limit| *limit > 0 && *limit < (1usize << (usize::BITS - 2)));
-    cgroup_limit.map_or(DEFAULT_WRITE_WINDOW_BYTES, |limit| {
-        DEFAULT_WRITE_WINDOW_BYTES.min((limit / 8).max(MIN_WRITE_WINDOW_BYTES))
+    cgroup_limit.map_or(ceiling, |limit| {
+        ceiling.min((limit / cgroup_divisor).max(MIN_WRITE_WINDOW_BYTES))
     })
 }
 
@@ -2701,7 +2739,7 @@ fn validate_append_schema(
         ));
     }
     for (index, (field, column)) in schema.fields().iter().zip(columns).enumerate() {
-        if field.name() != column.name() {
+        if !append_column_names_match(field.name(), column.name()) {
             return Err(error(
                 format!(
                     "append column {index} is named {:?}, but destination column is named {:?}; append schemas are positional and column order must match",
@@ -2731,6 +2769,10 @@ fn validate_append_schema(
         }
     }
     Ok(())
+}
+
+fn append_column_names_match(source: &str, destination: &str) -> bool {
+    source.eq_ignore_ascii_case(destination)
 }
 
 #[derive(Clone)]
@@ -3768,6 +3810,29 @@ fn table_exists(
         ))
         .map_err(map_cursor_error)?;
     count_query_result(&mut cursor, "table")
+}
+
+fn table_has_constraints(
+    connection: &monetdb::Connection,
+    schema_name: Option<&str>,
+    table_name: &str,
+    timeouts: Timeouts,
+) -> Result<bool> {
+    let schema_filter = schema_name
+        .map(metadata::raw_string_literal)
+        .transpose()?
+        .unwrap_or_else(|| "current_schema".to_owned());
+    let table = metadata::raw_string_literal(table_name)?;
+    let mut cursor = connection.cursor();
+    cursor.set_timeouts(timeouts);
+    cursor
+        .execute(&format!(
+            "SELECT CAST(COUNT(*) AS VARCHAR(32)) \
+             FROM information_schema.table_constraints \
+             WHERE table_schema = {schema_filter} AND table_name = {table}"
+        ))
+        .map_err(map_cursor_error)?;
+    count_query_result(&mut cursor, "table constraint")
 }
 
 fn delete_on_commit_temporary_table_exists(
@@ -5149,5 +5214,11 @@ mod tests {
         scheduler.update_target_rows();
 
         assert!(scheduler.target_rows.unwrap() > 11_745_000);
+    }
+
+    #[test]
+    fn append_column_names_follow_unquoted_identifier_case_folding() {
+        assert!(append_column_names_match("MixedCase", "mixedcase"));
+        assert!(!append_column_names_match("first", "second"));
     }
 }

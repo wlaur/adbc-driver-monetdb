@@ -115,6 +115,13 @@ pub fn estimated_encoded_size(field: &Field, array: &dyn Array) -> Result<usize,
     Ok(size)
 }
 
+pub fn fixed_encoded_width(field: &Field) -> Result<Option<usize>, EncodeError> {
+    if *field.data_type() == DataType::Null {
+        return Ok(Some(2));
+    }
+    Ok(crate::wire::fixed_wire_width(monet_type_for_field(field)?))
+}
+
 /// Encode one logical column from any number of Arrow chunks and emit bounded
 /// wire-format pieces without concatenating them.
 pub fn encode_column_chunks<E>(
@@ -478,7 +485,7 @@ fn fixed_wire_width(field: &Field, data_type: &DataType) -> Result<Option<usize>
     if *data_type == DataType::Null {
         return Ok(Some(2));
     }
-    Ok(crate::wire::fixed_wire_width(monet_type_for_field(field)?))
+    fixed_encoded_width(field)
 }
 
 fn checked_encoded_size(rows: usize, width: usize) -> Result<usize, EncodeError> {
@@ -1372,6 +1379,22 @@ mod tests {
         ]
         .concat();
         assert_eq!(encode_column(&field, &array).unwrap(), expected);
+    }
+
+    #[test]
+    fn reports_fixed_encoded_widths_without_array_data() {
+        assert_eq!(
+            fixed_encoded_width(&Field::new("i", DataType::Int32, true)).unwrap(),
+            Some(4)
+        );
+        assert_eq!(
+            fixed_encoded_width(&Field::new("s", DataType::Utf8, true)).unwrap(),
+            None
+        );
+        assert_eq!(
+            fixed_encoded_width(&Field::new("n", DataType::Null, true)).unwrap(),
+            Some(2)
+        );
     }
 
     #[test]

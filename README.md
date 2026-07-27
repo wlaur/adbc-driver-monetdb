@@ -176,14 +176,20 @@ timeout. Use `adbc_cancel()` when session destruction is intended, or set
 overlap.
 
 Ingestion automatically chooses the fewest COPY windows that fit a 512 MiB encoded-byte budget.
+For constrained append targets whose fixed-width wire rows are at most 16 bytes, the budget is
+raised to 2 GiB.
 The driver estimates wire bytes per row from the first 4,096 rows, coalesces small upstream Arrow
 batches, splits large ones without copying their buffers, and adapts after each window. Target
 windows contain at least 4,096 rows when available; the encoded-byte budget, rather than an
-arbitrary row cap, bounds larger windows. On Linux the default budget is reduced when a cgroup
-memory limit requires it. Each requested column is then encoded directly into bounded
-16 MiB upload messages; null-free signed integers and 32/64-bit floats borrow their Arrow value
-buffers after validation instead of copying them. Peak encoding memory is therefore bounded by
-the upload buffers rather than the logical window size.
+arbitrary row cap, bounds larger windows. The narrow-row constraint budget avoids repeated index
+maintenance across tens of millions of rows without imposing the larger memory bound on
+variable-width, wide, or ordinary append-only tables. On Linux both ceilings are reduced to a
+fixed fraction of a finite cgroup memory limit when needed. Each requested column is then encoded
+directly into bounded
+1 MiB encoder chunks, which the protocol layer coalesces into 16 MiB upload messages; null-free
+signed integers and 32/64-bit floats borrow their Arrow value buffers after validation instead of
+copying them. Peak encoding memory is therefore bounded by the upload buffers rather than the
+logical window size.
 
 `adbc.monetdb.write_window_bytes` changes the byte budget; zero selects the automatic default.
 `adbc.monetdb.write_batch_rows` remains a diagnostic row-count override and disables adaptation.

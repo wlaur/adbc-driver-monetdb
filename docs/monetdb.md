@@ -52,8 +52,12 @@ interrupt whichever statement currently owns the connection; open a new connecti
 ## Bulk ingestion
 
 The driver coalesces producer batches into adaptive COPY windows using a 512 MiB encoded-byte
-budget, then streams each requested column in bounded messages. Producer batch size therefore
-does not need to match the driver window. The connection and statement option
+budget, raised to 2 GiB for constrained append targets with fixed-width wire rows no larger than
+16 bytes, then streams each requested column in bounded messages. Producer batch size therefore
+does not need to match the driver window. This avoids repeated index maintenance across tens of
+millions of narrow rows while wide, variable-width, and ordinary append-only tables retain the
+smaller bound. In finite Linux cgroups, the ceilings are reduced to one eighth and one quarter of
+the limit, respectively. The connection and statement option
 `adbc.monetdb.write_window_bytes` changes the byte budget; the diagnostic
 `adbc.monetdb.write_batch_rows` option forces an exact row count instead.
 

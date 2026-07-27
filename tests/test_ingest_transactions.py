@@ -159,6 +159,45 @@ def test_default_scheduler_coalesces_small_upstream_batches(monetdb_uri: str) ->
 
 
 @pytest.mark.integration
+def test_default_scheduler_uses_larger_bound_only_for_narrow_fixed_constraints(
+    monetdb_uri: str,
+) -> None:
+    batch = pa.record_batch({"value": pa.array([1], type=pa.int32())})
+    with dbapi.connect(monetdb_uri) as connection, connection.cursor() as cursor:
+        try:
+            cursor.execute("CREATE TABLE ingest_unconstrained_budget(value INT)")
+            cursor.adbc_ingest("ingest_unconstrained_budget", batch, mode="append")
+            unconstrained = json.loads(cursor.adbc_statement.get_option(str(StatementOptions.INGEST_STATS)))[
+                "window_budget_bytes"
+            ]
+
+            cursor.execute("CREATE TABLE ingest_constrained_budget(value INT PRIMARY KEY)")
+            cursor.adbc_ingest("ingest_constrained_budget", batch, mode="append")
+            constrained = json.loads(cursor.adbc_statement.get_option(str(StatementOptions.INGEST_STATS)))[
+                "window_budget_bytes"
+            ]
+
+            cursor.execute("CREATE TABLE ingest_variable_constraint_budget(value STRING PRIMARY KEY)")
+            cursor.adbc_ingest(
+                "ingest_variable_constraint_budget",
+                pa.record_batch({"value": pa.array(["one"], type=pa.string())}),
+                mode="append",
+            )
+            variable = json.loads(cursor.adbc_statement.get_option(str(StatementOptions.INGEST_STATS)))[
+                "window_budget_bytes"
+            ]
+
+            assert unconstrained <= 512 * 1024 * 1024
+            assert constrained <= 2 * 1024 * 1024 * 1024
+            assert constrained >= unconstrained
+            assert variable == unconstrained
+        finally:
+            cursor.execute("DROP TABLE IF EXISTS ingest_unconstrained_budget")
+            cursor.execute("DROP TABLE IF EXISTS ingest_constrained_budget")
+            cursor.execute("DROP TABLE IF EXISTS ingest_variable_constraint_budget")
+
+
+@pytest.mark.integration
 def test_repeated_wide_appends_have_bounded_transaction_storage(monetdb_uri: str) -> None:
     rows = 4_096
     columns = 786
