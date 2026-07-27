@@ -117,9 +117,11 @@ closes the MAPI session, so the partially read connection cannot be reused.
 
 The URI names are `connect_timeout`, `read_timeout`, `write_timeout`, and
 `operation_timeout`. Unknown query names are rejected so misspelled settings cannot be silently
-ignored. This is the only configuration channel available to `polars.read_database_uri`:
+ignored. This is the only configuration channel available to `pl.read_database_uri`:
 
 ```python
+import polars as pl
+
 df = pl.read_database_uri(
     "SELECT * FROM trades",
     "monetdb://localhost:50000/db?connect_timeout=10&operation_timeout=120",
@@ -157,7 +159,7 @@ with dbapi.connect(
         df = pl.read_database("SELECT * FROM trades", cursor)
 ```
 
-`polars.read_database(query, connection)` selects ADBC from the supplied DB-API connection or
+`pl.read_database(query, connection)` selects ADBC from the supplied DB-API connection or
 cursor; it has no `engine="adbc"` parameter. Polars calls `connection.cursor()` without
 `adbc_stmt_kwargs`, so use a preconfigured cursor for statement-specific settings. Its
 `execute_options` are forwarded to `Cursor.execute`: use a sequence for positional `?` values
@@ -178,18 +180,40 @@ overlap.
 Ingestion automatically chooses the fewest COPY windows that fit a 512 MiB encoded-byte budget.
 For constrained append targets whose fixed-width wire rows are at most 16 bytes, the budget is
 raised to 2 GiB.
-The driver estimates wire bytes per row from the first 4,096 rows, coalesces small upstream Arrow
-batches, splits large ones without copying their buffers, and adapts after each window. Target
-windows contain at least 4,096 rows when available; the encoded-byte budget, rather than an
-arbitrary row cap, bounds larger windows. The narrow-row constraint budget avoids repeated index
+The driver measures every upstream Arrow batch, coalesces small batches, and splits large ones
+without copying their buffers so each window stays within the byte budget. A single row larger
+than the budget is the only possible overrun. Tiered compaction keeps metadata bounded without
+repeatedly recopying the accumulated tail. The narrow-row constraint budget avoids repeated index
 maintenance across tens of millions of rows without imposing the larger memory bound on
 variable-width, wide, or ordinary append-only tables. On Linux both ceilings are reduced to a
-fixed fraction of a finite cgroup memory limit when needed. Each requested column is then encoded
-directly into bounded
-1 MiB encoder chunks, which the protocol layer coalesces into 16 MiB upload messages; null-free
-signed integers and 32/64-bit floats borrow their Arrow value buffers after validation instead of
-copying them. Peak encoding memory is therefore bounded by the upload buffers rather than the
-logical window size.
+fixed fraction of a finite cgroup memory limit when needed.
+
+Each requested column is encoded directly into bounded 1 MiB encoder chunks, which the protocol
+layer coalesces into 16 MiB upload messages; null-free signed integers and 32/64-bit floats borrow
+their Arrow value buffers after validation instead of copying them. The protocol can temporarily
+hold both a pending upload message and its framed representation, so the reported conservative
+streaming-buffer peak is about 33 MiB plus framing headers, independent of logical window size.
+
+Large logical windows do not imply equally large resident staging buffers. The driver probes each
+column with standard LZ4 block compression and keeps encoded chunks in anonymous memory mappings
+only when compression saves at least 12.5%. In that case the source Arrow batches can be released
+while the logical window continues toward its 512 MiB encoded-byte budget. During upload, at most
+one 1 MiB encoded piece is decompressed into a reusable anonymous mapping immediately before it is
+passed to the normal MonetDB binary protocol. This is internal memory compression: it is neither
+wire compression nor an on-disk cache, and MonetDB receives the same uncompressed bytes.
+
+If the initial staging group does not meet the savings threshold, the driver stops attempting
+compression, retains the Arrow representation, and automatically closes the logical window at
+64 MiB. This bounds the losing case for random floats, compressed blobs, and other high-entropy
+data without requiring per-table settings. An explicit `write_batch_rows` value continues to mean
+exactly what the caller requested and therefore disables this automatic incompressible-data cap.
+
+Compared with an application that stages complete column files on disk, a very wide,
+incompressible stream may consequently produce more COPY windows and use more MonetDB memory while
+the server consolidates or reloads those appends. Raising the window would retain more Arrow data
+in client RAM; spilling the encoded columns would recreate the disk-staging path. The automatic
+cap deliberately favors bounded client memory and no staging files. Compressible streams avoid
+this tradeoff because their large logical windows remain small in physical memory.
 
 `adbc.monetdb.write_window_bytes` changes the byte budget; zero selects the automatic default.
 `adbc.monetdb.write_batch_rows` remains a diagnostic row-count override and disables adaptation.
@@ -199,11 +223,34 @@ After an ingest, the read-only statement option `adbc.monetdb.ingest_stats` retu
 the input-batch and COPY counts, coalesced/split window counts, encoded bytes, bounded in-flight
 bytes, window trajectories, transaction scope, and poison state.
 
+Polars lazy queries do not expose an Arrow stream directly. Install the optional integration with
+`uv add 'adbc-driver-monetdb[polars]'` and wrap the query in the fully backpressured
+`PolarsArrowStream`. Its default producer batches are bounded independently of the driver's exact
+encoded-byte windows:
+
+```python
+import polars as pl
+
+from adbc_driver_monetdb import PolarsArrowStream, dbapi
+
+frame = pl.scan_parquet("trades/*.parquet")
+
+with dbapi.connect("monetdb://localhost:50000/db") as connection:
+    with connection.cursor() as cursor:
+        stream = PolarsArrowStream(frame)
+        inserted_rows = cursor.adbc_ingest("trades", stream, mode="append")
+        assert inserted_rows == stream.rows_read
+```
+
+The base driver remains importable without Polars or PyArrow. Install
+`adbc-driver-monetdb[pyarrow]` for PyArrow-specific driver-manager APIs without the Polars adapter.
+
 An append to an existing table inside an explicit transaction executes directly for every Arrow
 stream window. This avoids MonetDB retaining and replaying a full table version for an operation
 savepoint. If a client-side stream or encoding error occurs after one or more completed COPY
 windows, subsequent reads remain available but `commit()` raises `InvalidState` until
-`rollback()` removes the partial append. Server errors retain their DB-API exception and SQLSTATE;
+`rollback()` removes the partial append. The same guard applies to raw SQL `COMMIT`, and a
+successful raw SQL `ROLLBACK` clears it. Server errors retain their DB-API exception and SQLSTATE;
 MonetDB itself leaves that transaction aborted until rollback. Autocommit ingestion wraps the
 complete stream in an internal transaction, rolls it back on error, and restores the connection.
 
@@ -267,7 +314,7 @@ close that connection and open another one before issuing more work.
 Client information is sent at login by default. The `client` value in
 [`sys.sessions`](https://www.monetdb.org/documentation-Dec2025/user-guide/sql-catalog/users-roles-privileges-sessions/)
 identifies this driver and its protocol library, for example
-`adbc_driver_monetdb 0.8.8 / monetdb-rust 0.2.2-wlaur.1`. The Python shim uses the basename of
+`adbc_driver_monetdb 0.8.9 / monetdb-rust 0.2.2-wlaur.1`. The Python shim uses the basename of
 `sys.argv[0]` as the default `application`. Hostname and process id are also sent by default, as
 they are by pymonetdb and libmapi; use `client_info=false` if that host metadata should not leave
 the client.
@@ -422,7 +469,7 @@ installation. Every GitHub Release includes `SHA256SUMS`; verify the archive che
 installing it.
 
 Polars can use a dbc-installed driver without the `adbc-driver-monetdb` Python package when the
-connection is created by the Python driver manager (which is still required by polars' ADBC engine):
+connection is created by the Python driver manager (which is still required by Polars' ADBC engine):
 
 ```python
 import polars as pl

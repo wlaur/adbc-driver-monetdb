@@ -51,18 +51,28 @@ interrupt whichever statement currently owns the connection; open a new connecti
 
 ## Bulk ingestion
 
-The driver coalesces producer batches into adaptive COPY windows using a 512 MiB encoded-byte
+The driver measures and coalesces producer batches into COPY windows using a 512 MiB encoded-byte
 budget, raised to 2 GiB for constrained append targets with fixed-width wire rows no larger than
-16 bytes, then streams each requested column in bounded messages. Producer batch size therefore
-does not need to match the driver window. This avoids repeated index maintenance across tens of
-millions of narrow rows while wide, variable-width, and ordinary append-only tables retain the
-smaller bound. In finite Linux cgroups, the ceilings are reduced to one eighth and one quarter of
-the limit, respectively. The connection and statement option
+16 bytes, then streams each requested column in bounded messages. Oversized producer batches are
+split without copying, and a single row larger than the configured budget is the only possible
+overrun. Producer batch size therefore does not need to match the driver window. This avoids
+repeated index maintenance across tens of millions of narrow rows while wide, variable-width, and
+ordinary append-only tables retain the smaller bound. In finite Linux cgroups, the ceilings are
+reduced to one eighth and one quarter of the limit, respectively. The connection and statement option
 `adbc.monetdb.write_window_bytes` changes the byte budget; the diagnostic
 `adbc.monetdb.write_batch_rows` option forces an exact row count instead.
 
+Encoded column chunks are held in anonymous mappings using standard LZ4 block compression when it
+saves at least 12.5%. Compressible streams can therefore release their Arrow batches while filling
+the logical 512 MiB window. Upload decompresses one bounded 1 MiB piece at a time into a reusable
+mapping before sending the ordinary, uncompressed MonetDB binary protocol. The compressed form is
+never sent or persisted. If the initial staging group is not materially compressible, the driver
+stops probing, retains Arrow, and automatically limits the window to 64 MiB. This policy is
+data-driven and normally requires no application tuning.
+
 In a caller-managed transaction, a client-side failure after completed COPY windows makes commit
-fail until rollback, so a partial append is not accidentally committed. Advanced callers may set
+fail until rollback, including through raw transaction SQL, so a partial append is not
+accidentally committed. Advanced callers may set
 `adbc.monetdb.ingest_atomicity=savepoint` to roll back only the ingest, or
 `adbc.monetdb.ingest_partial=allow` to permit a partial commit. Statement option
 `adbc.monetdb.ingest_stats` returns post-execution JSON observability.

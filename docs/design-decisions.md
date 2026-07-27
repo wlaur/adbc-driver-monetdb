@@ -53,21 +53,55 @@ requirements change their premises.
 
 - The read default remains 131,072 rows. Write scheduling is byte-based: a 512 MiB encoded budget,
   raised to 2 GiB for constrained append targets with fixed-width wire rows no larger than 16
-  bytes, with a 4,096-row minimum and no independent maximum-row cap. The ceilings are reduced to
-  one eighth and one quarter, respectively, of a finite Linux cgroup limit when needed. The first
-  4,096 rows establish the wire-byte estimate; later windows use a 70/30
-  actual/prior update. Full-suite calibration matters here: on Dec2025, repeatedly extending a
-  multi-million-row table can dominate ingest time even when each COPY is fast in smaller
-  microbenchmarks because MonetDB maintains constraint indexes for each append. Constraint
-  metadata and fixed wire width are therefore part of automatic scheduling: very narrow
-  constrained tables get fewer maintenance rounds, while wide, variable-width, and ordinary
-  append-only tables retain the smaller memory bound. Boundaries stay independent of producer
-  batching and an exact-row diagnostic override remains available.
+  bytes. The ceilings are reduced to one eighth and one quarter, respectively, of a finite Linux
+  cgroup limit when needed. Every producer batch is measured from its Arrow buffers before it
+  enters the pending queue. Windows consume only batches and zero-copy slices whose measured wire
+  size fits the remaining budget; a binary search finds the largest fitting slice of an oversized
+  batch. A single encoded row larger than the budget is the only permitted overrun.
+  Thirty-two equal-level pending batches are compacted at a time, bounding metadata while copying
+  each row at most logarithmically even for streams of one-row batches. Full-suite calibration
+  matters here: on Dec2025, repeatedly extending a multi-million-row table can dominate ingest
+  time because MonetDB maintains constraint indexes for each append. Constraint metadata and
+  fixed wire width are therefore queried only for automatic scheduling: very narrow constrained
+  tables get fewer maintenance rounds, while wide, variable-width, and ordinary append-only
+  tables retain the smaller memory bound. Boundaries stay independent of producer batching and an
+  exact-row diagnostic override remains available.
+- The 512 MiB default is measured rather than capacity-derived. On a 100-million-row
+  mixed-width population, 128 MiB reduced combined client/server peak RSS by 747 MiB but
+  increased duration from 361 to 401 seconds and peak farm/WAL storage from 47.7 to 50.2 GiB.
+  A chunked narrow-row population was insensitive to the same change. The explicit runtime
+  option remains available for memory-constrained applications, while the default favors the
+  cross-axis result across both shapes.
+- Logical ingest windows are decoupled from physical staging memory. Each encoded column starts by
+  applying standard LZ4 block compression in bounded 1 MiB pieces stored in anonymous mappings.
+  Compression remains enabled only when it saves at least 12.5%; this conservative threshold
+  covers both the temporary compression workspace and the CPU cost. A compressible window can
+  release its Arrow batches and continue toward the 512 MiB logical budget while retaining only
+  compressed chunks. Upload reuses one mapping to decode at most 1 MiB immediately before the
+  ordinary binary protocol consumes it. The compressed representation is process-local and is
+  never a wire or disk format.
+- If the first staging group is not materially compressible, further compression attempts stop,
+  Arrow remains the canonical representation, and automatic scheduling closes the window at
+  64 MiB. This bounds duplicated probe data and retained Arrow memory for random floats,
+  pre-compressed binary values, and other high-entropy inputs while preserving large COPY windows
+  for repetitive strings, null-heavy columns, and regular numeric data. The decision is based
+  only on observed bytes, not table or schema identity. Explicit row scheduling bypasses the cap
+  because it is an exact diagnostic override.
+- Very wide, incompressible input exposes a fundamental three-way tradeoff. Smaller COPY windows
+  bound client RSS and avoid staging files, but MonetDB may temporarily retain more append segments
+  during consolidation or restart. A single large window would move the encoded table into client
+  RAM, while file-backed chunks would recreate the disk-staging implementation. The automatic
+  64 MiB branch chooses bounded client memory and no temporary disk. This can lose server peak
+  memory to disk staging for that shape even though final farm size is identical; the behavior is
+  a format-driven consequence, not a reason to recognize particular tables or schemas.
 - The protocol fork exposes a generic streaming upload sink. The driver serves each requested
   column in bounded 1 MiB encoder pieces that the protocol coalesces into 16 MiB messages, so an
   encoded window is never materialized as one `Vec<u8>`. Null-free signed integer and float
-  layouts borrow validated Arrow buffers directly; other types
-  use one bounded scratch piece while the protocol layer owns one framed piece. A 2M-row
+  layouts borrow validated Arrow buffers directly; other types use one bounded scratch piece.
+  During a flush the protocol retains the pending 16 MiB payload while constructing a similarly
+  sized framed message, so the conservative streaming-buffer bound is about 33 MiB including the
+  1 MiB encoder chunk and framing headers. `peak_in_flight_bytes` reports that bound from the
+  protocol constants rather than inferring it from producer chunk size. A 2M-row
   single-column replay improved from 52.3 to 23.8 ms for BIGINT, 127.6 to 53.0 ms for VARCHAR, and
   105.7 to 42.5 ms for TIMESTAMP on the documented local Dec2025 harness because adaptive
   coalescing also removed repeated COPY round trips.
@@ -75,11 +109,12 @@ requirements change their premises.
   COPY window. Operation savepoints caused MonetDB to retain and materialize disproportionate
   storage for large, wide streams even after the savepoint was released. A server error aborts the
   caller transaction until rollback. A client-side error after a completed window marks the
-  connection rollback-only: reads remain available, but commit is blocked until rollback. This
-  preserves caller ownership without silently discarding earlier work. Explicit savepoint and
-  partial-commit modes remain advanced opt-ins. Autocommit still wraps the complete stream in an
-  internal transaction; create and replace modes retain their operation savepoint because their
-  DDL must be recovered without discarding unrelated caller work.
+  connection rollback-only: reads remain available, but connection APIs and raw SQL both block
+  commit until a successful rollback clears the state. This preserves caller ownership without
+  silently discarding earlier work. Explicit savepoint and partial-commit modes remain advanced
+  opt-ins. Autocommit still wraps the complete stream in an internal transaction; create and
+  replace modes retain their operation savepoint because their DDL must be recovered without
+  discarding unrelated caller work.
 - The prefetch worker fetches complete raw `Xexportbin` frames while the caller decodes the
   previous frame. A worker that both fetches and decodes would serialize those phases and lose the
   overlap.

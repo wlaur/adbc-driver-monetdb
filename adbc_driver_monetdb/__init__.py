@@ -4,6 +4,16 @@ from enum import StrEnum
 from importlib.metadata import PackageNotFoundError, version
 
 from adbc_driver_monetdb import _native
+from adbc_driver_monetdb.arrow import (
+    DEFAULT_ARROW_BATCH_BYTES,
+    DEFAULT_ARROW_BATCH_ROWS,
+    recommended_arrow_batch_rows,
+)
+from adbc_driver_monetdb.polars import (
+    DEFAULT_POLARS_BATCH_BYTES,
+    DEFAULT_POLARS_BATCH_ROWS,
+    PolarsArrowStream,
+)
 
 try:
     __version__ = version("adbc-driver-monetdb")
@@ -63,10 +73,16 @@ def driver_path() -> str:
 
 
 __all__ = [
+    "DEFAULT_ARROW_BATCH_BYTES",
+    "DEFAULT_ARROW_BATCH_ROWS",
+    "DEFAULT_POLARS_BATCH_BYTES",
+    "DEFAULT_POLARS_BATCH_ROWS",
     "ENTRYPOINT",
     "ConnectionOptions",
     "DatabaseOptions",
+    "PolarsArrowStream",
     "StatementOptions",
     "__version__",
     "driver_path",
+    "recommended_arrow_batch_rows",
 ]
