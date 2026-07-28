@@ -4493,29 +4493,36 @@ fn append_table_columns(
     mismatch_status: Status,
 ) -> Result<Vec<AppendColumn>> {
     let table = metadata::raw_string_literal(table_name)?;
-    let table_selector = match schema_name {
-        Some(schema) => format!(
-            "t.name = {table} AND s.name = {}",
-            metadata::raw_string_literal(schema)?
+    let (columns_catalog, tables_catalog, schema_join, table_selector) = match schema_name {
+        Some("tmp") => (
+            "tmp._columns",
+            "tmp._tables",
+            "",
+            format!("t.name = {table}"),
         ),
-        None => format!(
-            "t.id = (\
-                 SELECT t2.id \
-                 FROM sys.tables AS t2 \
-                 JOIN sys.schemas AS s2 ON s2.id = t2.schema_id \
-                 WHERE t2.name = {table} AND s2.name IN ('tmp', current_schema) \
-                 ORDER BY CASE WHEN s2.name = 'tmp' THEN 0 ELSE 1 END \
-                 LIMIT 1\
-             )"
+        Some(schema) => (
+            "sys._columns",
+            "sys._tables",
+            "JOIN sys.schemas AS s ON s.id = t.schema_id",
+            format!(
+                "t.name = {table} AND s.name = {}",
+                metadata::raw_string_literal(schema)?
+            ),
+        ),
+        None => (
+            "sys._columns",
+            "sys._tables",
+            "JOIN sys.schemas AS s ON s.id = t.schema_id",
+            format!("t.name = {table} AND s.name = current_schema"),
         ),
     };
     cursor
         .execute(&format!(
             "SELECT c.name, c.type, c.type_digits, c.type_scale, c.\"null\", \
                     tt.table_type_name \
-             FROM sys.columns AS c \
-             JOIN sys.tables AS t ON t.id = c.table_id \
-             JOIN sys.schemas AS s ON s.id = t.schema_id \
+             FROM {columns_catalog} AS c \
+             JOIN {tables_catalog} AS t ON t.id = c.table_id \
+             {schema_join} \
              JOIN sys.table_types AS tt ON tt.table_type_id = t.type \
              WHERE {table_selector} \
              ORDER BY c.number"

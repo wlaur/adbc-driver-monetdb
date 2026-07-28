@@ -240,6 +240,11 @@ requirements change their premises.
   uploading. The bound prevents unbounded producer read-ahead, and the join path surfaces reader
   errors or worker panics before the statement completes. On the 764,331 × 786 time-series input,
   this reduced the large-table ingest query from 8.21 to 6.52 seconds.
+- Append-schema reads use `sys._columns`/`sys._tables`, or their `tmp` counterparts when the ADBC
+  temporary-table option is set. On the supported 11.55.1 release, a temporary-table preflight
+  immediately before the public `sys.columns` view can misbind that view's internal `_columns`
+  reference to the temporary schema. The base catalogs provide the same metadata without that
+  server-side binder defect; the minimum-version integration job covers the sequence.
 - Server-side LZ4 is selected from observed bytes, not from another latency heuristic. The `auto`
   default sends plain frames only when every column in a window cleared the savings threshold; an
   incompressible column keeps the whole window on the ordinary upload path. It also avoids weak
