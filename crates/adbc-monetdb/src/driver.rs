@@ -3923,6 +3923,21 @@ fn should_finish_incompressible_window(
         && window.estimated_bytes >= incompressible_window_budget
 }
 
+fn remaining_staging_bytes(
+    configured_rows: Option<usize>,
+    remaining_window_bytes: usize,
+    incompressible_window_budget: usize,
+    window: &EncodedIngestWindow,
+) -> usize {
+    if configured_rows.is_none() && window.retain_arrow {
+        incompressible_window_budget
+            .saturating_sub(window.estimated_bytes)
+            .min(remaining_window_bytes)
+    } else {
+        remaining_window_bytes
+    }
+}
+
 impl<'a> IngestWindowScheduler<'a> {
     fn new(
         reader: &'a mut (dyn RecordBatchReader + Send),
@@ -3967,7 +3982,16 @@ impl<'a> IngestWindowScheduler<'a> {
             if remaining_bytes == 0 {
                 break;
             }
-            let staging_bytes = remaining_bytes.min(if window.rows == 0 {
+            let remaining_staging_bytes = remaining_staging_bytes(
+                self.configured_rows,
+                remaining_bytes,
+                self.incompressible_window_budget,
+                &window,
+            );
+            if remaining_staging_bytes == 0 {
+                break;
+            }
+            let staging_bytes = remaining_staging_bytes.min(if window.rows == 0 {
                 compression_probe_staging_bytes(self.schema.fields().len())
             } else {
                 ENCODE_STAGING_BYTES
@@ -7531,6 +7555,32 @@ mod tests {
             INCOMPRESSIBLE_WRITE_WINDOW_BYTES,
             &window
         ));
+    }
+
+    #[test]
+    fn incompressible_staging_honors_the_remaining_physical_window() {
+        let mut window = EncodedIngestWindow::new(0);
+        window.retain_arrow = true;
+        window.estimated_bytes = 16 * 1024 * 1024;
+
+        assert_eq!(
+            remaining_staging_bytes(
+                None,
+                DEFAULT_WRITE_WINDOW_BYTES - window.estimated_bytes,
+                INCOMPRESSIBLE_WRITE_WINDOW_BYTES,
+                &window,
+            ),
+            INCOMPRESSIBLE_WRITE_WINDOW_BYTES - window.estimated_bytes
+        );
+        assert_eq!(
+            remaining_staging_bytes(
+                Some(1_000_000),
+                DEFAULT_WRITE_WINDOW_BYTES - window.estimated_bytes,
+                INCOMPRESSIBLE_WRITE_WINDOW_BYTES,
+                &window,
+            ),
+            DEFAULT_WRITE_WINDOW_BYTES - window.estimated_bytes
+        );
     }
 
     #[test]

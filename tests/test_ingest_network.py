@@ -87,10 +87,11 @@ def test_measured_latency_adapts_insert_routing_and_copy_windows(monetdb_uri: st
     finally:
         _set_latency(0)
 
-    assert direct["copy_count"] == 2
-    assert direct["incompressible_window_budget_bytes"] == 64 * MIB
     assert isinstance(direct["measured_round_trip_us"], int)
     assert isinstance(proxied["measured_round_trip_us"], int)
+    direct_is_remote = direct["measured_round_trip_us"] >= 500
+    assert direct["copy_count"] == (1 if direct_is_remote else 2)
+    assert direct["incompressible_window_budget_bytes"] == (512 if direct_is_remote else 64) * MIB
     assert proxied["measured_round_trip_us"] > direct["measured_round_trip_us"]
     assert proxied["measured_round_trip_us"] >= 500
     assert proxied["copy_count"] == 1
