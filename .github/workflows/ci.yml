@@ -34,7 +34,7 @@ jobs:
     name: lint (ruff + pyright)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
       - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
@@ -56,7 +56,7 @@ jobs:
     name: rust fmt/clippy/test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
       - name: Install Rust components
@@ -92,7 +92,7 @@ jobs:
       matrix:
         os: [macos-14, windows-latest]
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
       - name: Install current stable Rust
@@ -106,7 +106,7 @@ jobs:
     name: big-endian Arrow check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
       - name: Install current stable Rust and s390x target
@@ -121,7 +121,7 @@ jobs:
     name: dependency license report
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
       - name: Install current stable Rust
@@ -146,7 +146,7 @@ jobs:
     needs: license-report
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
       - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
@@ -224,7 +224,7 @@ jobs:
           - os: windows-latest     # Windows x86_64
             dbc_platform: windows_amd64
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
       - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
@@ -390,7 +390,7 @@ jobs:
         os: [ubuntu-latest, ubuntu-24.04-arm, macos-14, windows-latest]
         python: ["3.13", "3.14"]
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
         with:
           python-version: ${{ matrix.python }}
@@ -441,7 +441,7 @@ jobs:
       MONETDB_REMOTE_TEST_URI: monetdb://monetdb:monetdb@localhost:50001/remote
       MONETDB_REMOTE_SERVER_URI: mapi:monetdb://monetdb-remote:50000/remote
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
       - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
@@ -530,7 +530,7 @@ jobs:
     env:
       MONETDB_TEST_URI: monetdb://monetdb:monetdb@localhost:50000/test
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: wlaur/sqlalchemy-monetdb-adbc
           path: downstream-dialect
@@ -571,7 +571,7 @@ jobs:
       MONETDB_TEST_URI: monetdb://monetdb:monetdb@localhost:50000/test
       MONETDB_EXPECTED_SERVER_VERSION: 11.55.1
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
       - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
@@ -645,7 +645,7 @@ jobs:
     env:
       MONETDB_TEST_URI: monetdb://monetdb:monetdb@localhost:50000/test
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: true
       - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
@@ -737,7 +737,7 @@ jobs:
       id-token: write               # OIDC -> PyPI; no API token/secret is used
       contents: read                # checkout below reads pyproject.toml to guard the tag
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - name: Verify protected-main provenance and release versions
@@ -765,7 +765,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: release/python
