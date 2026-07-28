@@ -58,24 +58,41 @@ split without copying, and a single row larger than the configured budget is the
 overrun. Producer batch size therefore does not need to match the driver window. This avoids
 repeated index maintenance across tens of millions of narrow rows while wide, variable-width, and
 ordinary append-only tables retain the smaller bound. In finite Linux cgroups, the ceilings are
-reduced to one eighth and one quarter of the limit, respectively. The connection and statement option
-`adbc.monetdb.write_window_bytes` changes the byte budget; the diagnostic
-`adbc.monetdb.write_batch_rows` option forces an exact row count instead.
+reduced to one eighth and one quarter of the limit, respectively. The connection and statement
+option `adbc.monetdb.write_window_bytes` changes the byte budget and the incompressible-data floor;
+the diagnostic `adbc.monetdb.write_batch_rows` option forces an exact row count instead. On
+automatic settings, measured network latency and very wide tables raise the 64 MiB incompressible
+floor to avoid repeating per-column COPY exchanges and server-plan compilation. The local-width
+cutoff is 512 columns, selected conservatively from a repeated 100–1,000-column calibration.
 
-Encoded column chunks are held in anonymous mappings using standard LZ4 block compression when it
-saves at least 12.5%. Compressible streams can therefore release their Arrow batches while filling
-the logical 512 MiB window. Upload decompresses one bounded 1 MiB piece at a time into a reusable
-mapping before sending the ordinary, uncompressed MonetDB binary protocol. The compressed form is
-never sent or persisted. If the initial staging group is not materially compressible, the driver
-stops probing, retains Arrow, and automatically limits the window to 64 MiB. This policy is
-data-driven and normally requires no application tuning.
+With `wire_compression=none`, each window samples up to 256 KiB per column and chooses between
+ordinary LZ4 and byte-plane shuffle plus LZ4 from the observed bytes. `auto` probes plain LZ4 so a
+profitable frame can go directly to the server, while `lz4` forces that representation.
+Compressible streams can release their Arrow batches while filling the logical window.
+Incompressible later batches stay as Arrow and are encoded in bounded pieces on a worker while
+earlier pieces upload. Client-only retention uses direct LZ4 blocks; wire-eligible data uses LZ4
+frames. The compressed form is never persisted.
+
+The default `adbc.monetdb.wire_compression=auto` sends a window's plain LZ4 frames directly to
+MonetDB only when every column already benefits; otherwise it retains Arrow and sends ordinary
+binary COPY. `lz4` forces plain LZ4 for bandwidth-constrained links. `none` enables client-only
+byte shuffling for a lower-memory retention path; shuffled blocks are decoded locally because
+MonetDB does not reverse that transform. The same key is available as `wire_compression` in the
+URI, and `window_wire_compression` in ingest stats makes every per-window decision observable.
+
+A complete single-batch ingest of at most 100 rows and 8 MiB uses the cached prepared INSERT path;
+the row threshold adapts upward on measured higher-latency connections. Set
+`adbc.monetdb.ingest_insert_rows=0` to force COPY. The URI accepts `write_window_bytes`,
+`ingest_insert_rows`, `prepared_cache_capacity`, and `wire_compression` for URI-only consumers.
 
 In a caller-managed transaction, a client-side failure after completed COPY windows makes commit
 fail until rollback, including through raw transaction SQL, so a partial append is not
 accidentally committed. Advanced callers may set
 `adbc.monetdb.ingest_atomicity=savepoint` to roll back only the ingest, or
 `adbc.monetdb.ingest_partial=allow` to permit a partial commit. Statement option
-`adbc.monetdb.ingest_stats` returns post-execution JSON observability.
+`adbc.monetdb.ingest_stats` returns post-execution JSON including the chosen path, measured round
+trip, effective thresholds, physical stored bytes, per-window storage and wire modes, and
+prepared-cache hits.
 
 ## Client information
 

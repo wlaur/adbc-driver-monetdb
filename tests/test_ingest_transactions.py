@@ -292,7 +292,10 @@ def test_single_copy_append_server_error_aborts_dbapi_transaction_until_rollback
         setup.execute("INSERT INTO ingest_constraint_error VALUES (1)")
 
     try:
-        with dbapi.connect(monetdb_uri) as connection, connection.cursor() as cursor:
+        with (
+            dbapi.connect(monetdb_uri) as connection,
+            connection.cursor(adbc_stmt_kwargs={StatementOptions.INGEST_INSERT_ROWS: "0"}) as cursor,
+        ):
             cursor.execute("INSERT INTO ingest_constraint_error VALUES (2)")
             duplicate = pa.table({"value": pa.array([3, 3], type=pa.int32())})
             with pytest.raises(adbc_driver_manager.IntegrityError) as caught:

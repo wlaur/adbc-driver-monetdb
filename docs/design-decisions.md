@@ -73,13 +73,13 @@ requirements change their premises.
   option remains available for memory-constrained applications, while the default favors the
   cross-axis result across both shapes.
 - Logical ingest windows are decoupled from physical staging memory. Each encoded column starts by
-  applying standard LZ4 block compression in bounded 1 MiB pieces stored in anonymous mappings.
+  applying LZ4 compression in bounded 1 MiB pieces stored in anonymous mappings. Client-only
+  retention uses direct blocks; wire-eligible compression uses frames.
   Compression remains enabled only when it saves at least 12.5%; this conservative threshold
   covers both the temporary compression workspace and the CPU cost. A compressible window can
   release its Arrow batches and continue toward the 512 MiB logical budget while retaining only
   compressed chunks. Upload reuses one mapping to decode at most 1 MiB immediately before the
-  ordinary binary protocol consumes it. The compressed representation is process-local and is
-  never a wire or disk format.
+  ordinary binary protocol consumes it. The compressed representation is never a disk format.
 - If the first staging group is not materially compressible, further compression attempts stop,
   Arrow remains the canonical representation, and automatic scheduling closes the window at
   64 MiB. This bounds duplicated probe data and retained Arrow memory for random floats,
@@ -98,13 +98,16 @@ requirements change their premises.
   column in bounded 1 MiB encoder pieces that the protocol coalesces into 16 MiB messages, so an
   encoded window is never materialized as one `Vec<u8>`. Null-free signed integer and float
   layouts borrow validated Arrow buffers directly; other types use one bounded scratch piece.
-  During a flush the protocol retains the pending 16 MiB payload while constructing a similarly
-  sized framed message, so the conservative streaming-buffer bound is about 33 MiB including the
-  1 MiB encoder chunk and framing headers. `peak_in_flight_bytes` reports that bound from the
-  protocol constants rather than inferring it from producer chunk size. A 2M-row
+  During a flush the protocol scatter-writes MAPI headers with the pending 16 MiB payload instead
+  of copying it into a similarly sized framed message, so the conservative streaming-buffer bound
+  is about 17 MiB including the 1 MiB encoder chunk and framing headers.
+  `peak_in_flight_bytes` reports that bound from the protocol constants rather than inferring it
+  from producer chunk size. A 2M-row
   single-column replay improved from 52.3 to 23.8 ms for BIGINT, 127.6 to 53.0 ms for VARCHAR, and
   105.7 to 42.5 ms for TIMESTAMP on the documented local Dec2025 harness because adaptive
-  coalescing also removed repeated COPY round trips.
+  coalescing also removed repeated COPY round trips. On a 160 MB, 20-column random-REAL upload,
+  replacing copied framing with scatter framing reduced the median of five warmed runs from
+  168.6 to 161.2 ms (4.4%) and removed one message-sized allocation.
 - Appends to an existing table inside a caller-managed transaction execute directly for every
   COPY window. Operation savepoints caused MonetDB to retain and materialize disproportionate
   storage for large, wide streams even after the savepoint was released. A server error aborts the
@@ -157,7 +160,8 @@ requirements change their premises.
 ## Prepared-statement lifetime
 
 - Positional prepared statements are cached per connection under SQL normalized by trimming
-  surrounding whitespace and trailing semicolons. A 128-entry least-recently-used cache bounds
+  surrounding whitespace and trailing semicolons. A configurable 512-entry least-recently-used
+  cache bounds
   session memory; lookups update a monotonic use counter in constant time, while eviction scans
   only when inserting a new entry. Shared entry leases prevent eviction from deallocating a plan
   still used by a live statement. Statement destruction remains nonblocking; the cache or session
@@ -205,6 +209,51 @@ requirements change their premises.
   directly after a precision/sentinel validation scan. Unaligned or big-endian buffers retain the
   checked copying path.
 
+## Ingest routing, retention, and topology
+
+- A complete one-batch ingest of at most 100 rows and 8 MiB uses the cached prepared INSERT path.
+  At 1,001 columns, binary COPY costs about 210 ms regardless of one or ten rows because the
+  server requests one client file per column; a prepared one-row INSERT costs 3–5 ms. The row
+  threshold is configurable, zero disables the route, and multi-batch readers always stay on
+  COPY. The 8 MiB cap bounds literal rendering and the single MAPI script.
+- Connection initialization times existing metadata queries and retains the lower observed round
+  trip without adding a probe. Below 0.5 ms, the static defaults remain unchanged. Above that
+  boundary, the INSERT crossover grows from the measured round trip and the incompressible COPY
+  floor grows to the effective logical-window budget. At 1,000 columns, a local Toxiproxy
+  calibration measured one-row COPY at 0.23 seconds direct, 3.92 seconds with 1 ms downstream
+  latency, and 12.59 seconds with 5 ms; a prepared 1,000-row INSERT remained 1.57–1.78 seconds.
+  The manual `test_measured_latency_adapts_insert_routing_and_copy_windows` regression reproduces
+  the topology change with the pinned Compose proxy.
+- Tables of at least 512 columns also use the effective logical-window budget for incompressible
+  data on a local link. In a repeated 200,000-row random-float sweep, 512 MiB was neutral at 100
+  columns and improved median COPY time by 15%, 23%, 30%, 33%, 34%, and 36% at 200, 256, 384,
+  512, 786, and 1,000 columns. The 512-column cutoff retains the smaller-memory behavior below the
+  measured crossover while covering wide analytical tables.
+- With client-only `wire_compression=none`, each new window samples at most 256 KiB per column. For
+  fixed-width values it compares plain LZ4 with byte-plane shuffle plus LZ4 and selects only a
+  representation saving at least 12.5%. `auto` probes plain LZ4 so profitable frames can go
+  directly to the server, and `lz4` forces frames. Selection is per column and byte-observed. A
+  full-chunk savings check can still demote a misleading sample to raw retention without affecting
+  correctness. Retained Arrow batches are encoded through a capacity-one worker channel, so
+  encoding of a bounded piece overlaps upload of the preceding piece.
+- A zero-capacity window handoff builds one logical ingest window while the preceding COPY is
+  uploading. The bound prevents unbounded producer read-ahead, and the join path surfaces reader
+  errors or worker panics before the statement completes. On the 764,331 × 786 time-series input,
+  this reduced the large-table ingest query from 8.21 to 6.52 seconds.
+- Server-side LZ4 is selected from observed bytes, not from another latency heuristic. The `auto`
+  default sends plain frames only when every column in a window cleared the savings threshold; an
+  incompressible column keeps the whole window on the ordinary upload path. It also avoids weak
+  client-only shuffle compression on mixed time-series windows. `none` enables that lower-memory
+  client-only shuffle path, while `lz4` forces bounded plain frames for links where reduced bytes
+  outweigh server decompression. In the final cross-suite validation, `auto` improved time-series
+  by 5%, rtabench by 22%, and ClickBench by 28% versus the preceding ADBC state. Per-window
+  selection prevents one high-entropy window from disabling compression for later repetitive
+  data, and `window_wire_compression` exposes the decision.
+- The stats contract exposes every adaptive decision: `path`, `measured_round_trip_us`,
+  `insert_rows_threshold`, `window_budget_bytes`, `incompressible_window_budget_bytes`,
+  `stored_bytes`, `window_storage`, `window_wire_compression`, and `prepared_cache_hits`. Tests
+  assert these fields instead of inferring routes from timing.
+
 ## Measured optimization rejections
 
 These conclusions record comparative measurements completed on 2026-07-23. A proposal to reverse
@@ -222,6 +271,7 @@ be reviewed and reproduced.
 | Unconditional dedup-map pre-sizing or a 2,048-row sample | Rejected in favor of the adaptive 4,096-row sample. |
 | Disabling dedup adaptively | Rejected; the best case was about 2%, with a 2–5× downside on a wrong guess. |
 | Temporal, decimal, or primitive encode rewrites | Rejected; they were at parity or slower. The chrono removal helped decode because decode had validation and intermediate-allocation costs that encode does not have. |
+| Demoting fixed-width Arrow validation | Rejected; a paired time-series check improved the 786-column ingest by only 0.4%, inside run noise, and a 200,000-row primitive control was neutral. Full validation keeps one contract for all foreign Arrow inputs. |
 | Cross-window string backreferences | Deferred; keeping windows independent bounds state, while adaptive coalescing already avoids upstream-batch resets. |
 | Asynchronous COPY double-buffering | Rejected for the sequential ON CLIENT protocol; synchronous bounded encode/send already holds at most one scratch and one framed chunk. |
 | A worker that fetches and decodes | Rejected because it cannot overlap the two phases. |

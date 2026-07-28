@@ -17,13 +17,22 @@ from adbc_driver_monetdb import (
     ConnectionOptions as ConnectionOptions,
 )
 from adbc_driver_monetdb import (
+    ConnectionOptionValues as ConnectionOptionValues,
+)
+from adbc_driver_monetdb import (
     DatabaseOptions as DatabaseOptions,
+)
+from adbc_driver_monetdb import (
+    DatabaseOptionValues as DatabaseOptionValues,
 )
 from adbc_driver_monetdb import (
     PolarsArrowStream as PolarsArrowStream,
 )
 from adbc_driver_monetdb import (
     StatementOptions as StatementOptions,
+)
+from adbc_driver_monetdb import (
+    StatementOptionValues as StatementOptionValues,
 )
 from adbc_driver_monetdb import (
     __version__ as __version__,
@@ -41,9 +50,12 @@ __all__ = [
     "DEFAULT_POLARS_BATCH_BYTES",
     "DEFAULT_POLARS_BATCH_ROWS",
     "ENTRYPOINT",
+    "ConnectionOptionValues",
     "ConnectionOptions",
+    "DatabaseOptionValues",
     "DatabaseOptions",
     "PolarsArrowStream",
+    "StatementOptionValues",
     "StatementOptions",
     "__version__",
     "driver_path",

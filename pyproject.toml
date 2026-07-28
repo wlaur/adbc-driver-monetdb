@@ -1,6 +1,6 @@
 [project]
 name = "adbc-driver-monetdb"
-version = "0.8.9"
+version = "0.9.0"
 description = "ADBC driver for MonetDB: Arrow-native reads and writes for polars, pandas, and the wider ADBC ecosystem"
 authors = [{ name = "William Laurén", email = "lauren.william.a@gmail.com" }]
 requires-python = ">=3.13"
@@ -33,6 +33,7 @@ pyarrow = ["pyarrow>=25"]
 [dependency-groups]
 dev = [
     "maturin>=1.8.2,<2",
+    "numpy>=2",
     "ruff",
     "pytest>=9",
     "pyright",

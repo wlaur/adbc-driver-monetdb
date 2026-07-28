@@ -1,0 +1,8 @@
+[
+  {
+    "name": "monetdb",
+    "listen": "[::]:50001",
+    "upstream": "monetdb:50000",
+    "enabled": true
+  }
+]

@@ -1,13 +1,17 @@
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet, VecDeque},
     fmt,
+    io::{Read, Write},
     num::NonZeroUsize,
     os::raw::c_char,
     path::Path,
     sync::{
         Arc, Mutex, MutexGuard, Weak,
         atomic::{AtomicU64, Ordering},
+        mpsc::{Receiver, SyncSender, sync_channel},
     },
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
@@ -48,9 +52,18 @@ const NARROW_CONSTRAINED_ROW_BYTES: usize = 16;
 const MIN_WRITE_WINDOW_BYTES: usize = 4 * 1024 * 1024;
 const ENCODE_CHUNK_BYTES: usize = 1024 * 1024;
 const MIN_ENCODE_BUFFER_BYTES: usize = 64 * 1024;
+const COMPRESSION_PROBE_BYTES: usize = 256 * 1024;
+const MIN_COMPRESSION_PROBE_STAGING_BYTES: usize = 16 * 1024 * 1024;
+const MAX_COMPRESSION_PROBE_STAGING_BYTES: usize = 64 * 1024 * 1024;
+const ENCODE_STAGING_BYTES: usize = DEFAULT_WRITE_WINDOW_BYTES;
 const PENDING_BATCH_COMPACTION_FANOUT: usize = 32;
 const PENDING_BATCH_COMPACTION_MAX_BYTES: usize = 16 * 1024 * 1024;
-const PREPARED_CACHE_CAPACITY: usize = 128;
+const DEFAULT_PREPARED_CACHE_CAPACITY: usize = 512;
+const ADAPTIVE_NETWORK_RTT: Duration = Duration::from_micros(500);
+const INSERT_VALUE_ENCODE_MICROS: u128 = 2;
+const COPY_FILE_EXCHANGES_PER_COLUMN: u128 = 2;
+const MAX_ADAPTIVE_INSERT_ROWS: usize = 10_000;
+const WIDE_COPY_ADAPTIVE_COLUMNS: usize = 512;
 const PREFETCH_DROP_GRACE: Duration = Duration::from_millis(250);
 const METADATA_REPLY_ROWS: usize = 1024;
 const INLINE_REPLY_ROWS: i64 = 100;
@@ -58,6 +71,9 @@ const READ_BATCH_ROWS_OPTION: &str = "adbc.monetdb.read_batch_rows";
 const READ_PREFETCH_OPTION: &str = "adbc.monetdb.read_prefetch";
 const WRITE_BATCH_ROWS_OPTION: &str = "adbc.monetdb.write_batch_rows";
 const WRITE_WINDOW_BYTES_OPTION: &str = "adbc.monetdb.write_window_bytes";
+const INGEST_INSERT_ROWS_OPTION: &str = "adbc.monetdb.ingest_insert_rows";
+const PREPARED_CACHE_CAPACITY_OPTION: &str = "adbc.monetdb.prepared_cache_capacity";
+const WIRE_COMPRESSION_OPTION: &str = "adbc.monetdb.wire_compression";
 const INGEST_PARTIAL_OPTION: &str = "adbc.monetdb.ingest_partial";
 const INGEST_ATOMICITY_OPTION: &str = "adbc.monetdb.ingest_atomicity";
 const INGEST_STATS_OPTION: &str = "adbc.monetdb.ingest_stats";
@@ -90,7 +106,55 @@ const URI_QUERY_KEYS: &[&str] = &[
     "client_application",
     "client_remark",
     "max_response_size",
+    "write_window_bytes",
+    "ingest_insert_rows",
+    "prepared_cache_capacity",
+    "wire_compression",
 ];
+
+fn tuning_option_from_uri_key(key: &str) -> Option<&'static str> {
+    match key {
+        "write_window_bytes" => Some(WRITE_WINDOW_BYTES_OPTION),
+        "ingest_insert_rows" => Some(INGEST_INSERT_ROWS_OPTION),
+        "prepared_cache_capacity" => Some(PREPARED_CACHE_CAPACITY_OPTION),
+        "wire_compression" => Some(WIRE_COMPRESSION_OPTION),
+        _ => None,
+    }
+}
+
+fn tuning_uri_key(option: &str) -> Option<&'static str> {
+    match option {
+        WRITE_WINDOW_BYTES_OPTION => Some("write_window_bytes"),
+        INGEST_INSERT_ROWS_OPTION => Some("ingest_insert_rows"),
+        PREPARED_CACHE_CAPACITY_OPTION => Some("prepared_cache_capacity"),
+        WIRE_COMPRESSION_OPTION => Some("wire_compression"),
+        _ => None,
+    }
+}
+
+fn validate_tuning_option(key: &str, value: &OptionValue) -> Result<()> {
+    match key {
+        WRITE_WINDOW_BYTES_OPTION => {
+            write_window_bytes_option(value)?;
+        }
+        INGEST_INSERT_ROWS_OPTION => {
+            nonnegative_usize_option(key, value)?;
+        }
+        PREPARED_CACHE_CAPACITY_OPTION => {
+            if nonnegative_usize_option(key, value)? == 0 {
+                return Err(error(
+                    format!("option '{key}' must be positive"),
+                    Status::InvalidArguments,
+                ));
+            }
+        }
+        WIRE_COMPRESSION_OPTION => {
+            WireCompression::parse(value)?;
+        }
+        _ => return Err(not_implemented(key)),
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TimeoutOption {
@@ -274,6 +338,15 @@ fn write_window_bytes_option(value: &OptionValue) -> Result<Option<usize>> {
         })
 }
 
+fn nonnegative_usize_option(key: &str, value: &OptionValue) -> Result<usize> {
+    usize::try_from(integer_option(key, value)?).map_err(|_| {
+        error(
+            format!("option '{key}' must be non-negative"),
+            Status::InvalidArguments,
+        )
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IngestPartial {
     Block,
@@ -334,6 +407,41 @@ impl IngestAtomicity {
         match self {
             Self::Transaction => "transaction",
             Self::Savepoint => "savepoint",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WireCompression {
+    None,
+    Auto,
+    Lz4,
+}
+
+impl WireCompression {
+    fn parse(value: &OptionValue) -> Result<Self> {
+        let OptionValue::String(value) = value else {
+            return Err(error(
+                format!("option '{WIRE_COMPRESSION_OPTION}' must be a string"),
+                Status::InvalidArguments,
+            ));
+        };
+        match value.as_str() {
+            "none" => Ok(Self::None),
+            "auto" => Ok(Self::Auto),
+            "lz4" => Ok(Self::Lz4),
+            _ => Err(error(
+                format!("option '{WIRE_COMPRESSION_OPTION}' must be 'none', 'auto', or 'lz4'"),
+                Status::InvalidArguments,
+            )),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Auto => "auto",
+            Self::Lz4 => "lz4",
         }
     }
 }
@@ -709,6 +817,8 @@ impl Optionable for MonetdbDatabase {
         if let OptionDatabase::Other(name) = &key {
             if TimeoutOption::from_key(name).is_some() {
                 timeout_seconds(name, &value)?;
+            } else if tuning_uri_key(name).is_some() {
+                validate_tuning_option(name, &value)?;
             } else if let Some(option) = ClientInfoOption::from_key(name) {
                 let value = option.validate(name, &value)?;
                 self.options.set(key, value);
@@ -733,9 +843,11 @@ impl Optionable for MonetdbDatabase {
         {
             let timeout = TimeoutOption::from_key(name);
             let client_info = ClientInfoOption::from_key(name);
+            let tuning = tuning_uri_key(name);
             if let Some(uri_key) = timeout
                 .map(TimeoutOption::uri_key)
                 .or_else(|| client_info.map(ClientInfoOption::uri_key))
+                .or(tuning)
                 && let Some(uri) = self.options.optional_string(OptionDatabase::Uri)
             {
                 let parsed = parse_driver_uri(uri)?;
@@ -749,6 +861,18 @@ impl Optionable for MonetdbDatabase {
             }
             if let Some(client_info) = client_info {
                 return Ok(client_info.default_value().to_owned());
+            }
+            if tuning.is_some() {
+                return Ok(match name.as_str() {
+                    WRITE_WINDOW_BYTES_OPTION => "0",
+                    INGEST_INSERT_ROWS_OPTION => "100",
+                    PREPARED_CACHE_CAPACITY_OPTION => {
+                        return Ok(DEFAULT_PREPARED_CACHE_CAPACITY.to_string());
+                    }
+                    WIRE_COMPRESSION_OPTION => "auto",
+                    _ => unreachable!("tuning option was recognized"),
+                }
+                .to_owned());
             }
         }
         let value = self.options.get_string(&key)?;
@@ -807,6 +931,22 @@ impl Database for MonetdbDatabase {
             parsed_uri
                 .set_password(None)
                 .map_err(|()| error("URI user information is invalid", Status::InvalidArguments))?;
+        }
+        let mut uri_tuning_options = Vec::new();
+        let mut server_query = Vec::new();
+        for (key, value) in parsed_uri.query_pairs() {
+            if let Some(option) = tuning_option_from_uri_key(&key) {
+                uri_tuning_options.push((
+                    OptionConnection::Other(option.to_owned()),
+                    OptionValue::String(value.into_owned()),
+                ));
+            } else {
+                server_query.push((key.into_owned(), value.into_owned()));
+            }
+        }
+        parsed_uri.set_query(None);
+        if !server_query.is_empty() {
+            parsed_uri.query_pairs_mut().extend_pairs(server_query);
         }
         let mut parameters = Parameters::from_url(parsed_uri.as_str())
             .map_err(|value| map_display(value, Status::InvalidArguments))?;
@@ -933,10 +1073,12 @@ impl Database for MonetdbDatabase {
             ));
         }
         let metadata_timeouts = initialization_timeouts(timeouts, initialization_deadline)?;
+        let metadata_started = Instant::now();
         let version = connection
             .metadata_with_timeouts(metadata_timeouts)
             .map_err(map_cursor_error)?
             .version();
+        let metadata_round_trip = metadata_started.elapsed();
         if version < MINIMUM_VERSION {
             return Err(error(
                 format!(
@@ -949,11 +1091,13 @@ impl Database for MonetdbDatabase {
 
         let cancel = connection.cancel_handle();
         let inner = Arc::new(DriverConnection::new(connection));
+        let schema_started = Instant::now();
         let current_schema = scalar_string(
             &inner,
             "SELECT current_schema AS \"__adbc_current_schema\"",
             initialization_timeouts(timeouts, initialization_deadline)?,
         )?;
+        let measured_round_trip = metadata_round_trip.min(schema_started.elapsed());
         let mut options = Options::default();
         options.set(OptionConnection::CurrentCatalog, catalog.clone().into());
         options.set(OptionConnection::CurrentSchema, current_schema.into());
@@ -962,19 +1106,37 @@ impl Database for MonetdbDatabase {
         store_runtime_timeouts(&mut options, timeouts);
         let mut result = MonetdbConnection {
             inner,
-            prepared_cache: Arc::new(Mutex::new(PreparedCache::new(PREPARED_CACHE_CAPACITY))),
+            prepared_cache: Arc::new(Mutex::new(PreparedCache::new(
+                DEFAULT_PREPARED_CACHE_CAPACITY,
+            ))),
             cancel,
             timeouts,
             read_batch_rows: DEFAULT_READ_BATCH_ROWS,
             read_prefetch: true,
             write_batch_rows: None,
             write_window_bytes: None,
+            ingest_insert_rows: 100,
+            wire_compression: WireCompression::Auto,
+            measured_round_trip,
             ingest_partial: IngestPartial::Block,
             ingest_atomicity: IngestAtomicity::Transaction,
             options,
             version,
             catalog,
         };
+        for (key, value) in uri_tuning_options {
+            result.set_option(key, value)?;
+        }
+        for key in [
+            WRITE_WINDOW_BYTES_OPTION,
+            INGEST_INSERT_ROWS_OPTION,
+            PREPARED_CACHE_CAPACITY_OPTION,
+            WIRE_COMPRESSION_OPTION,
+        ] {
+            if let Some(value) = self.options.get(key) {
+                result.set_option(OptionConnection::Other(key.to_owned()), value.clone())?;
+            }
+        }
         for (key, value) in opts {
             result.set_option(key, value)?;
         }
@@ -1053,6 +1215,9 @@ pub struct MonetdbConnection {
     read_prefetch: bool,
     write_batch_rows: Option<usize>,
     write_window_bytes: Option<usize>,
+    ingest_insert_rows: usize,
+    wire_compression: WireCompression,
+    measured_round_trip: Duration,
     ingest_partial: IngestPartial,
     ingest_atomicity: IngestAtomicity,
     options: Options,
@@ -1173,6 +1338,20 @@ impl PreparedCache {
         self.entries.clear();
     }
 
+    fn set_capacity(&mut self, capacity: usize) {
+        assert!(capacity > 0, "prepared cache capacity must be positive");
+        self.capacity = capacity;
+        while self.entries.len() > capacity {
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(_, cached)| cached.last_used)
+                .map(|(query, _)| query.clone())
+                .expect("a nonempty cache has an LRU key");
+            self.entries.remove(&oldest);
+        }
+    }
+
     fn next_use(&mut self) -> u64 {
         self.use_counter = self.use_counter.saturating_add(1);
         self.use_counter
@@ -1208,6 +1387,31 @@ impl Optionable for MonetdbConnection {
         if key.as_ref() == WRITE_WINDOW_BYTES_OPTION {
             self.write_window_bytes = write_window_bytes_option(&value)?;
             self.options.set(key, value);
+            return Ok(());
+        }
+        if key.as_ref() == INGEST_INSERT_ROWS_OPTION {
+            self.ingest_insert_rows = nonnegative_usize_option(INGEST_INSERT_ROWS_OPTION, &value)?;
+            self.options.set(key, value);
+            return Ok(());
+        }
+        if key.as_ref() == PREPARED_CACHE_CAPACITY_OPTION {
+            let capacity = nonnegative_usize_option(PREPARED_CACHE_CAPACITY_OPTION, &value)?;
+            if capacity == 0 {
+                return Err(error(
+                    format!("option '{PREPARED_CACHE_CAPACITY_OPTION}' must be positive"),
+                    Status::InvalidArguments,
+                ));
+            }
+            self.prepared_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .set_capacity(capacity);
+            self.options.set(key, value);
+            return Ok(());
+        }
+        if key.as_ref() == WIRE_COMPRESSION_OPTION {
+            self.wire_compression = WireCompression::parse(&value)?;
+            self.options.set(key, self.wire_compression.as_str().into());
             return Ok(());
         }
         if key.as_ref() == INGEST_PARTIAL_OPTION {
@@ -1306,6 +1510,20 @@ impl Optionable for MonetdbConnection {
         if key.as_ref() == WRITE_WINDOW_BYTES_OPTION {
             return Ok(self.write_window_bytes.unwrap_or(0).to_string());
         }
+        if key.as_ref() == INGEST_INSERT_ROWS_OPTION {
+            return Ok(self.ingest_insert_rows.to_string());
+        }
+        if key.as_ref() == PREPARED_CACHE_CAPACITY_OPTION {
+            return Ok(self
+                .prepared_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .capacity
+                .to_string());
+        }
+        if key.as_ref() == WIRE_COMPRESSION_OPTION {
+            return Ok(self.wire_compression.as_str().to_owned());
+        }
         if key.as_ref() == INGEST_PARTIAL_OPTION {
             return Ok(self.ingest_partial.as_str().to_owned());
         }
@@ -1340,6 +1558,19 @@ impl Optionable for MonetdbConnection {
                 .map_err(|_| error("write_window_bytes exceeds i64", Status::Internal))
                 .map(|bytes| bytes.unwrap_or(0));
         }
+        if key.as_ref() == INGEST_INSERT_ROWS_OPTION {
+            return i64::try_from(self.ingest_insert_rows)
+                .map_err(|_| error("ingest_insert_rows exceeds i64", Status::Internal));
+        }
+        if key.as_ref() == PREPARED_CACHE_CAPACITY_OPTION {
+            return i64::try_from(
+                self.prepared_cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .capacity,
+            )
+            .map_err(|_| error("prepared_cache_capacity exceeds i64", Status::Internal));
+        }
         self.options.get_int(key)
     }
 
@@ -1365,6 +1596,9 @@ impl Connection for MonetdbConnection {
             read_prefetch: self.read_prefetch,
             write_batch_rows: self.write_batch_rows,
             write_window_bytes: self.write_window_bytes,
+            ingest_insert_rows: self.ingest_insert_rows,
+            wire_compression: self.wire_compression,
+            measured_round_trip: self.measured_round_trip,
             ingest_partial: self.ingest_partial,
             ingest_atomicity: self.ingest_atomicity,
             ingest_stats: None,
@@ -1531,6 +1765,9 @@ pub struct MonetdbStatement {
     read_prefetch: bool,
     write_batch_rows: Option<usize>,
     write_window_bytes: Option<usize>,
+    ingest_insert_rows: usize,
+    wire_compression: WireCompression,
+    measured_round_trip: Duration,
     ingest_partial: IngestPartial,
     ingest_atomicity: IngestAtomicity,
     ingest_stats: Option<String>,
@@ -1569,6 +1806,16 @@ impl Optionable for MonetdbStatement {
         if key.as_ref() == WRITE_WINDOW_BYTES_OPTION {
             self.write_window_bytes = write_window_bytes_option(&value)?;
             self.options.set(key, value);
+            return Ok(());
+        }
+        if key.as_ref() == INGEST_INSERT_ROWS_OPTION {
+            self.ingest_insert_rows = nonnegative_usize_option(INGEST_INSERT_ROWS_OPTION, &value)?;
+            self.options.set(key, value);
+            return Ok(());
+        }
+        if key.as_ref() == WIRE_COMPRESSION_OPTION {
+            self.wire_compression = WireCompression::parse(&value)?;
+            self.options.set(key, self.wire_compression.as_str().into());
             return Ok(());
         }
         if key.as_ref() == INGEST_PARTIAL_OPTION {
@@ -1664,6 +1911,12 @@ impl Optionable for MonetdbStatement {
         if key.as_ref() == WRITE_WINDOW_BYTES_OPTION {
             return Ok(self.write_window_bytes.unwrap_or(0).to_string());
         }
+        if key.as_ref() == INGEST_INSERT_ROWS_OPTION {
+            return Ok(self.ingest_insert_rows.to_string());
+        }
+        if key.as_ref() == WIRE_COMPRESSION_OPTION {
+            return Ok(self.wire_compression.as_str().to_owned());
+        }
         if key.as_ref() == INGEST_PARTIAL_OPTION {
             return Ok(self.ingest_partial.as_str().to_owned());
         }
@@ -1717,6 +1970,10 @@ impl Optionable for MonetdbStatement {
                 .transpose()
                 .map_err(|_| error("write_window_bytes exceeds i64", Status::Internal))
                 .map(|bytes| bytes.unwrap_or(0));
+        }
+        if key.as_ref() == INGEST_INSERT_ROWS_OPTION {
+            return i64::try_from(self.ingest_insert_rows)
+                .map_err(|_| error("ingest_insert_rows exceeds i64", Status::Internal));
         }
         self.options.get_int(key)
     }
@@ -2195,7 +2452,7 @@ impl MonetdbStatement {
             }
             if data_type == MonetType::Inet {
                 return Err(error(
-                    "COPY BINARY ingestion for legacy INET columns is not supported by MonetDB",
+                    "COPY BINARY ingestion for INET columns is not supported by MonetDB",
                     Status::NotImplemented,
                 ));
             }
@@ -2226,7 +2483,12 @@ impl MonetdbStatement {
                 ""
             }
         );
-        let mut reader = reader;
+        let insert_rows = if self.write_batch_rows.is_none() {
+            adaptive_insert_rows(self.ingest_insert_rows, self.measured_round_trip)
+        } else {
+            0
+        };
+        let (reader, insert_candidate) = route_ingest_reader(reader, &schema, insert_rows)?;
 
         let connection = lock_connection(&self.connection)?;
         if temporary
@@ -2264,12 +2526,13 @@ impl MonetdbStatement {
                 table,
                 self.timeouts,
             )?;
-        let caller_scope =
-            if append_to_existing && self.ingest_atomicity == IngestAtomicity::Transaction {
-                CallerTransactionScope::Direct
-            } else {
-                CallerTransactionScope::Savepoint
-            };
+        let caller_scope = if insert_candidate.is_some() {
+            CallerTransactionScope::Savepoint
+        } else if append_to_existing && self.ingest_atomicity == IngestAtomicity::Transaction {
+            CallerTransactionScope::Direct
+        } else {
+            CallerTransactionScope::Savepoint
+        };
         let (mut cursor, atomic_scope) =
             begin_atomic(&connection, "ingest", caller_scope, self.timeouts)?;
         let caller_transaction = matches!(&atomic_scope, AtomicScope::CallerTransaction);
@@ -2277,48 +2540,153 @@ impl MonetdbStatement {
         let window_budget = self
             .write_window_bytes
             .unwrap_or_else(|| automatic_write_window_bytes(narrow_constrained_append));
-        let mut scheduler = IngestWindowScheduler::new(
-            reader.as_mut(),
-            Arc::clone(&schema),
+        let incompressible_window_budget = self.write_window_bytes.unwrap_or_else(|| {
+            adaptive_incompressible_window_bytes(
+                window_budget,
+                schema.fields().len(),
+                self.measured_round_trip,
+            )
+        });
+        let mut stats = IngestStats::new(
             window_budget,
-            self.write_batch_rows,
+            incompressible_window_budget,
+            insert_rows,
+            self.measured_round_trip,
+            scope_name,
         );
-        let mut stats = IngestStats::new(window_budget, scope_name);
-        let result = (|| {
-            match mode {
-                "adbc.ingest.mode.create" => cursor.execute(&create).map_err(map_cursor_error)?,
-                "adbc.ingest.mode.append" => {}
-                "adbc.ingest.mode.replace" => {
-                    cursor
-                        .execute(&format!("DROP TABLE IF EXISTS {operation_target}"))
-                        .map_err(map_cursor_error)?;
-                    cursor.execute(&create).map_err(map_cursor_error)?;
-                }
-                "adbc.ingest.mode.create_append" => cursor
-                    .execute(&create.replacen("TABLE ", "TABLE IF NOT EXISTS ", 1))
-                    .map_err(map_cursor_error)?,
-                value => {
-                    return Err(error(
-                        format!("unknown ingest mode '{value}'"),
-                        Status::InvalidArguments,
-                    ));
-                }
-            }
-
-            if matches!(
+        if let Some(candidate) = insert_candidate {
+            let target = IngestTarget {
                 mode,
-                "adbc.ingest.mode.append" | "adbc.ingest.mode.create_append"
-            ) {
-                cursor
-                    .execute(&format!("SELECT * FROM {operation_target} WHERE FALSE"))
-                    .map_err(map_cursor_error)?;
-                let mismatch_status = if mode == "adbc.ingest.mode.create_append" {
-                    Status::AlreadyExists
-                } else {
-                    Status::InvalidArguments
+                create: &create,
+                operation_target: &operation_target,
+                schema_name,
+                table,
+                temporary,
+            };
+            let setup = execute_ingest_target_mode(&mut cursor, &target);
+            drop(cursor);
+            drop(connection);
+            let mut prepared_cache_hit = false;
+            let inserted = setup.and_then(|()| {
+                let mut prepared = None;
+                let mut prepare_error = None;
+                for insert_query in insert_parameter_queries(&operation_target, &schema)? {
+                    match prepare_cached_with_status(
+                        &self.connection,
+                        &self.prepared_cache,
+                        &insert_query,
+                        schema.fields().len(),
+                        self.timeouts,
+                    ) {
+                        Ok(value) => {
+                            prepared = Some(value);
+                            break;
+                        }
+                        Err(value) => prepare_error = Some(value),
+                    }
+                }
+                let (entry, cache_hit) = match prepared {
+                    Some(value) => value,
+                    None => {
+                        let root = prepare_error.ok_or_else(|| {
+                            error(
+                                "no INSERT form was available for ingest",
+                                Status::Internal,
+                            )
+                        })?;
+                        diagnose_append_target_after_prepare_error(
+                            &self.connection,
+                            &target,
+                            &schema,
+                            self.timeouts,
+                        )?;
+                        return Err(root);
+                    }
                 };
-                validate_append_schema(&schema, cursor.column_metadata(), mismatch_status)?;
+                if matches!(
+                    mode,
+                    "adbc.ingest.mode.append" | "adbc.ingest.mode.create_append"
+                ) {
+                    validate_prepared_insert_schema(
+                        &schema,
+                        &entry.parameters,
+                        append_mismatch_status(mode),
+                    )?;
+                }
+                prepared_cache_hit = cache_hit;
+                let queries = candidate
+                    .arguments
+                    .iter()
+                    .map(|arguments| BoundQuery {
+                        sql: format!("EXECUTE {}({arguments})", entry.id),
+                        prepared: None,
+                    })
+                    .collect::<Vec<_>>();
+                let connection = lock_connection(&self.connection)?;
+                let mut cursor = connection.cursor();
+                cursor.set_timeouts(self.timeouts);
+                let mut total = 0i64;
+                let mut has_count = false;
+                execute_update_batch(&mut cursor, &queries, &mut total, &mut has_count)?;
+                has_count
+                    .then_some(total)
+                    .ok_or_else(|| {
+                        error(
+                            "MonetDB did not report the INSERT row count",
+                            Status::InvalidData,
+                        )
+                    })
+                    .and_then(|rows| {
+                        let expected = i64::try_from(candidate.batch.num_rows()).map_err(|_| {
+                            error("insert row count exceeds i64", Status::Internal)
+                        })?;
+                        if rows != expected {
+                            return Err(error(
+                                format!(
+                                    "MonetDB inserted {rows} rows from a batch containing {expected} rows"
+                                ),
+                                Status::InvalidData,
+                            ));
+                        }
+                        Ok(rows)
+                    })
+            });
+            let connection = lock_connection(&self.connection)?;
+            let mut cursor = connection.cursor();
+            cursor.set_timeouts(self.timeouts);
+            let result = finish_atomic(
+                &connection,
+                &mut cursor,
+                atomic_scope,
+                inserted,
+                self.timeouts,
+            )
+            .map(Some);
+            stats.input_batches = 1;
+            stats.encoded_bytes = candidate.estimated_bytes;
+            stats.prepared_cache_hits = usize::from(prepared_cache_hit);
+            stats.path = "insert";
+            self.ingest_stats = Some(stats.to_json());
+            drop(cursor);
+            drop(connection);
+            if mode != "adbc.ingest.mode.append" && result.is_ok() {
+                self.prepared_cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clear();
             }
+            return result;
+        }
+        let result = (|| {
+            let target = IngestTarget {
+                mode,
+                create: &create,
+                operation_target: &operation_target,
+                schema_name,
+                table,
+                temporary,
+            };
+            prepare_ingest_target(&mut cursor, &target, &schema)?;
 
             let files = (0..schema.fields().len())
                 .map(|index| format!("'c{index}'"))
@@ -2326,15 +2694,43 @@ impl MonetdbStatement {
                 .join(", ");
             let copy =
                 format!("COPY LITTLE ENDIAN BINARY INTO {operation_target} FROM {files} ON CLIENT");
+            let copy_lz4 = format!(
+                "COPY LITTLE ENDIAN BINARY INTO {operation_target} FROM {files} ON 'lz4' CLIENT"
+            );
+            let windows = start_ingest_window_prefetch(
+                reader,
+                Arc::clone(&schema),
+                window_budget,
+                incompressible_window_budget,
+                self.write_batch_rows,
+                self.wire_compression,
+            )?;
             let mut rows = 0i64;
-            while let Some(window) = scheduler.next_window()? {
-                let mut window_bytes = window.encoded_bytes;
-                let mut largest_chunk = window.largest_chunk;
-                let mut largest_column_bytes = window.largest_column_bytes;
-                cursor
-                    .execute_with_streaming_uploads(&copy, |filename, sink| {
+            let upload_result = (|| {
+                while let Some(window) = windows.next_window()? {
+                    let wire_lz4 = window.uses_wire_lz4();
+                    let stored_bytes = window.stored_bytes();
+                    let storage = window.storage_mode();
+                    let mut window_bytes = window.encoded_bytes;
+                    let mut largest_chunk = window.largest_chunk;
+                    let mut largest_column_bytes = window.largest_column_bytes;
+                    let (retained_request, retained_receiver, retained_encoder) =
+                        if window.retained_batches.is_empty() {
+                            (None, None, None)
+                        } else {
+                            let (request, receiver, encoder) = start_retained_encoder(
+                                Arc::clone(&schema),
+                                window.retained_batches.clone(),
+                            );
+                            (Some(request), Some(receiver), Some(encoder))
+                        };
+                    let upload_result = cursor
+                    .execute_with_streaming_uploads(
+                        if wire_lz4 { &copy_lz4 } else { &copy },
+                        |filename, sink| {
                         let index = upload_column_index(filename, schema.fields().len())?;
                         let mut decoded = None;
+                        let mut unshuffled = None;
                         for chunk in &window.columns[index].chunks {
                             match chunk {
                                 EncodedChunk::Raw(data) => sink.write_chunk(data)?,
@@ -2342,7 +2738,21 @@ impl MonetdbStatement {
                                     data,
                                     len,
                                     decoded_len,
+                                    transform,
+                                    format,
                                 } => {
+                                    if wire_lz4 {
+                                        if *transform != CompressionTransform::Plain
+                                            || *format != CompressionFormat::Frame
+                                        {
+                                            return Err(CursorError::FileTransfer(
+                                                "wire-compressed ingest contains a client-only transform"
+                                                    .into(),
+                                            ));
+                                        }
+                                        sink.write_chunk(&data[..*len])?;
+                                        continue;
+                                    }
                                     if decoded
                                         .as_ref()
                                         .is_none_or(|scratch: &MmapMut| scratch.len() < *decoded_len)
@@ -2358,41 +2768,76 @@ impl MonetdbStatement {
                                     let scratch = decoded
                                         .as_mut()
                                         .expect("decode buffer was just initialized");
-                                    let written = lz4_flex::block::decompress_into(
-                                        &data[..*len],
-                                        &mut scratch[..*decoded_len],
-                                    )
-                                    .map_err(|value| {
-                                        CursorError::FileTransfer(format!(
-                                            "decompressing an ingest buffer failed: {value}"
-                                        ))
-                                    })?;
+                                    let written = match format {
+                                        CompressionFormat::Block => {
+                                            lz4_flex::block::decompress_into(
+                                                &data[..*len],
+                                                &mut scratch[..*decoded_len],
+                                            )
+                                            .map_err(|value| {
+                                                CursorError::FileTransfer(format!(
+                                                    "decompressing an ingest buffer failed: {value}"
+                                                ))
+                                            })?
+                                        }
+                                        CompressionFormat::Frame => decompress_frame_into(
+                                            &data[..*len],
+                                            &mut scratch[..*decoded_len],
+                                        )?,
+                                    };
                                     if written != *decoded_len {
                                         return Err(CursorError::FileTransfer(format!(
                                             "decompressed ingest buffer has {written} bytes, expected {decoded_len}"
                                         )));
                                     }
-                                    sink.write_chunk(&scratch[..written])?;
+                                    match transform {
+                                        CompressionTransform::Plain => {
+                                            sink.write_chunk(&scratch[..written])?
+                                        }
+                                        CompressionTransform::Shuffle(width) => {
+                                            if unshuffled
+                                                .as_ref()
+                                                .is_none_or(|buffer: &MmapMut| {
+                                                    buffer.len() < *decoded_len
+                                                })
+                                            {
+                                                unshuffled =
+                                                    Some(MmapMut::map_anon(*decoded_len).map_err(
+                                                        |value| {
+                                                            CursorError::FileTransfer(format!(
+                                                                "allocating an ingest unshuffle buffer failed: {value}"
+                                                            ))
+                                                        },
+                                                    )?);
+                                            }
+                                            let output = unshuffled
+                                                .as_mut()
+                                                .expect("unshuffle buffer was just initialized");
+                                            unshuffle_bytes(
+                                                &scratch[..written],
+                                                *width,
+                                                &mut output[..written],
+                                            );
+                                            sink.write_chunk(&output[..written])?;
+                                        }
+                                    }
                                 }
                             }
                         }
-                        if !window.retained_batches.is_empty() {
-                            let arrays = window
-                                .retained_batches
-                                .iter()
-                                .map(|batch| batch.column(index).as_ref())
-                                .collect::<Vec<_>>();
-                            let retained_bytes = monetdb_arrow::encode_column_chunks(
-                                &schema.fields()[index],
-                                &arrays,
-                                NonZeroUsize::new(ENCODE_CHUNK_BYTES)
-                                    .expect("encode chunk size is positive"),
-                                |chunk| {
-                                    largest_chunk = largest_chunk.max(chunk.len());
-                                    sink.write_chunk(chunk)
-                                },
-                            )
-                            .map_err(map_chunked_encode_error)?;
+                        if let (Some(request), Some(receiver)) =
+                            (&retained_request, &retained_receiver)
+                        {
+                            request.send(index).map_err(|_| {
+                                CursorError::FileTransfer(
+                                    "ingest encoder stopped before a column was requested".into(),
+                                )
+                            })?;
+                            let retained_bytes = upload_retained_column(
+                                receiver,
+                                index,
+                                sink,
+                                &mut largest_chunk,
+                            )?;
                             let column_bytes = window.columns[index]
                                 .bytes
                                 .checked_add(retained_bytes)
@@ -2410,39 +2855,59 @@ impl MonetdbStatement {
                                 })?;
                         }
                         Ok(())
-                    })
-                    .map_err(map_cursor_error)?;
-                stats.record_window(
-                    window.rows,
-                    window_bytes,
-                    largest_chunk,
-                    largest_column_bytes,
-                );
-                let server_rows = cursor.affected_rows().ok_or_else(|| {
-                    error(
-                        "MonetDB did not report the COPY row count",
-                        Status::InvalidData,
+                    },
                     )
-                })?;
-                let expected_rows = i64::try_from(window.rows)
-                    .map_err(|_| error("window row count exceeds i64", Status::Internal))?;
-                if server_rows != expected_rows {
-                    return Err(error(
-                        format!(
-                            "MonetDB copied {server_rows} rows from a window containing {expected_rows} rows"
-                        ),
-                        Status::InvalidData,
-                    ));
+                    .map_err(map_cursor_error);
+                    drop(retained_request);
+                    drop(retained_receiver);
+                    let encoder_result = retained_encoder
+                        .map(|encoder| {
+                            encoder.join().map_err(|_| {
+                                error("ingest encoder thread panicked", Status::Internal)
+                            })
+                        })
+                        .transpose();
+                    encoder_result?;
+                    upload_result?;
+                    stats.record_window(
+                        window.rows,
+                        window_bytes,
+                        stored_bytes,
+                        storage,
+                        wire_lz4,
+                        IngestStreamingUsage {
+                            largest_chunk,
+                            largest_column_bytes,
+                        },
+                    );
+                    let server_rows = cursor.affected_rows().ok_or_else(|| {
+                        error(
+                            "MonetDB did not report the COPY row count",
+                            Status::InvalidData,
+                        )
+                    })?;
+                    let expected_rows = i64::try_from(window.rows)
+                        .map_err(|_| error("window row count exceeds i64", Status::Internal))?;
+                    if server_rows != expected_rows {
+                        return Err(error(
+                            format!(
+                                "MonetDB copied {server_rows} rows from a window containing {expected_rows} rows"
+                            ),
+                            Status::InvalidData,
+                        ));
+                    }
+                    rows = rows.checked_add(server_rows).ok_or_else(|| {
+                        error("ingested row count overflows i64", Status::Internal)
+                    })?;
                 }
-                rows = rows
-                    .checked_add(server_rows)
-                    .ok_or_else(|| error("ingested row count overflows i64", Status::Internal))?;
-            }
-            Ok(rows)
+                Ok(rows)
+            })();
+            let scheduler_stats = windows.finish()?;
+            stats.input_batches = scheduler_stats.input_batches;
+            stats.coalesced_windows = scheduler_stats.coalesced_windows;
+            stats.split_windows = scheduler_stats.split_windows;
+            upload_result
         })();
-        stats.input_batches = scheduler.input_batches;
-        stats.coalesced_windows = scheduler.coalesced_windows;
-        stats.split_windows = scheduler.split_windows;
         let operation_failed = result.is_err();
         let result = finish_atomic(
             &connection,
@@ -2474,6 +2939,147 @@ impl MonetdbStatement {
     }
 }
 
+struct IngestTarget<'a> {
+    mode: &'a str,
+    create: &'a str,
+    operation_target: &'a str,
+    schema_name: Option<&'a str>,
+    table: &'a str,
+    temporary: bool,
+}
+
+fn prepare_ingest_target(
+    cursor: &mut monetdb::Cursor,
+    target: &IngestTarget<'_>,
+    schema: &SchemaRef,
+) -> Result<()> {
+    execute_ingest_target_mode(cursor, target)?;
+    if matches!(
+        target.mode,
+        "adbc.ingest.mode.append" | "adbc.ingest.mode.create_append"
+    ) {
+        let mismatch_status = if target.mode == "adbc.ingest.mode.create_append" {
+            Status::AlreadyExists
+        } else {
+            Status::InvalidArguments
+        };
+        let destination = append_table_columns(
+            cursor,
+            if target.temporary {
+                Some("tmp")
+            } else {
+                target.schema_name
+            },
+            target.table,
+            mismatch_status,
+        )?;
+        validate_append_schema(schema, &destination, mismatch_status)?;
+    }
+    Ok(())
+}
+
+fn execute_ingest_target_mode(
+    cursor: &mut monetdb::Cursor,
+    target: &IngestTarget<'_>,
+) -> Result<()> {
+    match target.mode {
+        "adbc.ingest.mode.create" => cursor.execute(target.create).map_err(map_cursor_error)?,
+        "adbc.ingest.mode.append" => {}
+        "adbc.ingest.mode.replace" => {
+            cursor
+                .execute(&format!("DROP TABLE IF EXISTS {}", target.operation_target))
+                .map_err(map_cursor_error)?;
+            cursor.execute(target.create).map_err(map_cursor_error)?;
+        }
+        "adbc.ingest.mode.create_append" => cursor
+            .execute(&target.create.replacen("TABLE ", "TABLE IF NOT EXISTS ", 1))
+            .map_err(map_cursor_error)?,
+        value => {
+            return Err(error(
+                format!("unknown ingest mode '{value}'"),
+                Status::InvalidArguments,
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn insert_parameter_queries(target: &str, schema: &SchemaRef) -> Result<Vec<String>> {
+    let placeholders = std::iter::repeat_n("?", schema.fields().len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut queries = Vec::with_capacity(2);
+    if schema
+        .fields()
+        .iter()
+        .all(|field| is_simple_unquoted_identifier(field.name()))
+    {
+        queries.push(format!(
+            "INSERT INTO {target} ({}) VALUES ({placeholders})",
+            schema
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    queries.push(format!(
+        "INSERT INTO {target} ({}) VALUES ({placeholders})",
+        schema
+            .fields()
+            .iter()
+            .map(|field| quote_identifier(field.name()))
+            .collect::<Result<Vec<_>>>()?
+            .join(", ")
+    ));
+    Ok(queries)
+}
+
+fn is_simple_unquoted_identifier(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes.next().is_some_and(|byte| byte.is_ascii_alphabetic())
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+fn append_mismatch_status(mode: &str) -> Status {
+    if mode == "adbc.ingest.mode.create_append" {
+        Status::AlreadyExists
+    } else {
+        Status::InvalidArguments
+    }
+}
+
+fn diagnose_append_target_after_prepare_error(
+    connection: &SharedConnection,
+    target: &IngestTarget<'_>,
+    schema: &SchemaRef,
+    timeouts: Timeouts,
+) -> Result<()> {
+    if !matches!(
+        target.mode,
+        "adbc.ingest.mode.append" | "adbc.ingest.mode.create_append"
+    ) {
+        return Ok(());
+    }
+    let connection = lock_connection(connection)?;
+    let mut cursor = connection.cursor();
+    cursor.set_timeouts(timeouts);
+    let mismatch_status = append_mismatch_status(target.mode);
+    let destination = append_table_columns(
+        &mut cursor,
+        if target.temporary {
+            Some("tmp")
+        } else {
+            target.schema_name
+        },
+        target.table,
+        mismatch_status,
+    )?;
+    validate_append_schema(schema, &destination, mismatch_status)
+}
+
 fn upload_column_index(filename: &str, columns: usize) -> std::result::Result<usize, CursorError> {
     filename
         .strip_prefix('c')
@@ -2501,10 +3107,83 @@ struct IngestWindowScheduler<'a> {
     pending_bytes: usize,
     exhausted: bool,
     window_budget: usize,
+    incompressible_window_budget: usize,
     configured_rows: Option<usize>,
+    wire_compression: WireCompression,
     input_batches: usize,
     coalesced_windows: usize,
     split_windows: usize,
+}
+
+struct IngestSchedulerStats {
+    input_batches: usize,
+    coalesced_windows: usize,
+    split_windows: usize,
+}
+
+struct IngestWindowPrefetch {
+    receiver: Receiver<Result<Option<EncodedIngestWindow>>>,
+    worker: JoinHandle<IngestSchedulerStats>,
+}
+
+impl IngestWindowPrefetch {
+    fn next_window(&self) -> Result<Option<EncodedIngestWindow>> {
+        self.receiver.recv().map_err(|_| {
+            error(
+                "ingest window prefetch stopped before producing a result",
+                Status::Internal,
+            )
+        })?
+    }
+
+    fn finish(self) -> Result<IngestSchedulerStats> {
+        drop(self.receiver);
+        self.worker
+            .join()
+            .map_err(|_| error("ingest window prefetch thread panicked", Status::Internal))
+    }
+}
+
+fn start_ingest_window_prefetch(
+    mut reader: Box<dyn RecordBatchReader + Send>,
+    schema: SchemaRef,
+    window_budget: usize,
+    incompressible_window_budget: usize,
+    configured_rows: Option<usize>,
+    wire_compression: WireCompression,
+) -> Result<IngestWindowPrefetch> {
+    let (sender, receiver) = sync_channel(0);
+    let worker = thread::Builder::new()
+        .name("monetdb-ingest-window".into())
+        .spawn(move || {
+            let mut scheduler = IngestWindowScheduler::new(
+                reader.as_mut(),
+                schema,
+                window_budget,
+                incompressible_window_budget,
+                configured_rows,
+                wire_compression,
+            );
+            loop {
+                let next = scheduler.next_window();
+                let finished = !matches!(next, Ok(Some(_)));
+                if sender.send(next).is_err() || finished {
+                    break;
+                }
+            }
+            IngestSchedulerStats {
+                input_batches: scheduler.input_batches,
+                coalesced_windows: scheduler.coalesced_windows,
+                split_windows: scheduler.split_windows,
+            }
+        })
+        .map_err(|value| {
+            error(
+                format!("starting ingest window prefetch failed: {value}"),
+                Status::Internal,
+            )
+        })?;
+    Ok(IngestWindowPrefetch { receiver, worker })
 }
 
 struct PendingBatch {
@@ -2513,10 +3192,216 @@ struct PendingBatch {
     compaction_level: usize,
 }
 
+struct InsertCandidate {
+    batch: RecordBatch,
+    arguments: Vec<String>,
+    estimated_bytes: usize,
+}
+
+enum RetainedEncodeMessage {
+    Start(usize),
+    Chunk(Vec<u8>),
+    Finish(usize),
+    Error(CursorError),
+}
+
+fn start_retained_encoder(
+    schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+) -> (
+    SyncSender<usize>,
+    Receiver<RetainedEncodeMessage>,
+    JoinHandle<()>,
+) {
+    let (request_sender, request_receiver) = sync_channel(0);
+    let (sender, receiver) = sync_channel(1);
+    let handle = thread::spawn(move || {
+        encode_retained_columns(&request_receiver, &sender, &schema, &batches)
+    });
+    (request_sender, receiver, handle)
+}
+
+fn encode_retained_columns(
+    requests: &Receiver<usize>,
+    sender: &SyncSender<RetainedEncodeMessage>,
+    schema: &SchemaRef,
+    batches: &[RecordBatch],
+) {
+    while let Ok(index) = requests.recv() {
+        if sender.send(RetainedEncodeMessage::Start(index)).is_err() {
+            return;
+        }
+        let arrays = batches
+            .iter()
+            .map(|batch| batch.column(index).as_ref())
+            .collect::<Vec<_>>();
+        let encoded = monetdb_arrow::encode_column_chunks(
+            &schema.fields()[index],
+            &arrays,
+            NonZeroUsize::new(ENCODE_CHUNK_BYTES).expect("encode chunk size is positive"),
+            |chunk| -> std::result::Result<(), CursorError> {
+                sender
+                    .send(RetainedEncodeMessage::Chunk(chunk.to_vec()))
+                    .map_err(|_| {
+                        CursorError::FileTransfer(
+                            "ingest upload stopped before encoding completed".into(),
+                        )
+                    })
+            },
+        )
+        .map_err(map_chunked_encode_error);
+        match encoded {
+            Ok(bytes) => {
+                if sender.send(RetainedEncodeMessage::Finish(bytes)).is_err() {
+                    return;
+                }
+            }
+            Err(value) => {
+                let _ = sender.send(RetainedEncodeMessage::Error(value));
+                return;
+            }
+        }
+    }
+}
+
+fn upload_retained_column(
+    receiver: &Receiver<RetainedEncodeMessage>,
+    expected_index: usize,
+    sink: &mut dyn monetdb::UploadSink,
+    largest_chunk: &mut usize,
+) -> std::result::Result<usize, CursorError> {
+    match receiver.recv() {
+        Ok(RetainedEncodeMessage::Start(index)) if index == expected_index => {}
+        Ok(RetainedEncodeMessage::Start(index)) => {
+            return Err(CursorError::FileTransfer(format!(
+                "ingest encoder produced column {index}, expected {expected_index}"
+            )));
+        }
+        Ok(RetainedEncodeMessage::Error(value)) => return Err(value),
+        Ok(_) => {
+            return Err(CursorError::FileTransfer(
+                "ingest encoder produced an out-of-order message".into(),
+            ));
+        }
+        Err(_) => {
+            return Err(CursorError::FileTransfer(
+                "ingest encoder stopped before the upload completed".into(),
+            ));
+        }
+    }
+    loop {
+        match receiver.recv() {
+            Ok(RetainedEncodeMessage::Chunk(chunk)) => {
+                *largest_chunk = (*largest_chunk).max(chunk.len());
+                sink.write_chunk(&chunk)?;
+            }
+            Ok(RetainedEncodeMessage::Finish(bytes)) => return Ok(bytes),
+            Ok(RetainedEncodeMessage::Error(value)) => return Err(value),
+            Ok(RetainedEncodeMessage::Start(index)) => {
+                return Err(CursorError::FileTransfer(format!(
+                    "ingest encoder started column {index} before finishing {expected_index}"
+                )));
+            }
+            Err(_) => {
+                return Err(CursorError::FileTransfer(
+                    "ingest encoder stopped before the upload completed".into(),
+                ));
+            }
+        }
+    }
+}
+
+struct PrefixedBatchReader {
+    schema: SchemaRef,
+    prefix: VecDeque<RecordBatch>,
+    reader: Box<dyn RecordBatchReader + Send>,
+}
+
+impl Iterator for PrefixedBatchReader {
+    type Item = std::result::Result<RecordBatch, ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.prefix
+            .pop_front()
+            .map(Ok)
+            .or_else(|| self.reader.next())
+    }
+}
+
+impl RecordBatchReader for PrefixedBatchReader {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+}
+
+fn route_ingest_reader(
+    mut reader: Box<dyn RecordBatchReader + Send>,
+    schema: &SchemaRef,
+    insert_rows: usize,
+) -> Result<(Box<dyn RecordBatchReader + Send>, Option<InsertCandidate>)> {
+    if insert_rows == 0 {
+        return Ok((reader, None));
+    }
+    let Some(first) = reader.next() else {
+        return Ok((reader, None));
+    };
+    let first = first.map_err(Error::from)?;
+    validate_record_batch(&first)?;
+    if first.schema() != *schema {
+        return Err(error(
+            "record batch schema changed within ingest stream",
+            Status::InvalidData,
+        ));
+    }
+    let second = reader.next().transpose().map_err(Error::from)?;
+    let estimated_bytes = estimated_batch_size(schema, &first)?;
+    if insert_rows > 0
+        && first.num_rows() > 0
+        && first.num_rows() <= insert_rows
+        && estimated_bytes <= PARAMETER_UPDATE_BATCH_BYTES
+        && second.is_none()
+    {
+        let binary_compatible = schema
+            .fields()
+            .iter()
+            .zip(first.columns())
+            .all(|(field, column)| monetdb_arrow::encode_column(field, column.as_ref()).is_ok());
+        if binary_compatible {
+            let arguments = (0..first.num_rows())
+                .map(|row| render_arguments(&first, row).map(|values| values.join(", ")))
+                .collect::<Result<Vec<_>>>();
+            if let Ok(arguments) = arguments {
+                return Ok((
+                    reader,
+                    Some(InsertCandidate {
+                        batch: first,
+                        arguments,
+                        estimated_bytes,
+                    }),
+                ));
+            }
+        }
+    }
+    let mut prefix = VecDeque::from([first]);
+    if let Some(second) = second {
+        prefix.push_back(second);
+    }
+    Ok((
+        Box::new(PrefixedBatchReader {
+            schema: Arc::clone(schema),
+            prefix,
+            reader,
+        }),
+        None,
+    ))
+}
+
 struct EncodedColumn {
     chunks: Vec<EncodedChunk>,
     pending: Option<PendingEncodedChunk>,
     compression: CompressionMode,
+    fixed_width: Option<usize>,
+    wire_compression: WireCompression,
     bytes: usize,
 }
 
@@ -2531,6 +3416,8 @@ enum EncodedChunk {
         data: MmapMut,
         len: usize,
         decoded_len: usize,
+        transform: CompressionTransform,
+        format: CompressionFormat,
     },
 }
 
@@ -2543,19 +3430,33 @@ impl EncodedChunk {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompressionTransform {
+    Plain,
+    Shuffle(usize),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompressionFormat {
+    Block,
+    Frame,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CompressionMode {
     Unknown,
-    Enabled,
+    Enabled(CompressionTransform),
     Disabled,
 }
 
 impl EncodedColumn {
-    fn new() -> Self {
+    fn new(fixed_width: Option<usize>, wire_compression: WireCompression) -> Self {
         Self {
             chunks: Vec::new(),
             pending: None,
             compression: CompressionMode::Unknown,
+            fixed_width,
+            wire_compression,
             bytes: 0,
         }
     }
@@ -2603,24 +3504,43 @@ impl EncodedColumn {
             self.store_raw(input)?;
             return Ok(());
         }
-        let mut compressed = MmapMut::map_anon(lz4_flex::block::get_maximum_output_size(
-            input.len(),
-        ))
-        .map_err(|value| {
-            CursorError::FileTransfer(format!(
-                "allocating an ingest compression buffer failed: {value}"
-            ))
-        })?;
-        let compressed_len =
-            lz4_flex::block::compress_into(input, &mut compressed).map_err(|value| {
-                CursorError::FileTransfer(format!("compressing an ingest buffer failed: {value}"))
-            })?;
-        if compressed_len.saturating_mul(8) <= input.len().saturating_mul(7) {
-            self.compression = CompressionMode::Enabled;
+        let force_compression = self.wire_compression == WireCompression::Lz4;
+        let format = if self.wire_compression == WireCompression::None {
+            CompressionFormat::Block
+        } else {
+            CompressionFormat::Frame
+        };
+        let transform = match self.compression {
+            CompressionMode::Unknown => {
+                if force_compression {
+                    CompressionTransform::Plain
+                } else {
+                    let Some(transform) = select_compression_transform(
+                        input,
+                        self.fixed_width,
+                        self.wire_compression == WireCompression::None,
+                        format,
+                    )?
+                    else {
+                        self.compression = CompressionMode::Disabled;
+                        self.store_raw(input)?;
+                        return Ok(());
+                    };
+                    transform
+                }
+            }
+            CompressionMode::Enabled(transform) => transform,
+            CompressionMode::Disabled => unreachable!("disabled compression returned above"),
+        };
+        let (compressed, compressed_len) = compress_bytes(input, transform, format)?;
+        if force_compression || compressed_len.saturating_mul(8) <= input.len().saturating_mul(7) {
+            self.compression = CompressionMode::Enabled(transform);
             self.chunks.push(EncodedChunk::Lz4 {
                 data: compressed,
                 len: compressed_len,
                 decoded_len: input.len(),
+                transform,
+                format,
             });
         } else {
             self.compression = CompressionMode::Disabled;
@@ -2656,9 +3576,163 @@ impl EncodedColumn {
     }
 }
 
+fn select_compression_transform(
+    input: &[u8],
+    fixed_width: Option<usize>,
+    allow_shuffle: bool,
+    format: CompressionFormat,
+) -> std::result::Result<Option<CompressionTransform>, CursorError> {
+    let sample_len = COMPRESSION_PROBE_BYTES.min(input.len());
+    let plain = &input[..sample_len];
+    let mut candidates = vec![(CompressionTransform::Plain, plain.to_vec())];
+    if allow_shuffle && let Some(width) = fixed_width.filter(|width| *width > 1) {
+        let aligned_len = sample_len - sample_len % width;
+        if aligned_len > 0 {
+            candidates.push((
+                CompressionTransform::Shuffle(width),
+                shuffle_bytes(plain, width),
+            ));
+        }
+    }
+    let mut best = None;
+    for (transform, sample) in candidates {
+        let compressed_len = compressed_size(&sample, format)?;
+        if best
+            .as_ref()
+            .is_none_or(|(_, best_len): &(CompressionTransform, usize)| compressed_len < *best_len)
+        {
+            best = Some((transform, compressed_len));
+        }
+    }
+    Ok(best
+        .filter(|(_, compressed_len)| {
+            compressed_len.saturating_mul(8) <= plain.len().saturating_mul(7)
+        })
+        .map(|(transform, _)| transform))
+}
+
+fn compressed_size(
+    input: &[u8],
+    format: CompressionFormat,
+) -> std::result::Result<usize, CursorError> {
+    match format {
+        CompressionFormat::Block => {
+            let mut output = vec![0; lz4_flex::block::get_maximum_output_size(input.len())];
+            lz4_flex::block::compress_into(input, &mut output).map_err(|value| {
+                CursorError::FileTransfer(format!("compressing an ingest buffer failed: {value}"))
+            })
+        }
+        CompressionFormat::Frame => Ok(compress_frame_bytes(input)?.len()),
+    }
+}
+
+fn compress_frame_bytes(input: &[u8]) -> std::result::Result<Vec<u8>, CursorError> {
+    let mut encoder = lz4_flex::frame::FrameEncoder::new(Vec::new());
+    encoder.write_all(input).map_err(|value| {
+        CursorError::FileTransfer(format!("compressing an ingest buffer failed: {value}"))
+    })?;
+    encoder.finish().map_err(|value| {
+        CursorError::FileTransfer(format!(
+            "finishing an ingest compression frame failed: {value}"
+        ))
+    })
+}
+
+fn compress_frame(
+    input: &[u8],
+    transform: CompressionTransform,
+) -> std::result::Result<(MmapMut, usize), CursorError> {
+    let transformed = transform_bytes(input, transform);
+    let compressed = compress_frame_bytes(&transformed)?;
+    let mut mapping = MmapMut::map_anon(compressed.len()).map_err(|value| {
+        CursorError::FileTransfer(format!(
+            "allocating an ingest compression buffer failed: {value}"
+        ))
+    })?;
+    mapping.copy_from_slice(&compressed);
+    Ok((mapping, compressed.len()))
+}
+
+fn compress_bytes(
+    input: &[u8],
+    transform: CompressionTransform,
+    format: CompressionFormat,
+) -> std::result::Result<(MmapMut, usize), CursorError> {
+    if format == CompressionFormat::Frame {
+        return compress_frame(input, transform);
+    }
+    let transformed = transform_bytes(input, transform);
+    let mut compressed = MmapMut::map_anon(lz4_flex::block::get_maximum_output_size(
+        transformed.len(),
+    ))
+    .map_err(|value| {
+        CursorError::FileTransfer(format!(
+            "allocating an ingest compression buffer failed: {value}"
+        ))
+    })?;
+    let compressed_len =
+        lz4_flex::block::compress_into(&transformed, &mut compressed).map_err(|value| {
+            CursorError::FileTransfer(format!("compressing an ingest buffer failed: {value}"))
+        })?;
+    Ok((compressed, compressed_len))
+}
+
+fn decompress_frame_into(
+    input: &[u8],
+    output: &mut [u8],
+) -> std::result::Result<usize, CursorError> {
+    let mut decoder = lz4_flex::frame::FrameDecoder::new(input);
+    decoder.read_exact(output).map_err(|value| {
+        CursorError::FileTransfer(format!("decompressing an ingest buffer failed: {value}"))
+    })?;
+    let mut trailing = [0u8; 1];
+    let trailing_bytes = decoder.read(&mut trailing).map_err(|value| {
+        CursorError::FileTransfer(format!("finishing ingest decompression failed: {value}"))
+    })?;
+    if trailing_bytes != 0 {
+        return Err(CursorError::FileTransfer(
+            "decompressed ingest buffer exceeds its declared size".into(),
+        ));
+    }
+    Ok(output.len())
+}
+
+fn transform_bytes(input: &[u8], transform: CompressionTransform) -> Cow<'_, [u8]> {
+    match transform {
+        CompressionTransform::Plain => Cow::Borrowed(input),
+        CompressionTransform::Shuffle(width) => Cow::Owned(shuffle_bytes(input, width)),
+    }
+}
+
+fn shuffle_bytes(input: &[u8], width: usize) -> Vec<u8> {
+    assert!(width > 0);
+    let aligned_len = input.len() - input.len() % width;
+    let rows = aligned_len / width;
+    let mut output = Vec::with_capacity(input.len());
+    for byte in 0..width {
+        output.extend((0..rows).map(|row| input[row * width + byte]));
+    }
+    output.extend_from_slice(&input[aligned_len..]);
+    output
+}
+
+fn unshuffle_bytes(input: &[u8], width: usize, output: &mut [u8]) {
+    assert!(width > 0);
+    assert_eq!(input.len(), output.len());
+    let aligned_len = input.len() - input.len() % width;
+    let rows = aligned_len / width;
+    for byte in 0..width {
+        for row in 0..rows {
+            output[row * width + byte] = input[byte * rows + row];
+        }
+    }
+    output[aligned_len..].copy_from_slice(&input[aligned_len..]);
+}
+
 struct EncodedIngestWindow {
     columns: Vec<EncodedColumn>,
     retained_batches: Vec<RecordBatch>,
+    retained_estimated_bytes: usize,
     retain_arrow: bool,
     rows: usize,
     estimated_bytes: usize,
@@ -2666,13 +3740,18 @@ struct EncodedIngestWindow {
     largest_chunk: usize,
     largest_column_bytes: usize,
     coalesced: bool,
+    wire_compression: WireCompression,
 }
 
 impl EncodedIngestWindow {
+    #[cfg(test)]
     fn new(columns: usize) -> Self {
         Self {
-            columns: (0..columns).map(|_| EncodedColumn::new()).collect(),
+            columns: (0..columns)
+                .map(|_| EncodedColumn::new(None, WireCompression::None))
+                .collect(),
             retained_batches: Vec::new(),
+            retained_estimated_bytes: 0,
             retain_arrow: false,
             rows: 0,
             estimated_bytes: 0,
@@ -2680,7 +3759,33 @@ impl EncodedIngestWindow {
             largest_chunk: 0,
             largest_column_bytes: 0,
             coalesced: false,
+            wire_compression: WireCompression::None,
         }
+    }
+
+    fn for_schema(schema: &SchemaRef, wire_compression: WireCompression) -> Result<Self> {
+        let columns = schema
+            .fields()
+            .iter()
+            .map(|field| {
+                monetdb_arrow::fixed_encoded_width(field)
+                    .map_err(|value| map_display(value, Status::NotImplemented))
+                    .map(|width| EncodedColumn::new(width, wire_compression))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            columns,
+            retained_batches: Vec::new(),
+            retained_estimated_bytes: 0,
+            retain_arrow: false,
+            rows: 0,
+            estimated_bytes: 0,
+            encoded_bytes: 0,
+            largest_chunk: 0,
+            largest_column_bytes: 0,
+            coalesced: false,
+            wire_compression,
+        })
     }
 
     fn append(
@@ -2696,6 +3801,10 @@ impl EncodedIngestWindow {
             .map(|pending| pending.batch.num_rows())
             .sum::<usize>();
         if self.retain_arrow {
+            self.retained_estimated_bytes = self
+                .retained_estimated_bytes
+                .checked_add(estimated_bytes)
+                .ok_or_else(|| error("retained Arrow byte estimate overflows", Status::Internal))?;
             self.retained_batches
                 .extend(pending.into_iter().map(|pending| pending.batch));
         } else {
@@ -2730,8 +3839,8 @@ impl EncodedIngestWindow {
                 .iter()
                 .map(EncodedColumn::stored_bytes)
                 .sum::<usize>();
-            self.retain_arrow =
-                stored_bytes.saturating_mul(8) > self.encoded_bytes.saturating_mul(7);
+            self.retain_arrow = self.wire_compression != WireCompression::Lz4
+                && stored_bytes.saturating_mul(8) > self.encoded_bytes.saturating_mul(7);
         }
         self.rows = self
             .rows
@@ -2751,15 +3860,67 @@ impl EncodedIngestWindow {
         }
         Ok(())
     }
+
+    fn stored_bytes(&self) -> usize {
+        self.columns
+            .iter()
+            .map(EncodedColumn::stored_bytes)
+            .sum::<usize>()
+            .saturating_add(self.retained_estimated_bytes)
+    }
+
+    fn storage_mode(&self) -> WindowStorage {
+        let mut raw = 0usize;
+        let mut lz4 = 0usize;
+        for chunk in self.columns.iter().flat_map(|column| &column.chunks) {
+            match chunk {
+                EncodedChunk::Raw(data) => raw = raw.saturating_add(data.len()),
+                EncodedChunk::Lz4 { len, .. } => lz4 = lz4.saturating_add(*len),
+            }
+        }
+        [
+            (raw, WindowStorage::Raw),
+            (lz4, WindowStorage::Lz4),
+            (self.retained_estimated_bytes, WindowStorage::Arrow),
+        ]
+        .into_iter()
+        .max_by_key(|(bytes, _)| *bytes)
+        .map(|(_, mode)| mode)
+        .unwrap_or(WindowStorage::Raw)
+    }
+
+    fn uses_wire_lz4(&self) -> bool {
+        match self.wire_compression {
+            WireCompression::None => false,
+            WireCompression::Lz4 => true,
+            WireCompression::Auto => {
+                self.retained_batches.is_empty()
+                    && self.columns.iter().all(|column| {
+                        !column.chunks.is_empty()
+                            && column.chunks.iter().all(|chunk| {
+                                matches!(
+                                    chunk,
+                                    EncodedChunk::Lz4 {
+                                        transform: CompressionTransform::Plain,
+                                        format: CompressionFormat::Frame,
+                                        ..
+                                    }
+                                )
+                            })
+                    })
+            }
+        }
+    }
 }
 
 fn should_finish_incompressible_window(
     configured_rows: Option<usize>,
+    incompressible_window_budget: usize,
     window: &EncodedIngestWindow,
 ) -> bool {
     configured_rows.is_none()
         && window.retain_arrow
-        && window.estimated_bytes >= INCOMPRESSIBLE_WRITE_WINDOW_BYTES
+        && window.estimated_bytes >= incompressible_window_budget
 }
 
 impl<'a> IngestWindowScheduler<'a> {
@@ -2767,7 +3928,9 @@ impl<'a> IngestWindowScheduler<'a> {
         reader: &'a mut (dyn RecordBatchReader + Send),
         schema: SchemaRef,
         window_budget: usize,
+        incompressible_window_budget: usize,
         configured_rows: Option<usize>,
+        wire_compression: WireCompression,
     ) -> Self {
         Self {
             reader,
@@ -2777,7 +3940,9 @@ impl<'a> IngestWindowScheduler<'a> {
             pending_bytes: 0,
             exhausted: false,
             window_budget,
+            incompressible_window_budget,
             configured_rows,
+            wire_compression,
             input_batches: 0,
             coalesced_windows: 0,
             split_windows: 0,
@@ -2785,7 +3950,7 @@ impl<'a> IngestWindowScheduler<'a> {
     }
 
     fn next_window(&mut self) -> Result<Option<EncodedIngestWindow>> {
-        let mut window = EncodedIngestWindow::new(self.schema.fields().len());
+        let mut window = EncodedIngestWindow::for_schema(&self.schema, self.wire_compression)?;
         loop {
             let remaining_rows = self
                 .configured_rows
@@ -2802,7 +3967,11 @@ impl<'a> IngestWindowScheduler<'a> {
             if remaining_bytes == 0 {
                 break;
             }
-            let staging_bytes = remaining_bytes.min(PENDING_BATCH_COMPACTION_MAX_BYTES);
+            let staging_bytes = remaining_bytes.min(if window.rows == 0 {
+                compression_probe_staging_bytes(self.schema.fields().len())
+            } else {
+                ENCODE_STAGING_BYTES
+            });
             self.fill_staging(remaining_rows, staging_bytes)?;
             if self.pending_rows == 0 {
                 break;
@@ -2817,7 +3986,11 @@ impl<'a> IngestWindowScheduler<'a> {
                     .ok_or_else(|| error("pending ingest byte count overflows", Status::Internal))
             })?;
             window.append(&self.schema, pending, estimated_bytes)?;
-            if should_finish_incompressible_window(self.configured_rows, &window) {
+            if should_finish_incompressible_window(
+                self.configured_rows,
+                self.incompressible_window_budget,
+                &window,
+            ) {
                 break;
             }
         }
@@ -3033,32 +4206,83 @@ fn estimated_batch_size(schema: &SchemaRef, batch: &RecordBatch) -> Result<usize
         })
 }
 
+fn compression_probe_staging_bytes(columns: usize) -> usize {
+    COMPRESSION_PROBE_BYTES.saturating_mul(columns).clamp(
+        MIN_COMPRESSION_PROBE_STAGING_BYTES,
+        MAX_COMPRESSION_PROBE_STAGING_BYTES,
+    )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WindowStorage {
+    Lz4,
+    Raw,
+    Arrow,
+}
+
+impl WindowStorage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Lz4 => "lz4",
+            Self::Raw => "raw",
+            Self::Arrow => "arrow",
+        }
+    }
+}
+
 struct IngestStats {
     input_batches: usize,
     coalesced_windows: usize,
     split_windows: usize,
     copy_count: usize,
     encoded_bytes: usize,
+    stored_bytes: usize,
+    prepared_cache_hits: usize,
     peak_in_flight_bytes: usize,
     window_budget_bytes: usize,
+    incompressible_window_budget_bytes: usize,
+    insert_rows_threshold: usize,
+    measured_round_trip_us: u128,
     window_rows: Vec<usize>,
     window_bytes: Vec<usize>,
+    window_storage: Vec<WindowStorage>,
+    window_wire_compression: Vec<bool>,
+    path: &'static str,
     scope: &'static str,
     poisoned: bool,
 }
 
+struct IngestStreamingUsage {
+    largest_chunk: usize,
+    largest_column_bytes: usize,
+}
+
 impl IngestStats {
-    fn new(window_budget_bytes: usize, scope: &'static str) -> Self {
+    fn new(
+        window_budget_bytes: usize,
+        incompressible_window_budget_bytes: usize,
+        insert_rows_threshold: usize,
+        measured_round_trip: Duration,
+        scope: &'static str,
+    ) -> Self {
         Self {
             input_batches: 0,
             coalesced_windows: 0,
             split_windows: 0,
             copy_count: 0,
             encoded_bytes: 0,
+            stored_bytes: 0,
+            prepared_cache_hits: 0,
             peak_in_flight_bytes: 0,
             window_budget_bytes,
+            incompressible_window_budget_bytes,
+            insert_rows_threshold,
+            measured_round_trip_us: measured_round_trip.as_micros(),
             window_rows: Vec::new(),
             window_bytes: Vec::new(),
+            window_storage: Vec::new(),
+            window_wire_compression: Vec::new(),
+            path: "copy",
             scope,
             poisoned: false,
         }
@@ -3068,20 +4292,28 @@ impl IngestStats {
         &mut self,
         rows: usize,
         bytes: usize,
-        largest_chunk: usize,
-        largest_column_bytes: usize,
+        stored_bytes: usize,
+        storage: WindowStorage,
+        wire_lz4: bool,
+        streaming: IngestStreamingUsage,
     ) {
         self.copy_count += 1;
         self.encoded_bytes = self.encoded_bytes.saturating_add(bytes);
-        let upload_message_bytes = largest_column_bytes.min(DEFAULT_UPLOAD_CHUNK_SIZE_BYTES);
+        self.stored_bytes = self.stored_bytes.saturating_add(stored_bytes);
+        let upload_message_bytes = streaming
+            .largest_column_bytes
+            .min(DEFAULT_UPLOAD_CHUNK_SIZE_BYTES);
         let framing_bytes =
             2usize.saturating_mul(upload_message_bytes.div_ceil(monetdb::MAPI_BLOCK_SIZE_BYTES));
-        let streaming_bytes = largest_chunk
-            .saturating_add(upload_message_bytes.saturating_mul(2))
+        let streaming_bytes = streaming
+            .largest_chunk
+            .saturating_add(upload_message_bytes)
             .saturating_add(framing_bytes);
         self.peak_in_flight_bytes = self.peak_in_flight_bytes.max(streaming_bytes);
         self.window_rows.push(rows);
         self.window_bytes.push(bytes);
+        self.window_storage.push(storage);
+        self.window_wire_compression.push(wire_lz4);
     }
 
     fn to_json(&self) -> String {
@@ -3097,25 +4329,77 @@ impl IngestStats {
             .map(usize::to_string)
             .collect::<Vec<_>>()
             .join(",");
+        let storage = self
+            .window_storage
+            .iter()
+            .map(|mode| format!("\"{}\"", mode.as_str()))
+            .collect::<Vec<_>>()
+            .join(",");
+        let wire_compression = self
+            .window_wire_compression
+            .iter()
+            .map(|enabled| if *enabled { "\"lz4\"" } else { "\"none\"" })
+            .collect::<Vec<_>>()
+            .join(",");
         format!(
             concat!(
                 "{{\"input_batches\":{},\"coalesced_windows\":{},\"split_windows\":{},",
-                "\"copy_count\":{},\"encoded_bytes\":{},\"peak_in_flight_bytes\":{},",
-                "\"window_budget_bytes\":{},\"window_rows\":[{}],\"window_bytes\":[{}],",
-                "\"scope\":\"{}\",\"poisoned\":{}}}"
+                "\"copy_count\":{},\"encoded_bytes\":{},\"stored_bytes\":{},",
+                "\"prepared_cache_hits\":{},",
+                "\"peak_in_flight_bytes\":{},\"window_budget_bytes\":{},",
+                "\"incompressible_window_budget_bytes\":{},",
+                "\"insert_rows_threshold\":{},\"measured_round_trip_us\":{},",
+                "\"window_rows\":[{}],\"window_bytes\":[{}],\"window_storage\":[{}],",
+                "\"window_wire_compression\":[{}],",
+                "\"path\":\"{}\",\"scope\":\"{}\",\"poisoned\":{}}}"
             ),
             self.input_batches,
             self.coalesced_windows,
             self.split_windows,
             self.copy_count,
             self.encoded_bytes,
+            self.stored_bytes,
+            self.prepared_cache_hits,
             self.peak_in_flight_bytes,
             self.window_budget_bytes,
+            self.incompressible_window_budget_bytes,
+            self.insert_rows_threshold,
+            self.measured_round_trip_us,
             rows,
             bytes,
+            storage,
+            wire_compression,
+            self.path,
             self.scope,
             self.poisoned,
         )
+    }
+}
+
+fn adaptive_insert_rows(configured_rows: usize, measured_round_trip: Duration) -> usize {
+    if configured_rows == 0 || measured_round_trip < ADAPTIVE_NETWORK_RTT {
+        return configured_rows;
+    }
+    let measured_crossover = measured_round_trip
+        .as_micros()
+        .saturating_mul(COPY_FILE_EXCHANGES_PER_COLUMN)
+        / INSERT_VALUE_ENCODE_MICROS;
+    configured_rows.max(
+        usize::try_from(measured_crossover)
+            .unwrap_or(usize::MAX)
+            .min(MAX_ADAPTIVE_INSERT_ROWS),
+    )
+}
+
+fn adaptive_incompressible_window_bytes(
+    window_budget: usize,
+    columns: usize,
+    measured_round_trip: Duration,
+) -> usize {
+    if measured_round_trip >= ADAPTIVE_NETWORK_RTT || columns >= WIDE_COPY_ADAPTIVE_COLUMNS {
+        window_budget
+    } else {
+        INCOMPRESSIBLE_WRITE_WINDOW_BYTES.min(window_budget)
     }
 }
 
@@ -3171,9 +4455,103 @@ fn validate_record_batch(batch: &RecordBatch) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct AppendColumn {
+    name: String,
+    data_type: MonetType,
+    nullable: bool,
+}
+
+fn append_table_columns(
+    cursor: &mut monetdb::Cursor,
+    schema_name: Option<&str>,
+    table_name: &str,
+    mismatch_status: Status,
+) -> Result<Vec<AppendColumn>> {
+    let table = metadata::raw_string_literal(table_name)?;
+    let table_selector = match schema_name {
+        Some(schema) => format!(
+            "t.name = {table} AND s.name = {}",
+            metadata::raw_string_literal(schema)?
+        ),
+        None => format!(
+            "t.id = (\
+                 SELECT t2.id \
+                 FROM sys.tables AS t2 \
+                 JOIN sys.schemas AS s2 ON s2.id = t2.schema_id \
+                 WHERE t2.name = {table} AND s2.name IN ('tmp', current_schema) \
+                 ORDER BY CASE WHEN s2.name = 'tmp' THEN 0 ELSE 1 END \
+                 LIMIT 1\
+             )"
+        ),
+    };
+    cursor
+        .execute(&format!(
+            "SELECT c.name, c.type, c.type_digits, c.type_scale, c.\"null\", \
+                    tt.table_type_name \
+             FROM sys.columns AS c \
+             JOIN sys.tables AS t ON t.id = c.table_id \
+             JOIN sys.schemas AS s ON s.id = t.schema_id \
+             JOIN sys.table_types AS tt ON tt.table_type_id = t.type \
+             WHERE {table_selector} \
+             ORDER BY c.number"
+        ))
+        .map_err(map_cursor_error)?;
+    let mut columns = Vec::new();
+    let mut table_type = None;
+    while cursor.next_row().map_err(map_cursor_error)? {
+        let name = cursor
+            .get_str(0)
+            .map_err(map_cursor_error)?
+            .ok_or_else(|| error("catalog column name is NULL", Status::InvalidData))?;
+        let code = cursor
+            .get_str(1)
+            .map_err(map_cursor_error)?
+            .ok_or_else(|| error("catalog column type is NULL", Status::InvalidData))?;
+        let digits = cursor
+            .get::<i32>(2)
+            .map_err(map_cursor_error)?
+            .ok_or_else(|| error("catalog type digits are NULL", Status::InvalidData))?;
+        let scale = cursor
+            .get::<i32>(3)
+            .map_err(map_cursor_error)?
+            .ok_or_else(|| error("catalog type scale is NULL", Status::InvalidData))?;
+        let nullable = cursor
+            .get::<bool>(4)
+            .map_err(map_cursor_error)?
+            .ok_or_else(|| error("catalog nullability is NULL", Status::InvalidData))?;
+        let current_type = cursor
+            .get_str(5)
+            .map_err(map_cursor_error)?
+            .ok_or_else(|| error("catalog table type is NULL", Status::InvalidData))?;
+        table_type.get_or_insert_with(|| current_type.to_owned());
+        columns.push(AppendColumn {
+            name: name.to_owned(),
+            data_type: prepared_monet_type(code, digits, scale)?,
+            nullable,
+        });
+    }
+    let Some(table_type) = table_type else {
+        return Err(error(
+            format!("append target table {table_name:?} does not exist"),
+            Status::NotFound,
+        ));
+    };
+    if !matches!(
+        table_type.as_str(),
+        "TABLE" | "UNLOGGED TABLE" | "GLOBAL TEMPORARY TABLE" | "LOCAL TEMPORARY TABLE"
+    ) {
+        return Err(error(
+            format!("append target {table_name:?} is a {table_type}, not a writable table"),
+            mismatch_status,
+        ));
+    }
+    Ok(columns)
+}
+
 fn validate_append_schema(
     schema: &SchemaRef,
-    columns: &[ResultColumn],
+    columns: &[AppendColumn],
     mismatch_status: Status,
 ) -> Result<()> {
     if schema.fields().len() != columns.len() {
@@ -3187,26 +4565,20 @@ fn validate_append_schema(
         ));
     }
     for (index, (field, column)) in schema.fields().iter().zip(columns).enumerate() {
-        if !append_column_names_match(field.name(), column.name()) {
+        if !append_column_names_match(field.name(), &column.name) {
             return Err(error(
                 format!(
                     "append column {index} is named {:?}, but destination column is named {:?}; append schemas are positional and column order must match",
                     field.name(),
-                    column.name()
+                    column.name
                 ),
                 mismatch_status,
             ));
         }
         let source = monetdb_arrow::monet_type_for_field(field)
             .map_err(|value| map_display(value, Status::NotImplemented))?;
-        let destination = column.sql_type();
-        let string_wire = |data_type: &MonetType| {
-            matches!(
-                data_type,
-                MonetType::Varchar(_) | MonetType::Url | MonetType::Json
-            )
-        };
-        if source != *destination && !(string_wire(&source) && string_wire(destination)) {
+        let destination = &column.data_type;
+        if !append_monet_types_match(&source, destination) {
             return Err(error(
                 format!(
                     "append column {:?} has Arrow/MonetDB type {source}, but destination type is {destination}",
@@ -3217,6 +4589,49 @@ fn validate_append_schema(
         }
     }
     Ok(())
+}
+
+fn validate_prepared_insert_schema(
+    source: &SchemaRef,
+    destination: &Schema,
+    mismatch_status: Status,
+) -> Result<()> {
+    if source.fields().len() != destination.fields().len() {
+        return Err(error(
+            format!(
+                "append stream has {} columns but destination table has {}",
+                source.fields().len(),
+                destination.fields().len()
+            ),
+            mismatch_status,
+        ));
+    }
+    for (field, parameter) in source.fields().iter().zip(destination.fields()) {
+        let source_type = monetdb_arrow::monet_type_for_field(field)
+            .map_err(|value| map_display(value, Status::NotImplemented))?;
+        let destination_type = monetdb_arrow::monet_type_for_field(parameter)
+            .map_err(|value| map_display(value, Status::InvalidData))?;
+        if !append_monet_types_match(&source_type, &destination_type) {
+            return Err(error(
+                format!(
+                    "append column {:?} has Arrow/MonetDB type {source_type}, but destination type is {destination_type}",
+                    field.name()
+                ),
+                mismatch_status,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn append_monet_types_match(source: &MonetType, destination: &MonetType) -> bool {
+    let string_wire = |data_type: &MonetType| {
+        matches!(
+            data_type,
+            MonetType::Varchar(_) | MonetType::Url | MonetType::Json
+        )
+    };
+    source == destination || (string_wire(source) && string_wire(destination))
 }
 
 fn append_column_names_match(source: &str, destination: &str) -> bool {
@@ -3558,20 +4973,34 @@ fn prepare_cached(
     parameter_count: usize,
     timeouts: Timeouts,
 ) -> Result<Arc<PreparedEntry>> {
+    prepare_cached_with_status(connection, cache, query, parameter_count, timeouts)
+        .map(|(entry, _)| entry)
+}
+
+fn prepare_cached_with_status(
+    connection: &SharedConnection,
+    cache: &SharedPreparedCache,
+    query: &str,
+    parameter_count: usize,
+    timeouts: Timeouts,
+) -> Result<(Arc<PreparedEntry>, bool)> {
     let query = normalize_prepared_query(query);
     if let Some(entry) = cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(query)
     {
-        return Ok(entry);
+        return Ok((entry, true));
     }
     let metadata = prepare_query(connection, query, parameter_count, timeouts)?;
     let candidate = Arc::new(PreparedEntry::new(metadata, connection));
-    Ok(cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(query.to_owned(), candidate))
+    Ok((
+        cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(query.to_owned(), candidate),
+        false,
+    ))
 }
 
 struct PreparedField {
@@ -3700,7 +5129,9 @@ fn prepare_query_inner(
         let parameter_fields = fields
             .drain(result_count..)
             .enumerate()
-            .map(|(index, field)| prepared_arrow_field(index.to_string(), &field.data_type))
+            .map(|(index, field)| {
+                prepared_parameter_arrow_field(index.to_string(), &field.data_type)
+            })
             .collect::<Result<Vec<_>>>()?;
         let result_fields = fields
             .into_iter()
@@ -3860,6 +5291,16 @@ fn prepared_monet_type(code: &str, digits: i32, scale: i32) -> Result<MonetType>
 fn prepared_arrow_field(name: String, data_type: &MonetType) -> Result<Field> {
     monetdb_arrow::field_for_monet_type(name, data_type)
         .map_err(|value| map_display(value, Status::InvalidData))
+}
+
+fn prepared_parameter_arrow_field(name: String, data_type: &MonetType) -> Result<Field> {
+    if matches!(
+        data_type,
+        MonetType::Geometry | MonetType::Inet | MonetType::Xml
+    ) {
+        return Ok(Field::new(name, DataType::Utf8, true));
+    }
+    prepared_arrow_field(name, data_type)
 }
 
 fn query_reader_with_timeouts(
@@ -4056,11 +5497,25 @@ fn transaction_effects(query: &str) -> Result<TransactionEffects> {
     for statement in unbound_statements(query)? {
         match leading_sql_keyword(statement).map(str::to_ascii_uppercase) {
             Some(keyword) if keyword == "COMMIT" => effects.commit = true,
-            Some(keyword) if keyword == "ROLLBACK" => effects.rollback = true,
+            Some(keyword) if keyword == "ROLLBACK" => {
+                effects.rollback |= is_transaction_rollback(statement)
+            }
             _ => {}
         }
     }
     Ok(effects)
+}
+
+fn is_transaction_rollback(statement: &str) -> bool {
+    let Some(keyword) = leading_sql_keyword(statement) else {
+        return false;
+    };
+    if !keyword.eq_ignore_ascii_case("rollback") {
+        return false;
+    }
+    let keyword_end = keyword.as_ptr() as usize - statement.as_ptr() as usize + keyword.len();
+    !leading_sql_keyword(&statement[keyword_end..])
+        .is_some_and(|next| next.eq_ignore_ascii_case("to"))
 }
 
 fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
@@ -4216,8 +5671,7 @@ fn execute_update_script(
         apply_transaction_rollback(
             connection,
             TransactionEffects {
-                rollback: leading_sql_keyword(statement)
-                    .is_some_and(|keyword| keyword.eq_ignore_ascii_case("ROLLBACK")),
+                rollback: is_transaction_rollback(statement),
                 ..TransactionEffects::default()
             },
         );
@@ -5176,6 +6630,52 @@ fn qualified_name(schema: Option<&str>, table: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    struct SignallingReader {
+        batch: RecordBatch,
+        schema: SchemaRef,
+        offset: usize,
+        signal: std::sync::mpsc::Sender<()>,
+    }
+
+    impl Iterator for SignallingReader {
+        type Item = std::result::Result<RecordBatch, ArrowError>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.offset >= self.batch.num_rows() {
+                return None;
+            }
+            self.signal.send(()).unwrap();
+            let batch = self.batch.slice(self.offset, 1);
+            self.offset += 1;
+            Some(Ok(batch))
+        }
+    }
+
+    impl RecordBatchReader for SignallingReader {
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+    }
+
+    struct PanickingReader {
+        schema: SchemaRef,
+    }
+
+    impl Iterator for PanickingReader {
+        type Item = std::result::Result<RecordBatch, ArrowError>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            panic!("reader panic")
+        }
+    }
+
+    impl RecordBatchReader for PanickingReader {
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+    }
 
     #[test]
     fn extracts_sqlstate() {
@@ -5353,6 +6853,66 @@ mod tests {
         );
         assert!(IngestPartial::parse(&OptionValue::String("invalid".into())).is_err());
         assert!(IngestAtomicity::parse(&OptionValue::Int(1)).is_err());
+        for (value, expected) in [
+            ("none", WireCompression::None),
+            ("auto", WireCompression::Auto),
+            ("lz4", WireCompression::Lz4),
+        ] {
+            assert_eq!(
+                WireCompression::parse(&OptionValue::String(value.into())).unwrap(),
+                expected
+            );
+        }
+        assert!(WireCompression::parse(&OptionValue::String("gzip".into())).is_err());
+        assert!(WireCompression::parse(&OptionValue::Int(1)).is_err());
+    }
+
+    #[test]
+    fn adaptive_ingest_defaults_only_expand_for_measured_costs() {
+        assert_eq!(adaptive_insert_rows(0, Duration::from_secs(1)), 0);
+        assert_eq!(adaptive_insert_rows(100, Duration::from_micros(100)), 100);
+        assert_eq!(adaptive_insert_rows(100, Duration::from_millis(2)), 2_000);
+        assert_eq!(
+            adaptive_insert_rows(100, Duration::from_secs(1)),
+            MAX_ADAPTIVE_INSERT_ROWS
+        );
+
+        assert_eq!(
+            adaptive_incompressible_window_bytes(
+                DEFAULT_WRITE_WINDOW_BYTES,
+                100,
+                Duration::from_micros(100),
+            ),
+            INCOMPRESSIBLE_WRITE_WINDOW_BYTES
+        );
+        assert_eq!(
+            adaptive_incompressible_window_bytes(
+                DEFAULT_WRITE_WINDOW_BYTES,
+                100,
+                ADAPTIVE_NETWORK_RTT,
+            ),
+            DEFAULT_WRITE_WINDOW_BYTES
+        );
+        assert_eq!(
+            adaptive_incompressible_window_bytes(
+                DEFAULT_WRITE_WINDOW_BYTES,
+                WIDE_COPY_ADAPTIVE_COLUMNS - 1,
+                Duration::ZERO,
+            ),
+            INCOMPRESSIBLE_WRITE_WINDOW_BYTES
+        );
+        assert_eq!(
+            adaptive_incompressible_window_bytes(
+                DEFAULT_WRITE_WINDOW_BYTES,
+                WIDE_COPY_ADAPTIVE_COLUMNS,
+                Duration::ZERO,
+            ),
+            DEFAULT_WRITE_WINDOW_BYTES
+        );
+        assert_eq!(
+            adaptive_incompressible_window_bytes(MIN_WRITE_WINDOW_BYTES, 1, Duration::ZERO,),
+            MIN_WRITE_WINDOW_BYTES
+        );
     }
 
     #[test]
@@ -5549,6 +7109,13 @@ mod tests {
             transaction_effects("SELECT 'COMMIT'; SELECT \"ROLLBACK\" FROM sys.tables").unwrap();
         assert!(!effects.rollback);
         assert!(!effects.commit);
+
+        for statement in [
+            "ROLLBACK TO SAVEPOINT s",
+            "/* recover scope */ rollback /* target */ to savepoint s",
+        ] {
+            assert!(!transaction_effects(statement).unwrap().rollback);
+        }
     }
 
     #[test]
@@ -5625,11 +7192,18 @@ mod tests {
     }
 
     #[test]
-    fn maps_legacy_clob_prepare_metadata_to_string() {
+    fn maps_clob_prepare_metadata_to_string() {
         assert_eq!(
             prepared_monet_type("clob", 1024, 0).unwrap(),
             MonetType::Varchar(1024)
         );
+    }
+
+    #[test]
+    fn maps_text_only_prepare_parameters_without_enabling_binary_results() {
+        let parameter = prepared_parameter_arrow_field("0".into(), &MonetType::Inet).unwrap();
+        assert_eq!(parameter.data_type(), &DataType::Utf8);
+        assert!(prepared_arrow_field("inet".into(), &MonetType::Inet).is_err());
     }
 
     #[test]
@@ -5683,7 +7257,9 @@ mod tests {
             &mut reader,
             schema,
             DEFAULT_WRITE_WINDOW_BYTES,
+            INCOMPRESSIBLE_WRITE_WINDOW_BYTES,
             Some(100_000),
+            WireCompression::None,
         );
         let mut windows = Vec::new();
         while let Some(window) = scheduler.next_window().unwrap() {
@@ -5698,12 +7274,15 @@ mod tests {
 
     #[test]
     fn encoded_columns_keep_only_material_compression_savings() {
-        let mut compressible = EncodedColumn::new();
+        let mut compressible = EncodedColumn::new(None, WireCompression::None);
         compressible
             .push(&vec![0; MIN_ENCODE_BUFFER_BYTES])
             .unwrap();
         compressible.finish().unwrap();
-        assert!(matches!(compressible.compression, CompressionMode::Enabled));
+        assert!(matches!(
+            compressible.compression,
+            CompressionMode::Enabled(_)
+        ));
         assert!(compressible.stored_bytes() < MIN_ENCODE_BUFFER_BYTES);
 
         let mut state = 0x9e3779b97f4a7c15u64;
@@ -5715,7 +7294,7 @@ mod tests {
                 state as u8
             })
             .collect::<Vec<_>>();
-        let mut incompressible = EncodedColumn::new();
+        let mut incompressible = EncodedColumn::new(None, WireCompression::None);
         incompressible.push(&incompressible_bytes).unwrap();
         incompressible.finish().unwrap();
         assert!(matches!(
@@ -5726,15 +7305,232 @@ mod tests {
     }
 
     #[test]
+    fn compression_probe_selects_shuffle_from_observed_timestamp_bytes() {
+        let timestamps = (0..32_768i64)
+            .flat_map(|value| (1_700_000_000_000_000i64 + value * 1_000).to_le_bytes())
+            .collect::<Vec<_>>();
+        let mut column = EncodedColumn::new(Some(8), WireCompression::None);
+        column.push(&timestamps).unwrap();
+        column.finish().unwrap();
+
+        assert_eq!(
+            column.compression,
+            CompressionMode::Enabled(CompressionTransform::Shuffle(8))
+        );
+        assert!(column.stored_bytes() < timestamps.len() / 4);
+    }
+
+    #[test]
+    fn compression_probe_rejects_random_fixed_width_bytes() {
+        let mut state = 0x9e3779b97f4a7c15u64;
+        let values = (0..32_768)
+            .flat_map(|_| {
+                state ^= state << 7;
+                state ^= state >> 9;
+                state ^= state << 8;
+                state.to_le_bytes()
+            })
+            .collect::<Vec<_>>();
+        let mut column = EncodedColumn::new(Some(8), WireCompression::None);
+        column.push(&values).unwrap();
+        column.finish().unwrap();
+
+        assert_eq!(column.compression, CompressionMode::Disabled);
+        assert_eq!(column.stored_bytes(), values.len());
+    }
+
+    #[test]
+    fn compression_probe_selects_each_column_independently() {
+        let timestamps = arrow_array::TimestampMicrosecondArray::from_iter_values(
+            (0..32_768).map(|value| 1_700_000_000_000_000i64 + value * 1_000),
+        );
+        let mut state = 0x9e3779b97f4a7c15u64;
+        let random = Int64Array::from_iter_values((0..32_768).map(|_| {
+            state ^= state << 7;
+            state ^= state >> 9;
+            state ^= state << 8;
+            state as i64
+        }));
+        let batch = RecordBatch::try_from_iter([
+            ("time", Arc::new(timestamps) as ArrayRef),
+            ("value", Arc::new(random) as ArrayRef),
+        ])
+        .unwrap();
+        let schema = batch.schema();
+        let estimated = estimated_batch_size(&schema, &batch).unwrap();
+        let mut window = EncodedIngestWindow::for_schema(&schema, WireCompression::None).unwrap();
+        window
+            .append(
+                &schema,
+                vec![PendingBatch {
+                    batch,
+                    estimated_bytes: estimated,
+                    compaction_level: 0,
+                }],
+                estimated,
+            )
+            .unwrap();
+        window.finish().unwrap();
+
+        assert_eq!(
+            window.columns[0].compression,
+            CompressionMode::Enabled(CompressionTransform::Shuffle(12))
+        );
+        assert_eq!(window.columns[1].compression, CompressionMode::Disabled);
+    }
+
+    #[test]
+    fn compression_falls_back_when_the_sample_does_not_represent_the_tail() {
+        let mut column = EncodedColumn::new(Some(8), WireCompression::None);
+        column.push(&vec![0; ENCODE_CHUNK_BYTES]).unwrap();
+        assert!(matches!(column.compression, CompressionMode::Enabled(_)));
+
+        let mut state = 0x9e3779b97f4a7c15u64;
+        let tail = (0..ENCODE_CHUNK_BYTES / 8)
+            .flat_map(|_| {
+                state ^= state << 7;
+                state ^= state >> 9;
+                state ^= state << 8;
+                state.to_le_bytes()
+            })
+            .collect::<Vec<_>>();
+        column.push(&tail).unwrap();
+        column.finish().unwrap();
+
+        assert_eq!(column.compression, CompressionMode::Disabled);
+        assert!(matches!(column.chunks[0], EncodedChunk::Lz4 { .. }));
+        assert!(matches!(column.chunks[1], EncodedChunk::Raw(_)));
+    }
+
+    struct CollectingUploadSink {
+        bytes: Vec<u8>,
+    }
+
+    impl monetdb::UploadSink for CollectingUploadSink {
+        fn write_chunk(&mut self, data: &[u8]) -> std::result::Result<(), monetdb::CursorError> {
+            self.bytes.extend_from_slice(data);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn retained_encoder_streams_multiple_chunks_without_deadlock() {
+        let values = Int64Array::from_iter_values(0..400_000);
+        let batch = RecordBatch::try_from_iter([("value", Arc::new(values) as ArrayRef)]).unwrap();
+        let schema = batch.schema();
+        let (request, receiver, encoder) = start_retained_encoder(Arc::clone(&schema), vec![batch]);
+        let mut sink = CollectingUploadSink { bytes: Vec::new() };
+        let mut largest_chunk = 0;
+
+        request.send(0).unwrap();
+        let encoded = upload_retained_column(&receiver, 0, &mut sink, &mut largest_chunk).unwrap();
+        drop(request);
+        encoder.join().unwrap();
+
+        assert_eq!(encoded, sink.bytes.len());
+        assert_eq!(encoded, 400_000 * 8);
+        assert_eq!(largest_chunk, ENCODE_CHUNK_BYTES);
+    }
+
+    #[test]
+    fn retained_encoder_propagates_encode_errors_without_deadlock() {
+        let values = arrow_array::Float64Array::from(vec![1.0, f64::NAN]);
+        let batch = RecordBatch::try_from_iter([("value", Arc::new(values) as ArrayRef)]).unwrap();
+        let schema = batch.schema();
+        let (request, receiver, encoder) = start_retained_encoder(schema, vec![batch]);
+        let mut sink = CollectingUploadSink { bytes: Vec::new() };
+        let mut largest_chunk = 0;
+
+        request.send(0).unwrap();
+        let rejected =
+            upload_retained_column(&receiver, 0, &mut sink, &mut largest_chunk).unwrap_err();
+        drop(request);
+        encoder.join().unwrap();
+
+        assert!(rejected.to_string().contains("non-finite"));
+        assert!(sink.bytes.is_empty());
+    }
+
+    #[test]
+    fn retained_encoder_follows_the_server_column_order() {
+        let batch = RecordBatch::try_from_iter([
+            ("first", Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef),
+            ("second", Arc::new(Int64Array::from(vec![3, 4])) as ArrayRef),
+            ("third", Arc::new(Int64Array::from(vec![5, 6])) as ArrayRef),
+        ])
+        .unwrap();
+        let schema = batch.schema();
+        let (request, receiver, encoder) = start_retained_encoder(schema, vec![batch]);
+
+        for (index, expected) in [(2, [5i64, 6i64]), (0, [1i64, 2i64]), (1, [3i64, 4i64])] {
+            request.send(index).unwrap();
+            let mut sink = CollectingUploadSink { bytes: Vec::new() };
+            let mut largest_chunk = 0;
+            let encoded =
+                upload_retained_column(&receiver, index, &mut sink, &mut largest_chunk).unwrap();
+            let expected = expected
+                .into_iter()
+                .flat_map(i64::to_le_bytes)
+                .collect::<Vec<_>>();
+            assert_eq!(encoded, expected.len());
+            assert_eq!(sink.bytes, expected);
+        }
+
+        drop(request);
+        encoder.join().unwrap();
+    }
+
+    proptest! {
+        #[test]
+        fn shuffle_round_trips_arbitrary_fixed_width_values(
+            width in prop::sample::select(vec![1usize, 2, 4, 8, 12, 16]),
+            format in prop::sample::select(vec![CompressionFormat::Block, CompressionFormat::Frame]),
+            input in prop::collection::vec(any::<u8>(), 0..4096),
+        ) {
+            let (compressed, compressed_len) =
+                compress_bytes(&input, CompressionTransform::Shuffle(width), format).unwrap();
+            let mut decoded = vec![0; input.len()];
+            match format {
+                CompressionFormat::Block => {
+                    let written = lz4_flex::block::decompress_into(
+                        &compressed[..compressed_len],
+                        &mut decoded,
+                    )
+                    .unwrap();
+                    prop_assert_eq!(written, input.len());
+                }
+                CompressionFormat::Frame => {
+                    decompress_frame_into(&compressed[..compressed_len], &mut decoded).unwrap();
+                }
+            }
+            let mut restored = vec![0; input.len()];
+            unshuffle_bytes(&decoded, width, &mut restored);
+            prop_assert_eq!(restored, input);
+        }
+    }
+
+    #[test]
     fn incompressible_windows_are_bounded_unless_rows_are_explicit() {
         let mut window = EncodedIngestWindow::new(0);
         window.retain_arrow = true;
         window.estimated_bytes = INCOMPRESSIBLE_WRITE_WINDOW_BYTES - 1;
-        assert!(!should_finish_incompressible_window(None, &window));
+        assert!(!should_finish_incompressible_window(
+            None,
+            INCOMPRESSIBLE_WRITE_WINDOW_BYTES,
+            &window
+        ));
 
         window.estimated_bytes = INCOMPRESSIBLE_WRITE_WINDOW_BYTES;
-        assert!(should_finish_incompressible_window(None, &window));
-        assert!(!should_finish_incompressible_window(Some(100_000), &window));
+        assert!(should_finish_incompressible_window(
+            None,
+            INCOMPRESSIBLE_WRITE_WINDOW_BYTES,
+            &window
+        ));
+        assert!(!should_finish_incompressible_window(
+            Some(100_000),
+            INCOMPRESSIBLE_WRITE_WINDOW_BYTES,
+            &window
+        ));
     }
 
     #[test]
@@ -5750,7 +7546,9 @@ mod tests {
             &mut reader,
             schema,
             DEFAULT_WRITE_WINDOW_BYTES,
+            INCOMPRESSIBLE_WRITE_WINDOW_BYTES,
             Some(1_000_000),
+            WireCompression::None,
         );
 
         let window = scheduler.next_window().unwrap().unwrap();
@@ -5759,6 +7557,69 @@ mod tests {
         assert!(window.columns[0].chunks.len() <= 128);
         assert_eq!(scheduler.input_batches, 1_000_000);
         assert!(scheduler.next_window().unwrap().is_none());
+    }
+
+    #[test]
+    fn ingest_window_prefetch_builds_the_next_window_before_it_is_requested() {
+        let batch = RecordBatch::try_from_iter([(
+            "value",
+            Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+        )])
+        .unwrap();
+        let schema = batch.schema();
+        let (signal, signals) = std::sync::mpsc::channel();
+        let reader = SignallingReader {
+            batch,
+            schema: Arc::clone(&schema),
+            offset: 0,
+            signal,
+        };
+        let windows = start_ingest_window_prefetch(
+            Box::new(reader),
+            schema,
+            8,
+            8,
+            None,
+            WireCompression::None,
+        )
+        .unwrap();
+
+        assert_eq!(windows.next_window().unwrap().unwrap().rows, 1);
+        signals.recv_timeout(Duration::from_secs(1)).unwrap();
+        signals.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(windows.finish().unwrap().input_batches, 2);
+    }
+
+    #[test]
+    fn ingest_window_prefetch_reports_reader_panics_without_deadlocking() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let windows = start_ingest_window_prefetch(
+            Box::new(PanickingReader {
+                schema: Arc::clone(&schema),
+            }),
+            schema,
+            8,
+            8,
+            None,
+            WireCompression::None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            windows
+                .next_window()
+                .err()
+                .expect("prefetch must fail")
+                .status,
+            Status::Internal
+        );
+        let panic = windows.finish().err().expect("prefetch join must fail");
+        assert_eq!(panic.status, Status::Internal);
+        assert!(panic.message.contains("panicked"));
     }
 
     #[test]
@@ -5773,8 +7634,14 @@ mod tests {
         .unwrap();
         let schema = batch.schema();
         let mut reader = SlicedBatchReader::new(batch, rows / 32);
-        let mut scheduler =
-            IngestWindowScheduler::new(&mut reader, schema, DEFAULT_WRITE_WINDOW_BYTES, Some(rows));
+        let mut scheduler = IngestWindowScheduler::new(
+            &mut reader,
+            schema,
+            DEFAULT_WRITE_WINDOW_BYTES,
+            INCOMPRESSIBLE_WRITE_WINDOW_BYTES,
+            Some(rows),
+            WireCompression::None,
+        );
 
         let window = scheduler.next_window().unwrap().unwrap();
 
@@ -5805,8 +7672,14 @@ mod tests {
             Arc::clone(&schema),
         );
         let budget = 16 * 1_024;
-        let mut scheduler =
-            IngestWindowScheduler::new(&mut reader, Arc::clone(&schema), budget, None);
+        let mut scheduler = IngestWindowScheduler::new(
+            &mut reader,
+            Arc::clone(&schema),
+            budget,
+            budget,
+            None,
+            WireCompression::None,
+        );
         let mut windows = Vec::new();
         while let Some(window) = scheduler.next_window().unwrap() {
             windows.push((window.rows, window.estimated_bytes));
@@ -5830,8 +7703,14 @@ mod tests {
         let schema = batch.schema();
         let mut reader = SlicedBatchReader::new(batch, 2);
         let budget = 16 * 1024;
-        let mut scheduler =
-            IngestWindowScheduler::new(&mut reader, Arc::clone(&schema), budget, None);
+        let mut scheduler = IngestWindowScheduler::new(
+            &mut reader,
+            Arc::clone(&schema),
+            budget,
+            budget,
+            None,
+            WireCompression::None,
+        );
 
         let oversized = scheduler.next_window().unwrap().unwrap();
         let following = scheduler.next_window().unwrap().unwrap();
