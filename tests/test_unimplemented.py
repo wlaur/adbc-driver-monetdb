@@ -44,7 +44,7 @@ def test_cross_catalog_ingest_is_not_implemented(monetdb_uri: str) -> None:
 
 
 @pytest.mark.integration
-def test_legacy_inet_ingest_is_not_implemented(monetdb_uri: str) -> None:
+def test_unsized_inet_ingest_is_not_implemented(monetdb_uri: str) -> None:
     field = pa.field(
         "address",
         pa.string(),

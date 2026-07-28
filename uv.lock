@@ -45,7 +45,7 @@ wheels = [
 
 [[package]]
 name = "adbc-driver-monetdb"
-version = "0.8.9"
+version = "0.9.0"
 source = { editable = "." }
 dependencies = [
     { name = "adbc-driver-manager" },
@@ -65,6 +65,7 @@ dev = [
     { name = "adbc-drivers-validation" },
     { name = "cryptography" },
     { name = "maturin" },
+    { name = "numpy" },
     { name = "pandas" },
     { name = "pandas-stubs" },
     { name = "polars" },
@@ -91,6 +92,7 @@ dev = [
     { name = "adbc-drivers-validation", git = "https://github.com/adbc-drivers/validation?rev=a4019a3f44ccffcbec4b5203531a88259d588257" },
     { name = "cryptography", specifier = ">=45" },
     { name = "maturin", specifier = ">=1.8.2,<2" },
+    { name = "numpy", specifier = ">=2" },
     { name = "pandas", specifier = ">=3.0" },
     { name = "pandas-stubs", specifier = ">=3.0.3.260530" },
     { name = "polars", specifier = ">=1.42" },

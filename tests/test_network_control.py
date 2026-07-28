@@ -287,6 +287,7 @@ def test_statement_write_timeout_bounds_stalled_copy_upload() -> None:
                 StatementOptions.READ_TIMEOUT: 30,
                 StatementOptions.WRITE_TIMEOUT: 1,
                 StatementOptions.OPERATION_TIMEOUT: 0,
+                StatementOptions.WIRE_COMPRESSION: "none",
             }
         ) as cursor,
     ):

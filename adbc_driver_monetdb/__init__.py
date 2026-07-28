@@ -2,6 +2,7 @@
 
 from enum import StrEnum
 from importlib.metadata import PackageNotFoundError, version
+from typing import Literal, TypedDict
 
 from adbc_driver_monetdb import _native
 from adbc_driver_monetdb.arrow import (
@@ -33,6 +34,10 @@ class DatabaseOptions(StrEnum):
     CLIENT_APPLICATION = "adbc.monetdb.client_application"
     CLIENT_REMARK = "adbc.monetdb.client_remark"
     CLIENT_INFO = "adbc.monetdb.client_info"
+    WRITE_WINDOW_BYTES = "adbc.monetdb.write_window_bytes"
+    INGEST_INSERT_ROWS = "adbc.monetdb.ingest_insert_rows"
+    PREPARED_CACHE_CAPACITY = "adbc.monetdb.prepared_cache_capacity"
+    WIRE_COMPRESSION = "adbc.monetdb.wire_compression"
 
 
 class ConnectionOptions(StrEnum):
@@ -43,6 +48,9 @@ class ConnectionOptions(StrEnum):
     READ_PREFETCH = "adbc.monetdb.read_prefetch"
     WRITE_BATCH_ROWS = "adbc.monetdb.write_batch_rows"
     WRITE_WINDOW_BYTES = "adbc.monetdb.write_window_bytes"
+    INGEST_INSERT_ROWS = "adbc.monetdb.ingest_insert_rows"
+    PREPARED_CACHE_CAPACITY = "adbc.monetdb.prepared_cache_capacity"
+    WIRE_COMPRESSION = "adbc.monetdb.wire_compression"
     INGEST_PARTIAL = "adbc.monetdb.ingest_partial"
     INGEST_ATOMICITY = "adbc.monetdb.ingest_atomicity"
 
@@ -55,9 +63,67 @@ class StatementOptions(StrEnum):
     READ_PREFETCH = "adbc.monetdb.read_prefetch"
     WRITE_BATCH_ROWS = "adbc.monetdb.write_batch_rows"
     WRITE_WINDOW_BYTES = "adbc.monetdb.write_window_bytes"
+    INGEST_INSERT_ROWS = "adbc.monetdb.ingest_insert_rows"
+    WIRE_COMPRESSION = "adbc.monetdb.wire_compression"
     INGEST_PARTIAL = "adbc.monetdb.ingest_partial"
     INGEST_ATOMICITY = "adbc.monetdb.ingest_atomicity"
     INGEST_STATS = "adbc.monetdb.ingest_stats"
+
+
+DatabaseOptionValues = TypedDict(
+    "DatabaseOptionValues",
+    {
+        "username": str,
+        "password": str,
+        "adbc.monetdb.connect_timeout_seconds": str | int,
+        "adbc.monetdb.read_timeout_seconds": str | int,
+        "adbc.monetdb.write_timeout_seconds": str | int,
+        "adbc.monetdb.operation_timeout_seconds": str | int,
+        "adbc.monetdb.client_application": str,
+        "adbc.monetdb.client_remark": str,
+        "adbc.monetdb.client_info": str | bool,
+        "adbc.monetdb.write_window_bytes": str | int,
+        "adbc.monetdb.ingest_insert_rows": str | int,
+        "adbc.monetdb.prepared_cache_capacity": str | int,
+        "adbc.monetdb.wire_compression": Literal["none", "auto", "lz4"],
+    },
+    total=False,
+)
+ConnectionOptionValues = TypedDict(
+    "ConnectionOptionValues",
+    {
+        "adbc.monetdb.read_timeout_seconds": str | int,
+        "adbc.monetdb.write_timeout_seconds": str | int,
+        "adbc.monetdb.operation_timeout_seconds": str | int,
+        "adbc.monetdb.read_batch_rows": str | int,
+        "adbc.monetdb.read_prefetch": str | bool,
+        "adbc.monetdb.write_batch_rows": str | int,
+        "adbc.monetdb.write_window_bytes": str | int,
+        "adbc.monetdb.ingest_insert_rows": str | int,
+        "adbc.monetdb.prepared_cache_capacity": str | int,
+        "adbc.monetdb.wire_compression": Literal["none", "auto", "lz4"],
+        "adbc.monetdb.ingest_partial": Literal["block", "allow"],
+        "adbc.monetdb.ingest_atomicity": Literal["transaction", "savepoint"],
+    },
+    total=False,
+)
+StatementOptionValues = TypedDict(
+    "StatementOptionValues",
+    {
+        "adbc.monetdb.read_timeout_seconds": str | int,
+        "adbc.monetdb.write_timeout_seconds": str | int,
+        "adbc.monetdb.operation_timeout_seconds": str | int,
+        "adbc.monetdb.read_batch_rows": str | int,
+        "adbc.monetdb.read_prefetch": str | bool,
+        "adbc.monetdb.write_batch_rows": str | int,
+        "adbc.monetdb.write_window_bytes": str | int,
+        "adbc.monetdb.ingest_insert_rows": str | int,
+        "adbc.monetdb.wire_compression": Literal["none", "auto", "lz4"],
+        "adbc.monetdb.ingest_partial": Literal["block", "allow"],
+        "adbc.monetdb.ingest_atomicity": Literal["transaction", "savepoint"],
+    },
+    total=False,
+)
 
 
 def driver_path() -> str:
@@ -78,9 +144,12 @@ __all__ = [
     "DEFAULT_POLARS_BATCH_BYTES",
     "DEFAULT_POLARS_BATCH_ROWS",
     "ENTRYPOINT",
+    "ConnectionOptionValues",
     "ConnectionOptions",
+    "DatabaseOptionValues",
     "DatabaseOptions",
     "PolarsArrowStream",
+    "StatementOptionValues",
     "StatementOptions",
     "__version__",
     "driver_path",
