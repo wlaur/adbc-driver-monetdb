@@ -181,16 +181,14 @@ timeout. Use `adbc_cancel()` when session destruction is intended, or set
 `adbc.monetdb.read_prefetch` to `"false"` when prompt pool reuse matters more than fetch/decode
 overlap.
 
-Ingestion automatically chooses the fewest COPY windows that fit a 512 MiB encoded-byte budget.
-For constrained append targets whose fixed-width wire rows are at most 16 bytes, the budget is
-raised to 2 GiB.
+Ingestion uses a 512 MiB logical encoded-byte window. For constrained append targets whose
+fixed-width wire rows are at most 16 bytes, the logical target is 2 GiB to avoid repeated index
+maintenance.
 The driver measures every upstream Arrow batch, coalesces small batches, and splits large ones
 without copying their buffers so each window stays within the byte budget. A single row larger
 than the budget is the only possible overrun. Tiered compaction keeps metadata bounded without
-repeatedly recopying the accumulated tail. The narrow-row constraint budget avoids repeated index
-maintenance across tens of millions of rows without imposing the larger memory bound on
-variable-width, wide, or ordinary append-only tables. On Linux both ceilings are reduced to a
-fixed fraction of a finite cgroup memory limit when needed.
+repeatedly recopying the accumulated tail. Every automatic logical target is capped by a fraction
+of the lower of the host's physical memory and a finite cgroup limit.
 
 Each requested column is encoded directly into bounded 1 MiB encoder chunks, which the protocol
 layer coalesces into 16 MiB upload messages; null-free signed integers and 32/64-bit floats borrow
@@ -199,28 +197,38 @@ MAPI headers with the borrowed message payload instead of constructing another m
 buffer, so the reported conservative streaming-buffer peak is about 17 MiB plus framing headers,
 independent of logical window size.
 
-Large logical windows do not imply equally large resident staging buffers. With
-`wire_compression=none`, each new window samples up to 256 KiB per column and compares ordinary
+Large logical windows do not imply equally large resident staging buffers. Arrow input is encoded
+in groups of at most 16 MiB. Each new window samples up to 256 KiB per column and compares ordinary
 LZ4 compression with byte-plane shuffle followed by LZ4 for fixed-width values. It retains the
 smaller representation only when compression saves at least 12.5%. Selection follows the
 observed bytes, not a type-name or sortedness heuristic; timestamp and smooth numeric byte
-patterns consequently benefit while random values do not. `auto` probes plain LZ4 so profitable
-frames can be sent directly, while `lz4` forces that framed representation. During upload, at
-most one 1 MiB encoded piece is decompressed and
-unshuffled into reusable anonymous mappings before it is passed to the normal MonetDB binary
-protocol. Process-local chunks use direct LZ4 blocks to avoid frame construction and an extra
-copy; wire-eligible chunks use LZ4 frames. Neither representation is an on-disk cache.
+patterns consequently benefit while random values do not. `auto` and `none` both allow shuffled
+client storage; `auto` sends frames directly only when every column independently qualifies as
+plain LZ4. `lz4` forces the wire representation and therefore does not shuffle. During upload, at
+most one 1 MiB encoded piece is decompressed and unshuffled into reusable anonymous mappings
+before it is passed to the normal MonetDB binary protocol. Compression and shuffle reuse one
+workspace on the prefetch thread. Finished compressed bytes are copied into 16 MiB anonymous
+arena slabs owned by that window, bounding allocator metadata and avoiding one allocation or
+mapping per column chunk. Client-only chunks use direct LZ4 blocks; wire-eligible chunks use LZ4
+frames. Neither representation is an on-disk cache.
 
-If a column stops meeting the savings threshold, it falls back to raw retention; if the window as
-a whole is not materially compressible, the driver retains later Arrow batches and encodes
-bounded pieces on a worker while earlier pieces upload. On a low-latency target it
-automatically closes that window at 64 MiB. A connection metadata round trip of at least 0.5 ms,
-or a table with at least 512 columns, raises this floor to the effective 512 MiB budget because
-each additional COPY window otherwise repeats per-column network exchanges or wide server-plan
-compilation. A local random-float calibration found the larger floor neutral at 100 columns and
-15–36% faster from 200 through 1,000 columns. The 512-column cutoff keeps the tighter default
-memory bound for medium-width tables while retaining the 33–36% gain measured from 512 through
-1,000 columns. The measured round trip and chosen floor are reported in ingest stats.
+If a column stops meeting the savings threshold, it falls back to raw retention. For a window
+that is not materially compressible, null-free batches may remain in Arrow form and be encoded in
+bounded pieces on a worker while earlier pieces upload. Batches containing nulls stay in the raw
+encoded form instead, avoiding deferred null-sentinel conversion on the upload path. Below the
+5 ms remote-link threshold, incompressible windows close at 64 MiB and every window closes once
+its physical retained storage reaches 128 MiB. Schemas with at least 512 columns use a tighter
+48 MiB local physical limit, which also bounds their incompressible windows. Compressible data can
+consequently fill more of the 512 MiB logical window without increasing the physical bound. Above
+the threshold, both physical limits rise to the effective logical target to avoid repeating
+per-column exchanges. The measured round trip, schema-sensitive physical limit, and all three
+effective budgets are reported in ingest stats.
+
+On Linux, a finite cgroup limit also protects concurrent ingests before their prefetch workers
+allocate memory. Each active ingest reserves two physical windows, two staging groups, and 64 MiB
+of producer headroom against 90% of the cgroup limit. A request that does not fit is returned as
+an ADBC error; its connection is not killed by the cgroup OOM handler. Reservations are
+process-wide and are released on success or failure.
 
 Compared with an application that stages complete column files on disk, a very wide,
 incompressible stream may consequently produce more COPY windows and use more MonetDB memory while
@@ -229,21 +237,21 @@ in client RAM; spilling the encoded columns would recreate the disk-staging path
 cap deliberately favors bounded client memory and no staging files. Compressible streams avoid
 this tradeoff because their large logical windows remain small in physical memory.
 
-`adbc.monetdb.write_window_bytes` changes both the main byte budget and the incompressible-data
-floor; zero selects the automatic default. `adbc.monetdb.write_batch_rows` remains a diagnostic
-row-count override and disables byte-window adaptation. Both options can be set on a connection
-or statement, with statement values taking precedence. `write_window_bytes` is also accepted as a
-URI query parameter for applications whose only configuration surface is a connection URI.
-Applications normally need none of these: producer batch boundaries do not define COPY
-boundaries.
+`adbc.monetdb.write_window_bytes` changes the logical, physical, and incompressible-data budgets
+together; zero selects the automatic defaults. `adbc.monetdb.write_batch_rows` remains a
+diagnostic row-count override and disables byte-window adaptation. Both options can be set on a
+connection or statement, with statement values taking precedence. `write_window_bytes` is also
+accepted as a URI query parameter for applications whose only configuration surface is a
+connection URI. Applications normally need none of these: producer batch boundaries do not
+define COPY boundaries.
 
 MonetDB Dec2025 and newer can decompress LZ4 frames during client COPY. The default
 `adbc.monetdb.wire_compression=auto` sends a window's plain LZ4 frames on the wire only when every
-column passed the compression threshold; otherwise it retains Arrow and sends ordinary binary
-COPY. This avoids weak client-only compression on mixed time-series data while still reusing
-profitable frames for compressible windows. Byte-shuffled blocks remain client-local because the
-server does not undo that transform. Set the option to `lz4` to compress every column for a
-bandwidth-constrained link, or `none` to prefer the lower-memory client-only shuffle path. The
+column passed the compression threshold; otherwise it sends ordinary binary COPY from compressed,
+raw, or retained-Arrow client storage. Byte-shuffled blocks remain client-local because the server
+does not undo that transform.
+Set the option to `lz4` to compress every column for a bandwidth-constrained link, or `none` to
+disable wire compression while retaining the same client-storage probe. The
 option is accepted at database, connection, and statement scope and as `wire_compression` in the
 URI. Ingest stats report the choice for every window in `window_wire_compression`.
 
@@ -260,34 +268,47 @@ mixing explicit identity values with generated ones must manage that sequence.
 After an ingest, the read-only statement option `adbc.monetdb.ingest_stats` returns JSON containing
 the chosen path, measured round trip, effective INSERT threshold, logical and physical stored
 bytes, storage and wire-compression mode per window, prepared-cache hits, input-batch and COPY
-counts, coalesced/split window counts, bounded in-flight bytes, window trajectories, transaction
-scope, and poison state.
+counts, coalesced/split window counts, and transaction scope. Physical-memory fields include
+per-window stored, staging, retained-Arrow pinned, and scratch bytes plus single-window and
+prefetch-overlap high-water estimates.
 
 Window construction runs one logical window ahead of the active COPY on a zero-capacity handoff.
 This overlaps Arrow production and encoding with the current upload while bounding lookahead to
 one window. Reader failures and worker panics are joined and returned before ingest completion.
 
-Polars lazy queries do not expose an Arrow stream directly. Install the optional integration with
-`uv add 'adbc-driver-monetdb[polars]'` and wrap the query in the fully backpressured
-`PolarsArrowStream`. Its default producer batches are bounded independently of the driver's exact
-encoded-byte windows:
+For Parquet input, install `adbc-driver-monetdb[pyarrow]` and use
+`ParquetArrowStream`. It decodes one physical row group at a time and bounds emitted batches by
+rows and estimated bytes. Long streams ask PyArrow's allocator to return unused pages after every
+2 GiB of decoded row-group data, and every stream does so when it finishes or closes. Set
+`reclaim_bytes=None` to disable interval reclamation; reclaiming after each small row group can
+materially reduce throughput. Path inputs use an owned PyArrow `OSFile` instead of mapping the
+whole Parquet file. Column-parallel decoding is an explicit `use_threads=True` opt-in; the default
+keeps decoding and the driver's compression worker from competing for CPU and memory.
 
 ```python
-import polars as pl
-
-from adbc_driver_monetdb import PolarsArrowStream, dbapi
-
-frame = pl.scan_parquet("trades/*.parquet")
+from adbc_driver_monetdb import ParquetArrowStream, dbapi
 
 with dbapi.connect("monetdb://localhost:50000/db") as connection:
     with connection.cursor() as cursor:
-        stream = PolarsArrowStream(frame)
-        inserted_rows = cursor.adbc_ingest("trades", stream, mode="append")
-        assert inserted_rows == stream.rows_read
+        with ParquetArrowStream(
+            "trades.parquet",
+            epoch_columns={"observed_at": "ms"},
+        ) as stream:
+            inserted_rows = cursor.adbc_ingest("trades", stream, mode="append")
+            assert inserted_rows == stream.num_rows
 ```
 
-The base driver remains importable without Polars or PyArrow. Install
-`adbc-driver-monetdb[pyarrow]` for PyArrow-specific driver-manager APIs without the Polars adapter.
+`epoch_columns` can reinterpret nullable integer columns as Arrow timestamps in seconds,
+milliseconds, microseconds, or nanoseconds, or as day-based Arrow dates. Values and nulls are
+preserved and transformed batch by batch, so files with integer epoch storage do not need an
+eager Polars conversion.
+
+`PolarsArrowStream` remains useful for non-Parquet lazy pipelines. Its capacity-one handoff is
+backpressured, but Polars 1.43's Parquet source can decode ahead proportional to the dataset even
+when the sink is blocked. `POLARS_ROW_GROUP_PREFETCH_SIZE=1` reduces that read-ahead but does not
+make it strictly bounded; prefer `ParquetArrowStream` for Parquet until Polars exposes a source
+memory budget ([Polars issue #28569](https://github.com/pola-rs/polars/issues/28569)). The base
+driver remains importable without either optional dependency.
 
 An append to an existing table inside an explicit transaction executes directly for every Arrow
 stream window. This avoids MonetDB retaining and replaying a full table version for an operation
@@ -348,7 +369,9 @@ uv run pytest tests/test_local_benchmark.py::test_local_short_query_latency_agai
 
 The examples use strings because `adbc-driver-manager` publishes string-valued type hints for
 database and connection option mappings. Statement options also accept native integers through the
-ADBC integer option path.
+ADBC integer option path. `DatabaseOptionValues`, `ConnectionOptionValues`, and
+`StatementOptionValues` are optional `TypedDict` shapes for editor completion of driver-specific
+keys and accepted values; the corresponding `*Options` enums provide the runtime key constants.
 
 The DB-API module reports `threadsafety = 1`: threads may share the module, but each thread should
 use its own connection and cursors. Cancellation is connection-scoped: it interrupts the operation
@@ -361,7 +384,7 @@ close that connection and open another one before issuing more work.
 Client information is sent at login by default. The `client` value in
 [`sys.sessions`](https://www.monetdb.org/documentation-Dec2025/user-guide/sql-catalog/users-roles-privileges-sessions/)
 identifies this driver and its protocol library, for example
-`adbc_driver_monetdb 0.9.0 / monetdb-rust 0.2.2-wlaur.1`. The Python shim uses the basename of
+`adbc_driver_monetdb 0.9.1 / monetdb-rust 0.2.2-wlaur.1`. The Python shim uses the basename of
 `sys.argv[0]` as the default `application`. Hostname and process id are also sent by default, as
 they are by pymonetdb and libmapi; use `client_info=false` if that host metadata should not leave
 the client.

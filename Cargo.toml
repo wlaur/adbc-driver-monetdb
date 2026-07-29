@@ -6,7 +6,7 @@ members = ["crates/monetdb-arrow", "crates/adbc-monetdb"]
 exclude = ["monetdb-rust"]
 
 [workspace.package]
-version = "0.9.0"
+version = "0.9.1"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/wlaur/adbc-driver-monetdb"
@@ -19,9 +19,11 @@ adbc_ffi = { git = "https://github.com/wlaur/arrow-adbc", rev = "5fc505640f1c445
 # adbc_core/adbc_ffi 0.23 require arrow >=53.1,<59 -- one arrow major per workspace
 arrow-array = "58"
 arrow-buffer = "58"
+arrow-data = "58"
 arrow-schema = "58"
 arrow-select = "58"
 chrono = "0.4"
+libc = "0.2"
 memchr = "2"
 memmap2 = "0.9"
 lz4_flex = "0.13"

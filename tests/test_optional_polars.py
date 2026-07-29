@@ -26,6 +26,12 @@ def test_base_package_imports_without_polars_or_pyarrow() -> None:
             assert "adbc-driver-monetdb[polars]" in str(exc)
         else:
             raise AssertionError("constructing PolarsArrowStream should require the optional extra")
+        try:
+            adbc_driver_monetdb.ParquetArrowStream(None)
+        except ModuleNotFoundError as exc:
+            assert "adbc-driver-monetdb[pyarrow]" in str(exc)
+        else:
+            raise AssertionError("constructing ParquetArrowStream should require PyArrow")
         """
     )
 

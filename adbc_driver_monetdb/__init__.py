@@ -10,6 +10,12 @@ from adbc_driver_monetdb.arrow import (
     DEFAULT_ARROW_BATCH_ROWS,
     recommended_arrow_batch_rows,
 )
+from adbc_driver_monetdb.parquet import (
+    DEFAULT_PARQUET_RECLAIM_BYTES,
+    ParquetArrowStream,
+    ParquetEpochUnit,
+    ParquetSource,
+)
 from adbc_driver_monetdb.polars import (
     DEFAULT_POLARS_BATCH_BYTES,
     DEFAULT_POLARS_BATCH_ROWS,
@@ -141,6 +147,7 @@ def driver_path() -> str:
 __all__ = [
     "DEFAULT_ARROW_BATCH_BYTES",
     "DEFAULT_ARROW_BATCH_ROWS",
+    "DEFAULT_PARQUET_RECLAIM_BYTES",
     "DEFAULT_POLARS_BATCH_BYTES",
     "DEFAULT_POLARS_BATCH_ROWS",
     "ENTRYPOINT",
@@ -148,6 +155,9 @@ __all__ = [
     "ConnectionOptions",
     "DatabaseOptionValues",
     "DatabaseOptions",
+    "ParquetArrowStream",
+    "ParquetEpochUnit",
+    "ParquetSource",
     "PolarsArrowStream",
     "StatementOptionValues",
     "StatementOptions",

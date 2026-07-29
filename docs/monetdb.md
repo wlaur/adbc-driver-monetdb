@@ -51,34 +51,45 @@ interrupt whichever statement currently owns the connection; open a new connecti
 
 ## Bulk ingestion
 
-The driver measures and coalesces producer batches into COPY windows using a 512 MiB encoded-byte
-budget, raised to 2 GiB for constrained append targets with fixed-width wire rows no larger than
-16 bytes, then streams each requested column in bounded messages. Oversized producer batches are
-split without copying, and a single row larger than the configured budget is the only possible
-overrun. Producer batch size therefore does not need to match the driver window. This avoids
-repeated index maintenance across tens of millions of narrow rows while wide, variable-width, and
-ordinary append-only tables retain the smaller bound. In finite Linux cgroups, the ceilings are
-reduced to one eighth and one quarter of the limit, respectively. The connection and statement
-option `adbc.monetdb.write_window_bytes` changes the byte budget and the incompressible-data floor;
+The driver measures and coalesces producer batches into COPY windows using a 512 MiB logical
+encoded-byte target. Below 5 ms measured round trip, physical retained storage is limited to
+128 MiB and incompressible windows close at 64 MiB. Schemas with at least 512 columns use 48 MiB
+for both local limits. Above 5 ms, the physical limits rise to the logical target. Constrained
+append rows no larger than 16 bytes use a 2 GiB logical target to avoid repeated index
+maintenance. Every logical target is capped by a fraction of the lower of physical memory and a
+finite cgroup limit. Oversized producer batches are split without copying, and a single row larger
+than the configured budget is the only possible overrun. Producer batch size therefore does not
+need to match the driver window. The connection and statement option
+`adbc.monetdb.write_window_bytes` changes all three budgets together;
 the diagnostic `adbc.monetdb.write_batch_rows` option forces an exact row count instead. On
-automatic settings, measured network latency and very wide tables raise the 64 MiB incompressible
-floor to avoid repeating per-column COPY exchanges and server-plan compilation. The local-width
-cutoff is 512 columns, selected conservatively from a repeated 100–1,000-column calibration.
+automatic settings, measured round trips of at least 5 ms raise both physical limits to the
+effective logical window.
 
-With `wire_compression=none`, each window samples up to 256 KiB per column and chooses between
-ordinary LZ4 and byte-plane shuffle plus LZ4 from the observed bytes. `auto` probes plain LZ4 so a
-profitable frame can go directly to the server, while `lz4` forces that representation.
+Each window samples up to 256 KiB per column and chooses between ordinary LZ4 and byte-plane
+shuffle plus LZ4 from the observed bytes. `auto` and `none` both allow shuffled client storage;
+`auto` independently uses the wire path only if every column is plain LZ4, while `lz4` forces
+that representation.
 Compressible streams can release their Arrow batches while filling the logical window.
-Incompressible later batches stay as Arrow and are encoded in bounded pieces on a worker while
-earlier pieces upload. Client-only retention uses direct LZ4 blocks; wire-eligible data uses LZ4
-frames. The compressed form is never persisted.
+Incompressible null-free batches can stay as Arrow and are encoded in bounded pieces on a worker
+while earlier pieces upload; batches with nulls remain as raw encoded chunks to avoid deferred
+null-sentinel conversion. Input staging is limited to 16 MiB of logical encoded data. Client-only
+retention uses direct LZ4 blocks; wire-eligible data uses LZ4 frames. The compressed form is never
+persisted. Shuffle and compression reuse one prefetch-thread workspace, and finished pieces are
+packed into 16 MiB anonymous arena slabs owned by the window. This bounds scratch space and
+allocator metadata even for thousands of compressible columns.
+
+Under a finite Linux cgroup limit, each active ingest reserves two physical windows, two staging
+groups, and 64 MiB of producer headroom against 90% of the limit before starting its prefetch
+worker. Concurrent work that cannot fit returns an ADBC error instead of invoking the cgroup OOM
+killer.
 
 The default `adbc.monetdb.wire_compression=auto` sends a window's plain LZ4 frames directly to
-MonetDB only when every column already benefits; otherwise it retains Arrow and sends ordinary
-binary COPY. `lz4` forces plain LZ4 for bandwidth-constrained links. `none` enables client-only
-byte shuffling for a lower-memory retention path; shuffled blocks are decoded locally because
-MonetDB does not reverse that transform. The same key is available as `wire_compression` in the
-URI, and `window_wire_compression` in ingest stats makes every per-window decision observable.
+MonetDB only when every column already benefits; otherwise it sends ordinary binary COPY from the
+selected client-storage representation. `lz4` forces plain LZ4 for bandwidth-constrained links.
+`none` enables client-only byte shuffling for a lower-memory retention path; shuffled blocks are
+decoded locally because MonetDB does not reverse that transform. The same key is available as
+`wire_compression` in the URI, and `window_wire_compression` in ingest stats makes every
+per-window decision observable.
 
 A complete single-batch ingest of at most 100 rows and 8 MiB uses the cached prepared INSERT path;
 the row threshold adapts upward on measured higher-latency connections. Set
@@ -91,8 +102,8 @@ accidentally committed. Advanced callers may set
 `adbc.monetdb.ingest_atomicity=savepoint` to roll back only the ingest, or
 `adbc.monetdb.ingest_partial=allow` to permit a partial commit. Statement option
 `adbc.monetdb.ingest_stats` returns post-execution JSON including the chosen path, measured round
-trip, effective thresholds, physical stored bytes, per-window storage and wire modes, and
-prepared-cache hits.
+trip, effective thresholds, physical stored, staging, retained-Arrow pinned, scratch, and overlap
+high-water bytes, per-window storage and wire modes, and prepared-cache hits.
 
 ## Client information
 

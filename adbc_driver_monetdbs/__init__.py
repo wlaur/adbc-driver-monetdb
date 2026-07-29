@@ -5,6 +5,9 @@ from adbc_driver_monetdb import (
     DEFAULT_ARROW_BATCH_ROWS as DEFAULT_ARROW_BATCH_ROWS,
 )
 from adbc_driver_monetdb import (
+    DEFAULT_PARQUET_RECLAIM_BYTES as DEFAULT_PARQUET_RECLAIM_BYTES,
+)
+from adbc_driver_monetdb import (
     DEFAULT_POLARS_BATCH_BYTES as DEFAULT_POLARS_BATCH_BYTES,
 )
 from adbc_driver_monetdb import (
@@ -24,6 +27,15 @@ from adbc_driver_monetdb import (
 )
 from adbc_driver_monetdb import (
     DatabaseOptionValues as DatabaseOptionValues,
+)
+from adbc_driver_monetdb import (
+    ParquetArrowStream as ParquetArrowStream,
+)
+from adbc_driver_monetdb import (
+    ParquetEpochUnit as ParquetEpochUnit,
+)
+from adbc_driver_monetdb import (
+    ParquetSource as ParquetSource,
 )
 from adbc_driver_monetdb import (
     PolarsArrowStream as PolarsArrowStream,
@@ -47,6 +59,7 @@ from adbc_driver_monetdb import (
 __all__ = [
     "DEFAULT_ARROW_BATCH_BYTES",
     "DEFAULT_ARROW_BATCH_ROWS",
+    "DEFAULT_PARQUET_RECLAIM_BYTES",
     "DEFAULT_POLARS_BATCH_BYTES",
     "DEFAULT_POLARS_BATCH_ROWS",
     "ENTRYPOINT",
@@ -54,6 +67,9 @@ __all__ = [
     "ConnectionOptions",
     "DatabaseOptionValues",
     "DatabaseOptions",
+    "ParquetArrowStream",
+    "ParquetEpochUnit",
+    "ParquetSource",
     "PolarsArrowStream",
     "StatementOptionValues",
     "StatementOptions",
