@@ -51,42 +51,67 @@ requirements change their premises.
 
 ## Result scheduling and memory
 
-- The read default remains 131,072 rows. Write scheduling is byte-based: a 512 MiB encoded budget,
-  raised to 2 GiB for constrained append targets with fixed-width wire rows no larger than 16
-  bytes. The ceilings are reduced to one eighth and one quarter, respectively, of a finite Linux
-  cgroup limit when needed. Every producer batch is measured from its Arrow buffers before it
+- The read default remains 131,072 rows. Write scheduling separates a 512 MiB logical encoded-byte
+  target from physical retained storage. Below a measured 5 ms round trip, ordinary schemas have
+  a 128 MiB physical limit and incompressible windows close at 64 MiB. Schemas with at least 512
+  columns use 48 MiB for both local limits; above 5 ms, both physical limits rise to the logical
+  target. Constrained append rows no larger than 16 bytes use a 2 GiB logical target. Logical
+  targets are capped at one eighth and one quarter, respectively, of the lower of host physical
+  memory and a finite cgroup limit. Every producer
+  batch is measured from its Arrow buffers before it
   enters the pending queue. Windows consume only batches and zero-copy slices whose measured wire
   size fits the remaining budget; a binary search finds the largest fitting slice of an oversized
   batch. A single encoded row larger than the budget is the only permitted overrun.
   Thirty-two equal-level pending batches are compacted at a time, bounding metadata while copying
   each row at most logarithmically even for streams of one-row batches. Full-suite calibration
   matters here: on Dec2025, repeatedly extending a multi-million-row table can dominate ingest
-  time because MonetDB maintains constraint indexes for each append. Constraint metadata and
-  fixed wire width are therefore queried only for automatic scheduling: very narrow constrained
-  tables get fewer maintenance rounds, while wide, variable-width, and ordinary append-only
-  tables retain the smaller memory bound. Boundaries stay independent of producer batching and an
-  exact-row diagnostic override remains available.
-- The 512 MiB default is measured rather than capacity-derived. On a 100-million-row
-  mixed-width population, 128 MiB reduced combined client/server peak RSS by 747 MiB but
-  increased duration from 361 to 401 seconds and peak farm/WAL storage from 47.7 to 50.2 GiB.
-  A chunked narrow-row population was insensitive to the same change. The explicit runtime
-  option remains available for memory-constrained applications, while the default favors the
-  cross-axis result across both shapes.
+  time because MonetDB maintains constraint indexes for each append. Constraint metadata and fixed
+  wire width are therefore inspected only for the 2 GiB logical class. Boundaries stay independent
+  of producer batching and an exact-row diagnostic override remains available.
+- The earlier unconditional 512 MiB physical default was rejected after the 764,331 × 786
+  time-series chain showed 1,585 MiB driver-only RSS and 3,271 MiB end-to-end client RSS. A
+  128 MiB retained-storage run used 505 MiB and added 1.5–2.2 seconds per 2.2 GiB locally. The
+  final 48 MiB wide-schema limit brought the paired time-series RSS below staged +20% while
+  leaving the ordinary 128 MiB path intact for TPC-DS and ClickBench. Keeping the 512 MiB logical
+  target preserves coalescing for compressible data. The RTT branch raises physical limits only
+  where repeated network exchanges dominate.
 - Logical ingest windows are decoupled from physical staging memory. Each encoded column starts by
-  applying LZ4 compression in bounded 1 MiB pieces stored in anonymous mappings. Client-only
-  retention uses direct blocks; wire-eligible compression uses frames.
+  applying LZ4 compression in bounded 1 MiB pieces. Shuffle and compression reuse one workspace
+  on the prefetch thread, while finished pieces are packed into 16 MiB anonymous arena slabs owned
+  by the window. Mapping every small piece was rejected after a 1,000-column compressible run
+  retained roughly 500 MiB of page padding for 12 MiB of payload. Keeping separate heap
+  workspaces or finished allocations per piece was also rejected after paced ClickBench runs
+  accumulated allocator arenas. The reusable workspace plus window arena bounds both scratch and
+  allocation count. Client-only retention uses direct blocks; wire-eligible compression uses frames.
   Compression remains enabled only when it saves at least 12.5%; this conservative threshold
   covers both the temporary compression workspace and the CPU cost. A compressible window can
-  release its Arrow batches and continue toward the 512 MiB logical budget while retaining only
+  release its Arrow batches and continue toward the logical budget while retaining only
   compressed chunks. Upload reuses one mapping to decode at most 1 MiB immediately before the
   ordinary binary protocol consumes it. The compressed representation is never a disk format.
-- If the first staging group is not materially compressible, further compression attempts stop,
-  Arrow remains the canonical representation, and automatic scheduling closes the window at
-  64 MiB. This bounds duplicated probe data and retained Arrow memory for random floats,
+- A finite Linux cgroup limit is enforced before starting an ingest prefetch worker. The
+  process-wide reservation covers two physical windows, two 16 MiB staging groups, and 64 MiB of
+  producer headroom, while preserving 10% of the cgroup for unrelated work. This deliberately
+  conservative model prevents simultaneous connections in one client process from racing the
+  cgroup OOM handler. Rejected work receives an ADBC allocation error and every exit path releases
+  its reservation.
+- The bounded Parquet producer reclaims unused PyArrow allocator pages after each 2 GiB of decoded
+  row-group data and at stream close. Reclaiming every row group was rejected because many small
+  TPC-DS files regressed sharply; waiting until the end allowed a paced 36.4 GiB ClickBench decode
+  to retain more than 20 GiB. The byte interval avoids both failure modes and can be disabled per
+  stream. Path inputs are opened through an owned PyArrow `OSFile`, avoiding whole-file mapping.
+  Column-parallel decoding remains opt-in because it improved isolated scans but slightly regressed
+  full ingest while increasing client memory. Nullable integer epoch-to-timestamp/date transforms
+  run batch by batch in the same bounded stream.
+- Input staging, including the first per-column probe, is fixed at 16 MiB, preventing a full
+  logical window of Arrow batches from coexisting with its encoded copy. If the first staging
+  group is not materially compressible, further compression attempts stop and automatic
+  scheduling closes the window at 64 MiB. Null-free batches can remain the canonical Arrow
+  representation; batches containing nulls stay as raw encoded chunks so null-sentinel conversion
+  is not deferred onto the upload path. This bounds duplicated probe data for random floats,
   pre-compressed binary values, and other high-entropy inputs while preserving large COPY windows
   for repetitive strings, null-heavy columns, and regular numeric data. The decision is based
-  only on observed bytes, not table or schema identity. Explicit row scheduling bypasses the cap
-  because it is an exact diagnostic override.
+  only on observed bytes and null presence, not table or schema identity. Explicit row scheduling
+  bypasses the cap because it is an exact diagnostic override.
 - Very wide, incompressible input exposes a fundamental three-way tradeoff. Smaller COPY windows
   bound client RSS and avoid staging files, but MonetDB may temporarily retain more append segments
   during consolidation or restart. A single large window would move the encoded table into client
@@ -217,22 +242,22 @@ requirements change their premises.
   threshold is configurable, zero disables the route, and multi-batch readers always stay on
   COPY. The 8 MiB cap bounds literal rendering and the single MAPI script.
 - Connection initialization times existing metadata queries and retains the lower observed round
-  trip without adding a probe. Below 0.5 ms, the static defaults remain unchanged. Above that
-  boundary, the INSERT crossover grows from the measured round trip and the incompressible COPY
-  floor grows to the effective logical-window budget. At 1,000 columns, a local Toxiproxy
+  trip without adding a probe. At 0.5 ms, the INSERT crossover starts growing from the measured
+  round trip. At 5 ms, the COPY window and incompressible floor grow to the remote-link target.
+  At 1,000 columns, a local Toxiproxy
   calibration measured one-row COPY at 0.23 seconds direct, 3.92 seconds with 1 ms downstream
   latency, and 12.59 seconds with 5 ms; a prepared 1,000-row INSERT remained 1.57–1.78 seconds.
   The manual `test_measured_latency_adapts_insert_routing_and_copy_windows` regression reproduces
   the topology change with the pinned Compose proxy.
-- Tables of at least 512 columns also use the effective logical-window budget for incompressible
-  data on a local link. In a repeated 200,000-row random-float sweep, 512 MiB was neutral at 100
-  columns and improved median COPY time by 15%, 23%, 30%, 33%, 34%, and 36% at 200, 256, 384,
-  512, 786, and 1,000 columns. The 512-column cutoff retains the smaller-memory behavior below the
-  measured crossover while covering wide analytical tables.
-- With client-only `wire_compression=none`, each new window samples at most 256 KiB per column. For
+- The earlier 512-column rule that expanded wide schemas to the largest physical window was
+  removed. Width now only tightens the local physical bound to 48 MiB, because per-column state
+  makes those schemas the most expensive. Network topology remains the only automatic expansion
+  input: at or above 5 ms the driver restores the logical target for every schema.
+- Each new window samples at most 256 KiB per column. For
   fixed-width values it compares plain LZ4 with byte-plane shuffle plus LZ4 and selects only a
-  representation saving at least 12.5%. `auto` probes plain LZ4 so profitable frames can go
-  directly to the server, and `lz4` forces frames. Selection is per column and byte-observed. A
+  representation saving at least 12.5%. `auto` and `none` both permit shuffled client storage;
+  `auto` independently sends wire frames only for an all-plain-LZ4 window, and `lz4` forces
+  frames. Selection is per column and byte-observed. A
   full-chunk savings check can still demote a misleading sample to raw retention without affecting
   correctness. Retained Arrow batches are encoded through a capacity-one worker channel, so
   encoding of a bounded piece overlaps upload of the preceding piece.
@@ -247,17 +272,18 @@ requirements change their premises.
   server-side binder defect; the minimum-version integration job covers the sequence.
 - Server-side LZ4 is selected from observed bytes, not from another latency heuristic. The `auto`
   default sends plain frames only when every column in a window cleared the savings threshold; an
-  incompressible column keeps the whole window on the ordinary upload path. It also avoids weak
-  client-only shuffle compression on mixed time-series windows. `none` enables that lower-memory
-  client-only shuffle path, while `lz4` forces bounded plain frames for links where reduced bytes
+  incompressible or shuffled column keeps the whole window on the ordinary upload path. `none`
+  disables the wire path, while `lz4` forces bounded plain frames for links where reduced bytes
   outweigh server decompression. In the final cross-suite validation, `auto` improved time-series
   by 5%, rtabench by 22%, and ClickBench by 28% versus the preceding ADBC state. Per-window
   selection prevents one high-entropy window from disabling compression for later repetitive
   data, and `window_wire_compression` exposes the decision.
 - The stats contract exposes every adaptive decision: `path`, `measured_round_trip_us`,
   `insert_rows_threshold`, `window_budget_bytes`, `incompressible_window_budget_bytes`,
-  `stored_bytes`, `window_storage`, `window_wire_compression`, and `prepared_cache_hits`. Tests
-  assert these fields instead of inferring routes from timing.
+  `stored_bytes`, `window_storage`, `window_wire_compression`, and `prepared_cache_hits`.
+  Physical attribution reports per-window stored bytes, staging bytes, retained Arrow buffer
+  capacities, scratch, and single-window/prefetch high-water estimates. Tests assert these fields
+  instead of inferring routes from timing.
 
 ## Measured optimization rejections
 

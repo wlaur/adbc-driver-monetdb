@@ -31,7 +31,11 @@ class _ArrowStreamReader(Protocol):
 
 
 class PolarsArrowStream:
-    """Backpressured Arrow stream over a Polars lazy query."""
+    """Backpressured handoff over a Polars lazy query.
+
+    Polars may still decode ahead inside a Parquet source. Use
+    :class:`ParquetArrowStream` when producer memory must be strictly bounded.
+    """
 
     def __init__(
         self,

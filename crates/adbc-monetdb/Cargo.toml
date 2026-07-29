@@ -20,9 +20,12 @@ python = ["dep:pyo3", "pyo3/extension-module", "pyo3/abi3-py313"]
 adbc_core.workspace = true
 adbc_ffi.workspace = true
 arrow-array.workspace = true
+arrow-buffer.workspace = true
+arrow-data.workspace = true
 arrow-schema.workspace = true
 arrow-select.workspace = true
 chrono.workspace = true
+libc.workspace = true
 lz4_flex.workspace = true
 memmap2.workspace = true
 monetdb = { workspace = true, features = ["rustls"] }
@@ -35,7 +38,6 @@ url.workspace = true
 cargo-lock = "11"
 
 [dev-dependencies]
-arrow-buffer.workspace = true
 libloading = "0.9"
 proptest = "1"
 

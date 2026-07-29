@@ -57,7 +57,7 @@ def _wide_random_batch(rows: int, columns: int) -> pa.RecordBatch:
 
 @pytest.mark.integration
 @pytest.mark.local_only
-def test_measured_latency_adapts_insert_routing_and_copy_windows(monetdb_uri: str) -> None:
+def test_measured_latency_adapts_insert_routing_and_copy_windows() -> None:
     if os.environ.get("MONETDB_RUN_NETWORK_BENCHMARK") != "1":
         pytest.skip("set MONETDB_RUN_NETWORK_BENCHMARK=1 to run the toxiproxy regression")
 
@@ -65,37 +65,80 @@ def test_measured_latency_adapts_insert_routing_and_copy_windows(monetdb_uri: st
         "MONETDB_TOXIPROXY_URI",
         "monetdb://monetdb:monetdb@127.0.0.1:50003/test",
     )
-    bulk = _wide_random_batch(10_000_000, 1)
+    bulk = _wide_random_batch(9_000_000, 1)
+    wide = _wide_random_batch(8_000, 1_000)
     tiny = _wide_random_batch(1_000, 1_000)
+    latency_stats: dict[int, dict[str, object]] = {}
+    wide_latency_stats: dict[int, dict[str, object]] = {}
     try:
-        _set_latency(0)
-        with (
-            dbapi.connect(monetdb_uri, autocommit=True) as connection,
-            connection.cursor(adbc_stmt_kwargs={StatementOptions.INGEST_INSERT_ROWS: 0}) as cursor,
-        ):
-            assert cursor.adbc_ingest("network_window_direct", bulk, mode="replace") == bulk.num_rows
-            direct = _stats(cursor)
+        for milliseconds in (0, 1, 5, 20):
+            _set_latency(milliseconds)
+            with (
+                dbapi.connect(proxy_uri, autocommit=True) as connection,
+                connection.cursor(adbc_stmt_kwargs={StatementOptions.INGEST_INSERT_ROWS: 0}) as cursor,
+            ):
+                assert (
+                    cursor.adbc_ingest(
+                        f"network_window_{milliseconds}ms",
+                        bulk,
+                        mode="replace",
+                    )
+                    == bulk.num_rows
+                )
+                latency_stats[milliseconds] = _stats(cursor)
+
+        for milliseconds in (0, 5):
+            _set_latency(milliseconds)
+            with (
+                dbapi.connect(proxy_uri, autocommit=True) as connection,
+                connection.cursor(adbc_stmt_kwargs={StatementOptions.INGEST_INSERT_ROWS: 0}) as cursor,
+            ):
+                assert (
+                    cursor.adbc_ingest(
+                        f"network_wide_window_{milliseconds}ms",
+                        wide,
+                        mode="replace",
+                    )
+                    == wide.num_rows
+                )
+                wide_latency_stats[milliseconds] = _stats(cursor)
 
         _set_latency(5)
-        with dbapi.connect(proxy_uri, autocommit=True) as connection:
-            with connection.cursor(adbc_stmt_kwargs={StatementOptions.INGEST_INSERT_ROWS: 0}) as cursor:
-                assert cursor.adbc_ingest("network_window_proxy", bulk, mode="replace") == bulk.num_rows
-                proxied = _stats(cursor)
-            with connection.cursor() as cursor:
-                assert cursor.adbc_ingest("network_insert_proxy", tiny, mode="replace") == tiny.num_rows
-                routed = _stats(cursor)
+        with (
+            dbapi.connect(proxy_uri, autocommit=True) as connection,
+            connection.cursor() as cursor,
+        ):
+            assert cursor.adbc_ingest("network_insert_proxy", tiny, mode="replace") == tiny.num_rows
+            routed = _stats(cursor)
     finally:
         _set_latency(0)
 
-    assert isinstance(direct["measured_round_trip_us"], int)
-    assert isinstance(proxied["measured_round_trip_us"], int)
-    direct_is_remote = direct["measured_round_trip_us"] >= 500
-    assert direct["copy_count"] == (1 if direct_is_remote else 2)
-    assert direct["incompressible_window_budget_bytes"] == (512 if direct_is_remote else 64) * MIB
-    assert proxied["measured_round_trip_us"] > direct["measured_round_trip_us"]
-    assert proxied["measured_round_trip_us"] >= 500
-    assert proxied["copy_count"] == 1
-    assert proxied["incompressible_window_budget_bytes"] == 512 * MIB
+    measured: list[int] = []
+    for latency in (0, 1, 5, 20):
+        round_trip = latency_stats[latency]["measured_round_trip_us"]
+        assert isinstance(round_trip, int)
+        measured.append(round_trip)
+    assert max(measured[:2]) < 5_000 <= min(measured[2:])
+    assert measured[2] < measured[3]
+
+    for milliseconds in (0, 1):
+        stats = latency_stats[milliseconds]
+        assert stats["copy_count"] == 2
+        assert stats["window_budget_bytes"] == 512 * MIB
+        assert stats["physical_window_budget_bytes"] == 128 * MIB
+        assert stats["incompressible_window_budget_bytes"] == 64 * MIB
+    for milliseconds in (5, 20):
+        stats = latency_stats[milliseconds]
+        assert stats["copy_count"] == 1
+        assert stats["window_budget_bytes"] == 512 * MIB
+        assert stats["physical_window_budget_bytes"] == 512 * MIB
+        assert stats["incompressible_window_budget_bytes"] == 512 * MIB
+    assert wide_latency_stats[0]["copy_count"] == 2
+    assert wide_latency_stats[0]["physical_window_budget_bytes"] == 48 * MIB
+    assert wide_latency_stats[0]["incompressible_window_budget_bytes"] == 48 * MIB
+    assert wide_latency_stats[5]["copy_count"] == 1
+    assert wide_latency_stats[5]["physical_window_budget_bytes"] == 512 * MIB
+    assert wide_latency_stats[5]["incompressible_window_budget_bytes"] == 512 * MIB
     assert routed["path"] == "insert"
     assert isinstance(routed["insert_rows_threshold"], int)
     assert routed["insert_rows_threshold"] >= tiny.num_rows

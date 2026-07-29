@@ -1,5 +1,5 @@
 use std::{
-    borrow::Cow,
+    cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
     fmt,
     io::{Read, Write},
@@ -8,7 +8,7 @@ use std::{
     path::Path,
     sync::{
         Arc, Mutex, MutexGuard, Weak,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         mpsc::{Receiver, SyncSender, sync_channel},
     },
     thread::{self, JoinHandle},
@@ -46,24 +46,27 @@ use parameters::{
 
 const DEFAULT_READ_BATCH_ROWS: usize = 131_072;
 const DEFAULT_WRITE_WINDOW_BYTES: usize = 512 * 1024 * 1024;
+const LOCAL_PHYSICAL_WINDOW_BYTES: usize = 128 * 1024 * 1024;
+const WIDE_LOCAL_PHYSICAL_WINDOW_BYTES: usize = 48 * 1024 * 1024;
+const WIDE_MEMORY_BOUND_COLUMNS: usize = 512;
 const INCOMPRESSIBLE_WRITE_WINDOW_BYTES: usize = 64 * 1024 * 1024;
 const CONSTRAINED_WRITE_WINDOW_BYTES: usize = 1usize << 31;
 const NARROW_CONSTRAINED_ROW_BYTES: usize = 16;
 const MIN_WRITE_WINDOW_BYTES: usize = 4 * 1024 * 1024;
 const ENCODE_CHUNK_BYTES: usize = 1024 * 1024;
 const MIN_ENCODE_BUFFER_BYTES: usize = 64 * 1024;
+const COMPRESSED_ARENA_SLAB_BYTES: usize = 16 * 1024 * 1024;
 const COMPRESSION_PROBE_BYTES: usize = 256 * 1024;
-const MIN_COMPRESSION_PROBE_STAGING_BYTES: usize = 16 * 1024 * 1024;
-const MAX_COMPRESSION_PROBE_STAGING_BYTES: usize = 64 * 1024 * 1024;
-const ENCODE_STAGING_BYTES: usize = DEFAULT_WRITE_WINDOW_BYTES;
+const ENCODE_STAGING_BYTES: usize = 16 * 1024 * 1024;
+const INGEST_RESERVATION_SOURCE_BYTES: usize = 64 * 1024 * 1024;
 const PENDING_BATCH_COMPACTION_FANOUT: usize = 32;
 const PENDING_BATCH_COMPACTION_MAX_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_PREPARED_CACHE_CAPACITY: usize = 512;
 const ADAPTIVE_NETWORK_RTT: Duration = Duration::from_micros(500);
+const REMOTE_WRITE_WINDOW_RTT: Duration = Duration::from_millis(5);
 const INSERT_VALUE_ENCODE_MICROS: u128 = 2;
 const COPY_FILE_EXCHANGES_PER_COLUMN: u128 = 2;
 const MAX_ADAPTIVE_INSERT_ROWS: usize = 10_000;
-const WIDE_COPY_ADAPTIVE_COLUMNS: usize = 512;
 const PREFETCH_DROP_GRACE: Duration = Duration::from_millis(250);
 const METADATA_REPLY_ROWS: usize = 1024;
 const INLINE_REPLY_ROWS: i64 = 100;
@@ -87,6 +90,11 @@ const CLIENT_REMARK_OPTION: &str = "adbc.monetdb.client_remark";
 const CLIENT_INFO_OPTION: &str = "adbc.monetdb.client_info";
 const MINIMUM_VERSION: (u16, u16, u16) = (11, 55, 0);
 static SAVEPOINT_ID: AtomicU64 = AtomicU64::new(0);
+static RESERVED_INGEST_MEMORY_BYTES: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    static COMPRESSION_WORKSPACE: RefCell<CompressionWorkspace> =
+        RefCell::new(CompressionWorkspace::default());
+}
 
 const URI_QUERY_KEYS: &[&str] = &[
     "user",
@@ -2516,16 +2524,18 @@ impl MonetdbStatement {
                     self.timeouts,
                 )?);
         let automatic_window = self.write_window_bytes.is_none() && self.write_batch_rows.is_none();
-        let narrow_constrained_append = automatic_window
-            && append_to_existing
-            && fixed_encoded_row_width(&schema)?
-                .is_some_and(|width| width <= NARROW_CONSTRAINED_ROW_BYTES)
-            && table_has_constraints(
-                &connection,
-                if temporary { Some("tmp") } else { schema_name },
-                table,
-                self.timeouts,
-            )?;
+        let narrow_constrained_append = if automatic_window && append_to_existing {
+            let fixed_row_width = fixed_encoded_row_width(&schema)?;
+            fixed_row_width.is_some_and(|width| width <= NARROW_CONSTRAINED_ROW_BYTES)
+                && table_has_constraints(
+                    &connection,
+                    if temporary { Some("tmp") } else { schema_name },
+                    table,
+                    self.timeouts,
+                )?
+        } else {
+            false
+        };
         let caller_scope = if insert_candidate.is_some() {
             CallerTransactionScope::Savepoint
         } else if append_to_existing && self.ingest_atomicity == IngestAtomicity::Transaction {
@@ -2540,15 +2550,19 @@ impl MonetdbStatement {
         let window_budget = self
             .write_window_bytes
             .unwrap_or_else(|| automatic_write_window_bytes(narrow_constrained_append));
-        let incompressible_window_budget = self.write_window_bytes.unwrap_or_else(|| {
-            adaptive_incompressible_window_bytes(
+        let physical_window_budget = self.write_window_bytes.unwrap_or_else(|| {
+            adaptive_physical_window_bytes(
                 window_budget,
-                schema.fields().len(),
                 self.measured_round_trip,
+                schema.fields().len(),
             )
+        });
+        let incompressible_window_budget = self.write_window_bytes.unwrap_or_else(|| {
+            adaptive_incompressible_window_bytes(physical_window_budget, self.measured_round_trip)
         });
         let mut stats = IngestStats::new(
             window_budget,
+            physical_window_budget,
             incompressible_window_budget,
             insert_rows,
             self.measured_round_trip,
@@ -2701,16 +2715,18 @@ impl MonetdbStatement {
                 reader,
                 Arc::clone(&schema),
                 window_budget,
+                physical_window_budget,
                 incompressible_window_budget,
                 self.write_batch_rows,
                 self.wire_compression,
             )?;
             let mut rows = 0i64;
             let upload_result = (|| {
-                while let Some(window) = windows.next_window()? {
+                while let Some(mut window) = windows.next_window()? {
                     let wire_lz4 = window.uses_wire_lz4();
                     let stored_bytes = window.stored_bytes();
                     let storage = window.storage_mode();
+                    let memory_usage = window.memory_usage(wire_lz4);
                     let mut window_bytes = window.encoded_bytes;
                     let mut largest_chunk = window.largest_chunk;
                     let mut largest_column_bytes = window.largest_column_bytes;
@@ -2731,7 +2747,9 @@ impl MonetdbStatement {
                         let index = upload_column_index(filename, schema.fields().len())?;
                         let mut decoded = None;
                         let mut unshuffled = None;
-                        for chunk in &window.columns[index].chunks {
+                        let column = &mut window.columns[index];
+                        let chunks = std::mem::take(&mut column.chunks);
+                        for chunk in &chunks {
                             match chunk {
                                 EncodedChunk::Raw(data) => sink.write_chunk(data)?,
                                 EncodedChunk::Lz4 {
@@ -2741,6 +2759,7 @@ impl MonetdbStatement {
                                     transform,
                                     format,
                                 } => {
+                                    let data = data.slice(&window.compressed_arena, *len);
                                     if wire_lz4 {
                                         if *transform != CompressionTransform::Plain
                                             || *format != CompressionFormat::Frame
@@ -2748,9 +2767,9 @@ impl MonetdbStatement {
                                             return Err(CursorError::FileTransfer(
                                                 "wire-compressed ingest contains a client-only transform"
                                                     .into(),
-                                            ));
+                                                ));
                                         }
-                                        sink.write_chunk(&data[..*len])?;
+                                        sink.write_chunk(data)?;
                                         continue;
                                     }
                                     if decoded
@@ -2771,7 +2790,7 @@ impl MonetdbStatement {
                                     let written = match format {
                                         CompressionFormat::Block => {
                                             lz4_flex::block::decompress_into(
-                                                &data[..*len],
+                                                data,
                                                 &mut scratch[..*decoded_len],
                                             )
                                             .map_err(|value| {
@@ -2781,7 +2800,7 @@ impl MonetdbStatement {
                                             })?
                                         }
                                         CompressionFormat::Frame => decompress_frame_into(
-                                            &data[..*len],
+                                            data,
                                             &mut scratch[..*decoded_len],
                                         )?,
                                     };
@@ -2869,17 +2888,18 @@ impl MonetdbStatement {
                         .transpose();
                     encoder_result?;
                     upload_result?;
-                    stats.record_window(
-                        window.rows,
-                        window_bytes,
+                    stats.record_window(CompletedIngestWindow {
+                        rows: window.rows,
+                        bytes: window_bytes,
                         stored_bytes,
                         storage,
                         wire_lz4,
-                        IngestStreamingUsage {
+                        memory: memory_usage,
+                        streaming: IngestStreamingUsage {
                             largest_chunk,
                             largest_column_bytes,
                         },
-                    );
+                    });
                     let server_rows = cursor.affected_rows().ok_or_else(|| {
                         error(
                             "MonetDB did not report the COPY row count",
@@ -3107,6 +3127,7 @@ struct IngestWindowScheduler<'a> {
     pending_bytes: usize,
     exhausted: bool,
     window_budget: usize,
+    physical_window_budget: usize,
     incompressible_window_budget: usize,
     configured_rows: Option<usize>,
     wire_compression: WireCompression,
@@ -3124,6 +3145,7 @@ struct IngestSchedulerStats {
 struct IngestWindowPrefetch {
     receiver: Receiver<Result<Option<EncodedIngestWindow>>>,
     worker: JoinHandle<IngestSchedulerStats>,
+    _memory_reservation: IngestMemoryReservation,
 }
 
 impl IngestWindowPrefetch {
@@ -3137,10 +3159,17 @@ impl IngestWindowPrefetch {
     }
 
     fn finish(self) -> Result<IngestSchedulerStats> {
-        drop(self.receiver);
-        self.worker
+        let Self {
+            receiver,
+            worker,
+            _memory_reservation,
+        } = self;
+        drop(receiver);
+        let result = worker
             .join()
-            .map_err(|_| error("ingest window prefetch thread panicked", Status::Internal))
+            .map_err(|_| error("ingest window prefetch thread panicked", Status::Internal));
+        drop(_memory_reservation);
+        result
     }
 }
 
@@ -3148,10 +3177,12 @@ fn start_ingest_window_prefetch(
     mut reader: Box<dyn RecordBatchReader + Send>,
     schema: SchemaRef,
     window_budget: usize,
+    physical_window_budget: usize,
     incompressible_window_budget: usize,
     configured_rows: Option<usize>,
     wire_compression: WireCompression,
 ) -> Result<IngestWindowPrefetch> {
+    let memory_reservation = reserve_ingest_memory(physical_window_budget)?;
     let (sender, receiver) = sync_channel(0);
     let worker = thread::Builder::new()
         .name("monetdb-ingest-window".into())
@@ -3160,6 +3191,7 @@ fn start_ingest_window_prefetch(
                 reader.as_mut(),
                 schema,
                 window_budget,
+                physical_window_budget,
                 incompressible_window_budget,
                 configured_rows,
                 wire_compression,
@@ -3183,7 +3215,72 @@ fn start_ingest_window_prefetch(
                 Status::Internal,
             )
         })?;
-    Ok(IngestWindowPrefetch { receiver, worker })
+    Ok(IngestWindowPrefetch {
+        receiver,
+        worker,
+        _memory_reservation: memory_reservation,
+    })
+}
+
+struct IngestMemoryReservation {
+    bytes: usize,
+}
+
+impl Drop for IngestMemoryReservation {
+    fn drop(&mut self) {
+        if self.bytes > 0 {
+            RESERVED_INGEST_MEMORY_BYTES.fetch_sub(self.bytes, Ordering::AcqRel);
+        }
+    }
+}
+
+fn ingest_memory_reservation_bytes(physical_window_budget: usize) -> usize {
+    physical_window_budget
+        .saturating_add(ENCODE_STAGING_BYTES)
+        .saturating_mul(2)
+        .saturating_add(INGEST_RESERVATION_SOURCE_BYTES)
+}
+
+fn reserve_ingest_memory(physical_window_budget: usize) -> Result<IngestMemoryReservation> {
+    let bytes = ingest_memory_reservation_bytes(physical_window_budget);
+    let Some((limit, current)) = cgroup_memory_limit_and_usage_bytes() else {
+        return Ok(IngestMemoryReservation { bytes: 0 });
+    };
+    let allowed = limit.saturating_mul(9) / 10;
+    let mut reserved = RESERVED_INGEST_MEMORY_BYTES.load(Ordering::Acquire);
+    loop {
+        if !ingest_memory_reservation_fits(allowed, current, reserved, bytes) {
+            return Err(error(
+                format!(
+                    "ingest requires a {bytes}-byte memory reservation, but the cgroup has \
+                     {current} bytes in use, {reserved} bytes reserved by other ingests, and \
+                     a {limit}-byte limit"
+                ),
+                Status::Internal,
+            ));
+        }
+        match RESERVED_INGEST_MEMORY_BYTES.compare_exchange_weak(
+            reserved,
+            reserved.saturating_add(bytes),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Ok(IngestMemoryReservation { bytes }),
+            Err(updated) => reserved = updated,
+        }
+    }
+}
+
+fn ingest_memory_reservation_fits(
+    allowed: usize,
+    current: usize,
+    reserved: usize,
+    requested: usize,
+) -> bool {
+    current
+        .checked_add(reserved)
+        .and_then(|total| total.checked_add(requested))
+        .is_some_and(|required| required <= allowed)
 }
 
 struct PendingBatch {
@@ -3413,12 +3510,80 @@ struct PendingEncodedChunk {
 enum EncodedChunk {
     Raw(MmapMut),
     Lz4 {
-        data: MmapMut,
+        data: CompressedData,
         len: usize,
         decoded_len: usize,
         transform: CompressionTransform,
         format: CompressionFormat,
     },
+}
+
+struct CompressedSlab {
+    data: MmapMut,
+    used: usize,
+}
+
+#[derive(Default)]
+struct CompressedArena {
+    slabs: Vec<CompressedSlab>,
+}
+
+impl CompressedArena {
+    fn store(&mut self, bytes: &[u8]) -> std::result::Result<CompressedData, CursorError> {
+        let reusable = self
+            .slabs
+            .last()
+            .filter(|slab| slab.data.len() - slab.used >= bytes.len())
+            .map(|_| self.slabs.len() - 1);
+        let slab = match reusable {
+            Some(index) => index,
+            None => {
+                let capacity = COMPRESSED_ARENA_SLAB_BYTES.max(bytes.len());
+                let data = MmapMut::map_anon(capacity).map_err(|value| {
+                    CursorError::FileTransfer(format!(
+                        "allocating an ingest compression arena failed: {value}"
+                    ))
+                })?;
+                self.slabs.push(CompressedSlab { data, used: 0 });
+                self.slabs.len() - 1
+            }
+        };
+        let storage = &mut self.slabs[slab];
+        let offset = storage.used;
+        storage.data[offset..offset + bytes.len()].copy_from_slice(bytes);
+        storage.used += bytes.len();
+        Ok(CompressedData { slab, offset })
+    }
+
+    fn slice(&self, data: &CompressedData, len: usize) -> &[u8] {
+        &self.slabs[data.slab].data[data.offset..data.offset + len]
+    }
+
+    fn physical_bytes(&self) -> usize {
+        self.slabs.iter().map(|slab| slab.data.len()).sum()
+    }
+
+    #[cfg(test)]
+    fn used_bytes(&self) -> usize {
+        self.slabs.iter().map(|slab| slab.used).sum()
+    }
+}
+
+struct CompressedData {
+    slab: usize,
+    offset: usize,
+}
+
+#[derive(Default)]
+struct CompressionWorkspace {
+    transformed: Vec<u8>,
+    compressed: Vec<u8>,
+}
+
+impl CompressedData {
+    fn slice<'a>(&self, arena: &'a CompressedArena, len: usize) -> &'a [u8] {
+        arena.slice(self, len)
+    }
 }
 
 impl EncodedChunk {
@@ -3461,7 +3626,11 @@ impl EncodedColumn {
         }
     }
 
-    fn push(&mut self, mut bytes: &[u8]) -> std::result::Result<(), CursorError> {
+    fn push(
+        &mut self,
+        mut bytes: &[u8],
+        compressed_arena: &mut CompressedArena,
+    ) -> std::result::Result<(), CursorError> {
         while !bytes.is_empty() {
             if self.pending.is_none() {
                 let capacity = bytes
@@ -3485,17 +3654,23 @@ impl EncodedColumn {
             pending.len += copied;
             bytes = &bytes[copied..];
             if pending.len == pending.data.len() {
-                self.finish_pending()?;
+                self.finish_pending(compressed_arena)?;
             }
         }
         Ok(())
     }
 
-    fn finish(&mut self) -> std::result::Result<(), CursorError> {
-        self.finish_pending()
+    fn finish(
+        &mut self,
+        compressed_arena: &mut CompressedArena,
+    ) -> std::result::Result<(), CursorError> {
+        self.finish_pending(compressed_arena)
     }
 
-    fn finish_pending(&mut self) -> std::result::Result<(), CursorError> {
+    fn finish_pending(
+        &mut self,
+        compressed_arena: &mut CompressedArena,
+    ) -> std::result::Result<(), CursorError> {
         let Some(pending) = self.pending.take() else {
             return Ok(());
         };
@@ -3510,33 +3685,49 @@ impl EncodedColumn {
         } else {
             CompressionFormat::Frame
         };
-        let transform = match self.compression {
-            CompressionMode::Unknown => {
-                if force_compression {
-                    CompressionTransform::Plain
-                } else {
-                    let Some(transform) = select_compression_transform(
-                        input,
-                        self.fixed_width,
-                        self.wire_compression == WireCompression::None,
-                        format,
-                    )?
-                    else {
-                        self.compression = CompressionMode::Disabled;
-                        self.store_raw(input)?;
-                        return Ok(());
-                    };
-                    transform
+        let compressed = COMPRESSION_WORKSPACE.with(
+            |workspace| -> std::result::Result<
+                Option<(CompressedData, usize, CompressionTransform)>,
+                CursorError,
+            > {
+                let mut workspace = workspace.borrow_mut();
+                let transform = match self.compression {
+                    CompressionMode::Unknown => {
+                        if force_compression {
+                            CompressionTransform::Plain
+                        } else {
+                            let Some(transform) = select_compression_transform(
+                                input,
+                                self.fixed_width,
+                                self.wire_compression != WireCompression::Lz4,
+                                format,
+                                &mut workspace,
+                            )?
+                            else {
+                                return Ok(None);
+                            };
+                            transform
+                        }
+                    }
+                    CompressionMode::Enabled(transform) => transform,
+                    CompressionMode::Disabled => {
+                        unreachable!("disabled compression returned above")
+                    }
+                };
+                let compressed_len = compress_bytes(input, transform, format, &mut workspace)?;
+                if !force_compression
+                    && compressed_len.saturating_mul(8) > input.len().saturating_mul(7)
+                {
+                    return Ok(None);
                 }
-            }
-            CompressionMode::Enabled(transform) => transform,
-            CompressionMode::Disabled => unreachable!("disabled compression returned above"),
-        };
-        let (compressed, compressed_len) = compress_bytes(input, transform, format)?;
-        if force_compression || compressed_len.saturating_mul(8) <= input.len().saturating_mul(7) {
+                let data = compressed_arena.store(&workspace.compressed[..compressed_len])?;
+                Ok(Some((data, compressed_len, transform)))
+            },
+        )?;
+        if let Some((data, compressed_len, transform)) = compressed {
             self.compression = CompressionMode::Enabled(transform);
             self.chunks.push(EncodedChunk::Lz4 {
-                data: compressed,
+                data,
                 len: compressed_len,
                 decoded_len: input.len(),
                 transform,
@@ -3581,100 +3772,77 @@ fn select_compression_transform(
     fixed_width: Option<usize>,
     allow_shuffle: bool,
     format: CompressionFormat,
+    workspace: &mut CompressionWorkspace,
 ) -> std::result::Result<Option<CompressionTransform>, CursorError> {
     let sample_len = COMPRESSION_PROBE_BYTES.min(input.len());
     let plain = &input[..sample_len];
-    let mut candidates = vec![(CompressionTransform::Plain, plain.to_vec())];
+    let plain_len = compressed_size(plain, format, &mut workspace.compressed)?;
+    let mut best = (CompressionTransform::Plain, plain_len);
     if allow_shuffle && let Some(width) = fixed_width.filter(|width| *width > 1) {
         let aligned_len = sample_len - sample_len % width;
         if aligned_len > 0 {
-            candidates.push((
-                CompressionTransform::Shuffle(width),
-                shuffle_bytes(plain, width),
-            ));
+            shuffle_bytes_into(plain, width, &mut workspace.transformed);
+            let shuffled_len =
+                compressed_size(&workspace.transformed, format, &mut workspace.compressed)?;
+            if shuffled_len < best.1 {
+                best = (CompressionTransform::Shuffle(width), shuffled_len);
+            }
         }
     }
-    let mut best = None;
-    for (transform, sample) in candidates {
-        let compressed_len = compressed_size(&sample, format)?;
-        if best
-            .as_ref()
-            .is_none_or(|(_, best_len): &(CompressionTransform, usize)| compressed_len < *best_len)
-        {
-            best = Some((transform, compressed_len));
-        }
-    }
-    Ok(best
-        .filter(|(_, compressed_len)| {
-            compressed_len.saturating_mul(8) <= plain.len().saturating_mul(7)
-        })
-        .map(|(transform, _)| transform))
+    Ok((best.1.saturating_mul(8) <= plain.len().saturating_mul(7)).then_some(best.0))
 }
 
 fn compressed_size(
     input: &[u8],
     format: CompressionFormat,
+    output: &mut Vec<u8>,
 ) -> std::result::Result<usize, CursorError> {
     match format {
         CompressionFormat::Block => {
-            let mut output = vec![0; lz4_flex::block::get_maximum_output_size(input.len())];
-            lz4_flex::block::compress_into(input, &mut output).map_err(|value| {
-                CursorError::FileTransfer(format!("compressing an ingest buffer failed: {value}"))
-            })
+            output.resize(lz4_flex::block::get_maximum_output_size(input.len()), 0);
+            let compressed_len =
+                lz4_flex::block::compress_into(input, output).map_err(|value| {
+                    CursorError::FileTransfer(format!(
+                        "compressing an ingest buffer failed: {value}"
+                    ))
+                })?;
+            output.truncate(compressed_len);
+            Ok(compressed_len)
         }
-        CompressionFormat::Frame => Ok(compress_frame_bytes(input)?.len()),
+        CompressionFormat::Frame => compress_frame_bytes(input, output),
     }
 }
 
-fn compress_frame_bytes(input: &[u8]) -> std::result::Result<Vec<u8>, CursorError> {
-    let mut encoder = lz4_flex::frame::FrameEncoder::new(Vec::new());
+fn compress_frame_bytes(
+    input: &[u8],
+    output: &mut Vec<u8>,
+) -> std::result::Result<usize, CursorError> {
+    output.clear();
+    let mut encoder = lz4_flex::frame::FrameEncoder::new(std::mem::take(output));
     encoder.write_all(input).map_err(|value| {
         CursorError::FileTransfer(format!("compressing an ingest buffer failed: {value}"))
     })?;
-    encoder.finish().map_err(|value| {
+    *output = encoder.finish().map_err(|value| {
         CursorError::FileTransfer(format!(
             "finishing an ingest compression frame failed: {value}"
         ))
-    })
-}
-
-fn compress_frame(
-    input: &[u8],
-    transform: CompressionTransform,
-) -> std::result::Result<(MmapMut, usize), CursorError> {
-    let transformed = transform_bytes(input, transform);
-    let compressed = compress_frame_bytes(&transformed)?;
-    let mut mapping = MmapMut::map_anon(compressed.len()).map_err(|value| {
-        CursorError::FileTransfer(format!(
-            "allocating an ingest compression buffer failed: {value}"
-        ))
     })?;
-    mapping.copy_from_slice(&compressed);
-    Ok((mapping, compressed.len()))
+    Ok(output.len())
 }
 
 fn compress_bytes(
     input: &[u8],
     transform: CompressionTransform,
     format: CompressionFormat,
-) -> std::result::Result<(MmapMut, usize), CursorError> {
-    if format == CompressionFormat::Frame {
-        return compress_frame(input, transform);
+    workspace: &mut CompressionWorkspace,
+) -> std::result::Result<usize, CursorError> {
+    match transform {
+        CompressionTransform::Plain => compressed_size(input, format, &mut workspace.compressed),
+        CompressionTransform::Shuffle(width) => {
+            shuffle_bytes_into(input, width, &mut workspace.transformed);
+            compressed_size(&workspace.transformed, format, &mut workspace.compressed)
+        }
     }
-    let transformed = transform_bytes(input, transform);
-    let mut compressed = MmapMut::map_anon(lz4_flex::block::get_maximum_output_size(
-        transformed.len(),
-    ))
-    .map_err(|value| {
-        CursorError::FileTransfer(format!(
-            "allocating an ingest compression buffer failed: {value}"
-        ))
-    })?;
-    let compressed_len =
-        lz4_flex::block::compress_into(&transformed, &mut compressed).map_err(|value| {
-            CursorError::FileTransfer(format!("compressing an ingest buffer failed: {value}"))
-        })?;
-    Ok((compressed, compressed_len))
 }
 
 fn decompress_frame_into(
@@ -3697,23 +3865,16 @@ fn decompress_frame_into(
     Ok(output.len())
 }
 
-fn transform_bytes(input: &[u8], transform: CompressionTransform) -> Cow<'_, [u8]> {
-    match transform {
-        CompressionTransform::Plain => Cow::Borrowed(input),
-        CompressionTransform::Shuffle(width) => Cow::Owned(shuffle_bytes(input, width)),
-    }
-}
-
-fn shuffle_bytes(input: &[u8], width: usize) -> Vec<u8> {
+fn shuffle_bytes_into(input: &[u8], width: usize, output: &mut Vec<u8>) {
     assert!(width > 0);
     let aligned_len = input.len() - input.len() % width;
     let rows = aligned_len / width;
-    let mut output = Vec::with_capacity(input.len());
+    output.clear();
+    output.reserve(input.len());
     for byte in 0..width {
         output.extend((0..rows).map(|row| input[row * width + byte]));
     }
     output.extend_from_slice(&input[aligned_len..]);
-    output
 }
 
 fn unshuffle_bytes(input: &[u8], width: usize, output: &mut [u8]) {
@@ -3729,10 +3890,73 @@ fn unshuffle_bytes(input: &[u8], width: usize, output: &mut [u8]) {
     output[aligned_len..].copy_from_slice(&input[aligned_len..]);
 }
 
+fn pinned_record_batch_buffers<'a>(
+    batches: impl IntoIterator<Item = &'a RecordBatch>,
+) -> HashMap<usize, usize> {
+    let mut buffers = HashMap::new();
+    for batch in batches {
+        for column in batch.columns() {
+            add_array_buffers(&column.to_data(), &mut buffers);
+        }
+    }
+    buffers
+}
+
+fn add_array_buffers(data: &arrow_data::ArrayData, buffers: &mut HashMap<usize, usize>) {
+    for buffer in data.buffers() {
+        add_buffer(buffer, buffers);
+    }
+    if let Some(nulls) = data.nulls() {
+        add_buffer(nulls.buffer(), buffers);
+    }
+    for child in data.child_data() {
+        add_array_buffers(child, buffers);
+    }
+}
+
+fn add_buffer(buffer: &arrow_buffer::Buffer, buffers: &mut HashMap<usize, usize>) {
+    let bytes = buffer
+        .capacity()
+        .max(buffer.ptr_offset().saturating_add(buffer.len()));
+    if bytes > 0 {
+        buffers
+            .entry(buffer.data_ptr().as_ptr() as usize)
+            .and_modify(|current| *current = (*current).max(bytes))
+            .or_insert(bytes);
+    }
+}
+
+fn buffer_bytes(buffers: &HashMap<usize, usize>) -> usize {
+    buffers
+        .values()
+        .fold(0usize, |total, bytes| total.saturating_add(*bytes))
+}
+
+fn merged_buffers(
+    first: &HashMap<usize, usize>,
+    second: &HashMap<usize, usize>,
+) -> HashMap<usize, usize> {
+    let mut merged = first.clone();
+    for (pointer, bytes) in second {
+        merged
+            .entry(*pointer)
+            .and_modify(|current| *current = (*current).max(*bytes))
+            .or_insert(*bytes);
+    }
+    merged
+}
+
 struct EncodedIngestWindow {
     columns: Vec<EncodedColumn>,
+    compressed_arena: CompressedArena,
     retained_batches: Vec<RecordBatch>,
     retained_estimated_bytes: usize,
+    retained_buffers: HashMap<usize, usize>,
+    peak_staging_bytes: usize,
+    peak_build_bytes: usize,
+    peak_build_buffers: HashMap<usize, usize>,
+    incompressible: bool,
+    retain_arrow_eligible: bool,
     retain_arrow: bool,
     rows: usize,
     estimated_bytes: usize,
@@ -3750,8 +3974,15 @@ impl EncodedIngestWindow {
             columns: (0..columns)
                 .map(|_| EncodedColumn::new(None, WireCompression::None))
                 .collect(),
+            compressed_arena: CompressedArena::default(),
             retained_batches: Vec::new(),
             retained_estimated_bytes: 0,
+            retained_buffers: HashMap::new(),
+            peak_staging_bytes: 0,
+            peak_build_bytes: 0,
+            peak_build_buffers: HashMap::new(),
+            incompressible: false,
+            retain_arrow_eligible: true,
             retain_arrow: false,
             rows: 0,
             estimated_bytes: 0,
@@ -3775,8 +4006,15 @@ impl EncodedIngestWindow {
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             columns,
+            compressed_arena: CompressedArena::default(),
             retained_batches: Vec::new(),
             retained_estimated_bytes: 0,
+            retained_buffers: HashMap::new(),
+            peak_staging_bytes: 0,
+            peak_build_bytes: 0,
+            peak_build_buffers: HashMap::new(),
+            incompressible: false,
+            retain_arrow_eligible: true,
             retain_arrow: false,
             rows: 0,
             estimated_bytes: 0,
@@ -3794,6 +4032,14 @@ impl EncodedIngestWindow {
         pending: Vec<PendingBatch>,
         estimated_bytes: usize,
     ) -> Result<()> {
+        let staging_buffers =
+            pinned_record_batch_buffers(pending.iter().map(|pending| &pending.batch));
+        let staging_bytes = buffer_bytes(&staging_buffers);
+        self.peak_staging_bytes = self.peak_staging_bytes.max(staging_bytes);
+        self.retain_arrow_eligible &= pending
+            .iter()
+            .flat_map(|pending| pending.batch.columns())
+            .all(|column| column.null_count() == 0);
         self.coalesced |=
             pending.len() > 1 || pending.iter().any(|batch| batch.compaction_level > 0);
         let rows = pending
@@ -3807,6 +4053,7 @@ impl EncodedIngestWindow {
                 .ok_or_else(|| error("retained Arrow byte estimate overflows", Status::Internal))?;
             self.retained_batches
                 .extend(pending.into_iter().map(|pending| pending.batch));
+            self.retained_buffers = pinned_record_batch_buffers(self.retained_batches.iter());
         } else {
             for index in 0..schema.fields().len() {
                 let arrays = pending
@@ -3814,15 +4061,18 @@ impl EncodedIngestWindow {
                     .map(|pending| pending.batch.column(index).as_ref())
                     .collect::<Vec<_>>();
                 let column = &mut self.columns[index];
+                let compressed_arena = &mut self.compressed_arena;
                 let column_bytes = monetdb_arrow::encode_column_chunks(
                     &schema.fields()[index],
                     &arrays,
                     NonZeroUsize::new(ENCODE_CHUNK_BYTES).expect("encode chunk size is positive"),
-                    |chunk| -> std::result::Result<(), CursorError> { column.push(chunk) },
+                    |chunk| -> std::result::Result<(), CursorError> {
+                        column.push(chunk, compressed_arena)
+                    },
                 )
                 .map_err(map_chunked_encode_error)
                 .map_err(map_cursor_error)?;
-                column.finish().map_err(map_cursor_error)?;
+                column.finish(compressed_arena).map_err(map_cursor_error)?;
                 column.bytes = column.bytes.checked_add(column_bytes).ok_or_else(|| {
                     error("encoded column byte count overflows", Status::Internal)
                 })?;
@@ -3839,8 +4089,17 @@ impl EncodedIngestWindow {
                 .iter()
                 .map(EncodedColumn::stored_bytes)
                 .sum::<usize>();
-            self.retain_arrow = self.wire_compression != WireCompression::Lz4
+            self.incompressible = self.wire_compression != WireCompression::Lz4
                 && stored_bytes.saturating_mul(8) > self.encoded_bytes.saturating_mul(7);
+            self.retain_arrow = self.incompressible && self.retain_arrow_eligible;
+        }
+        let build_buffers = merged_buffers(&self.retained_buffers, &staging_buffers);
+        let build_bytes = self
+            .encoded_stored_bytes()
+            .saturating_add(buffer_bytes(&build_buffers));
+        if build_bytes > self.peak_build_bytes {
+            self.peak_build_bytes = build_bytes;
+            self.peak_build_buffers = build_buffers;
         }
         self.rows = self
             .rows
@@ -3855,18 +4114,68 @@ impl EncodedIngestWindow {
 
     fn finish(&mut self) -> Result<()> {
         for column in &mut self.columns {
-            column.finish().map_err(map_cursor_error)?;
+            column
+                .finish(&mut self.compressed_arena)
+                .map_err(map_cursor_error)?;
             self.largest_chunk = self.largest_chunk.max(column.largest_chunk());
         }
         Ok(())
     }
 
     fn stored_bytes(&self) -> usize {
+        self.encoded_stored_bytes()
+            .saturating_add(self.retained_estimated_bytes)
+    }
+
+    fn encoded_stored_bytes(&self) -> usize {
+        self.columns.iter().map(EncodedColumn::stored_bytes).sum()
+    }
+
+    fn encoded_physical_stored_bytes(&self) -> usize {
         self.columns
             .iter()
-            .map(EncodedColumn::stored_bytes)
+            .flat_map(|column| &column.chunks)
+            .map(|chunk| match chunk {
+                EncodedChunk::Raw(data) => data.len(),
+                EncodedChunk::Lz4 { .. } => 0,
+            })
             .sum::<usize>()
-            .saturating_add(self.retained_estimated_bytes)
+            .saturating_add(self.compressed_arena.physical_bytes())
+    }
+
+    fn physical_stored_bytes(&self) -> usize {
+        self.encoded_physical_stored_bytes()
+            .saturating_add(buffer_bytes(&self.retained_buffers))
+    }
+
+    fn scratch_bytes(&self) -> usize {
+        self.columns
+            .iter()
+            .flat_map(|column| &column.chunks)
+            .map(|chunk| match chunk {
+                EncodedChunk::Raw(_) => 0,
+                EncodedChunk::Lz4 {
+                    decoded_len,
+                    transform,
+                    ..
+                } => match transform {
+                    CompressionTransform::Plain => *decoded_len,
+                    CompressionTransform::Shuffle(_) => decoded_len.saturating_mul(2),
+                },
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn memory_usage(&self, wire_lz4: bool) -> WindowMemoryUsage {
+        WindowMemoryUsage {
+            encoded_stored_bytes: self.encoded_physical_stored_bytes(),
+            retained_buffers: self.retained_buffers.clone(),
+            peak_staging_bytes: self.peak_staging_bytes,
+            peak_build_bytes: self.peak_build_bytes,
+            peak_build_buffers: self.peak_build_buffers.clone(),
+            scratch_bytes: if wire_lz4 { 0 } else { self.scratch_bytes() },
+        }
     }
 
     fn storage_mode(&self) -> WindowStorage {
@@ -3913,14 +4222,15 @@ impl EncodedIngestWindow {
     }
 }
 
-fn should_finish_incompressible_window(
+fn should_finish_automatic_window(
     configured_rows: Option<usize>,
+    physical_window_budget: usize,
     incompressible_window_budget: usize,
     window: &EncodedIngestWindow,
 ) -> bool {
     configured_rows.is_none()
-        && window.retain_arrow
-        && window.estimated_bytes >= incompressible_window_budget
+        && (window.physical_stored_bytes() >= physical_window_budget
+            || (window.incompressible && window.estimated_bytes >= incompressible_window_budget))
 }
 
 fn remaining_staging_bytes(
@@ -3929,7 +4239,7 @@ fn remaining_staging_bytes(
     incompressible_window_budget: usize,
     window: &EncodedIngestWindow,
 ) -> usize {
-    if configured_rows.is_none() && window.retain_arrow {
+    if configured_rows.is_none() && window.incompressible {
         incompressible_window_budget
             .saturating_sub(window.estimated_bytes)
             .min(remaining_window_bytes)
@@ -3943,6 +4253,7 @@ impl<'a> IngestWindowScheduler<'a> {
         reader: &'a mut (dyn RecordBatchReader + Send),
         schema: SchemaRef,
         window_budget: usize,
+        physical_window_budget: usize,
         incompressible_window_budget: usize,
         configured_rows: Option<usize>,
         wire_compression: WireCompression,
@@ -3955,6 +4266,7 @@ impl<'a> IngestWindowScheduler<'a> {
             pending_bytes: 0,
             exhausted: false,
             window_budget,
+            physical_window_budget,
             incompressible_window_budget,
             configured_rows,
             wire_compression,
@@ -3991,11 +4303,7 @@ impl<'a> IngestWindowScheduler<'a> {
             if remaining_staging_bytes == 0 {
                 break;
             }
-            let staging_bytes = remaining_staging_bytes.min(if window.rows == 0 {
-                compression_probe_staging_bytes(self.schema.fields().len())
-            } else {
-                ENCODE_STAGING_BYTES
-            });
+            let staging_bytes = remaining_staging_bytes.min(ENCODE_STAGING_BYTES);
             self.fill_staging(remaining_rows, staging_bytes)?;
             if self.pending_rows == 0 {
                 break;
@@ -4010,8 +4318,9 @@ impl<'a> IngestWindowScheduler<'a> {
                     .ok_or_else(|| error("pending ingest byte count overflows", Status::Internal))
             })?;
             window.append(&self.schema, pending, estimated_bytes)?;
-            if should_finish_incompressible_window(
+            if should_finish_automatic_window(
                 self.configured_rows,
+                self.physical_window_budget,
                 self.incompressible_window_budget,
                 &window,
             ) {
@@ -4230,13 +4539,6 @@ fn estimated_batch_size(schema: &SchemaRef, batch: &RecordBatch) -> Result<usize
         })
 }
 
-fn compression_probe_staging_bytes(columns: usize) -> usize {
-    COMPRESSION_PROBE_BYTES.saturating_mul(columns).clamp(
-        MIN_COMPRESSION_PROBE_STAGING_BYTES,
-        MAX_COMPRESSION_PROBE_STAGING_BYTES,
-    )
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WindowStorage {
     Lz4,
@@ -4264,13 +4566,19 @@ struct IngestStats {
     prepared_cache_hits: usize,
     peak_in_flight_bytes: usize,
     window_budget_bytes: usize,
+    physical_window_budget_bytes: usize,
     incompressible_window_budget_bytes: usize,
     insert_rows_threshold: usize,
     measured_round_trip_us: u128,
     window_rows: Vec<usize>,
     window_bytes: Vec<usize>,
+    window_physical_stored_bytes: Vec<usize>,
+    window_staging_bytes: Vec<usize>,
+    window_retained_arrow_pinned_bytes: Vec<usize>,
+    window_scratch_bytes: Vec<usize>,
     window_storage: Vec<WindowStorage>,
     window_wire_compression: Vec<bool>,
+    window_memory: Vec<WindowMemoryUsage>,
     path: &'static str,
     scope: &'static str,
     poisoned: bool,
@@ -4281,9 +4589,36 @@ struct IngestStreamingUsage {
     largest_column_bytes: usize,
 }
 
+struct CompletedIngestWindow {
+    rows: usize,
+    bytes: usize,
+    stored_bytes: usize,
+    storage: WindowStorage,
+    wire_lz4: bool,
+    memory: WindowMemoryUsage,
+    streaming: IngestStreamingUsage,
+}
+
+struct WindowMemoryUsage {
+    encoded_stored_bytes: usize,
+    retained_buffers: HashMap<usize, usize>,
+    peak_staging_bytes: usize,
+    peak_build_bytes: usize,
+    peak_build_buffers: HashMap<usize, usize>,
+    scratch_bytes: usize,
+}
+
+impl WindowMemoryUsage {
+    fn physical_stored_bytes(&self) -> usize {
+        self.encoded_stored_bytes
+            .saturating_add(buffer_bytes(&self.retained_buffers))
+    }
+}
+
 impl IngestStats {
     fn new(
         window_budget_bytes: usize,
+        physical_window_budget_bytes: usize,
         incompressible_window_budget_bytes: usize,
         insert_rows_threshold: usize,
         measured_round_trip: Duration,
@@ -4299,28 +4634,35 @@ impl IngestStats {
             prepared_cache_hits: 0,
             peak_in_flight_bytes: 0,
             window_budget_bytes,
+            physical_window_budget_bytes,
             incompressible_window_budget_bytes,
             insert_rows_threshold,
             measured_round_trip_us: measured_round_trip.as_micros(),
             window_rows: Vec::new(),
             window_bytes: Vec::new(),
+            window_physical_stored_bytes: Vec::new(),
+            window_staging_bytes: Vec::new(),
+            window_retained_arrow_pinned_bytes: Vec::new(),
+            window_scratch_bytes: Vec::new(),
             window_storage: Vec::new(),
             window_wire_compression: Vec::new(),
+            window_memory: Vec::new(),
             path: "copy",
             scope,
             poisoned: false,
         }
     }
 
-    fn record_window(
-        &mut self,
-        rows: usize,
-        bytes: usize,
-        stored_bytes: usize,
-        storage: WindowStorage,
-        wire_lz4: bool,
-        streaming: IngestStreamingUsage,
-    ) {
+    fn record_window(&mut self, window: CompletedIngestWindow) {
+        let CompletedIngestWindow {
+            rows,
+            bytes,
+            stored_bytes,
+            storage,
+            wire_lz4,
+            memory,
+            streaming,
+        } = window;
         self.copy_count += 1;
         self.encoded_bytes = self.encoded_bytes.saturating_add(bytes);
         self.stored_bytes = self.stored_bytes.saturating_add(stored_bytes);
@@ -4336,8 +4678,16 @@ impl IngestStats {
         self.peak_in_flight_bytes = self.peak_in_flight_bytes.max(streaming_bytes);
         self.window_rows.push(rows);
         self.window_bytes.push(bytes);
+        self.window_physical_stored_bytes
+            .push(memory.physical_stored_bytes());
+        self.window_staging_bytes.push(memory.peak_staging_bytes);
+        self.window_retained_arrow_pinned_bytes
+            .push(buffer_bytes(&memory.retained_buffers));
+        self.window_scratch_bytes
+            .push(memory.scratch_bytes.saturating_add(streaming_bytes));
         self.window_storage.push(storage);
         self.window_wire_compression.push(wire_lz4);
+        self.window_memory.push(memory);
     }
 
     fn to_json(&self) -> String {
@@ -4349,6 +4699,30 @@ impl IngestStats {
             .join(",");
         let bytes = self
             .window_bytes
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let physical_stored_bytes = self
+            .window_physical_stored_bytes
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let staging_bytes = self
+            .window_staging_bytes
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let retained_arrow_pinned_bytes = self
+            .window_retained_arrow_pinned_bytes
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let scratch_bytes = self
+            .window_scratch_bytes
             .iter()
             .map(usize::to_string)
             .collect::<Vec<_>>()
@@ -4365,15 +4739,20 @@ impl IngestStats {
             .map(|enabled| if *enabled { "\"lz4\"" } else { "\"none\"" })
             .collect::<Vec<_>>()
             .join(",");
+        let (peak_window_physical_bytes, peak_prefetch_physical_bytes) = self.physical_peaks();
         format!(
             concat!(
                 "{{\"input_batches\":{},\"coalesced_windows\":{},\"split_windows\":{},",
                 "\"copy_count\":{},\"encoded_bytes\":{},\"stored_bytes\":{},",
                 "\"prepared_cache_hits\":{},",
                 "\"peak_in_flight_bytes\":{},\"window_budget_bytes\":{},",
-                "\"incompressible_window_budget_bytes\":{},",
+                "\"physical_window_budget_bytes\":{},\"incompressible_window_budget_bytes\":{},",
                 "\"insert_rows_threshold\":{},\"measured_round_trip_us\":{},",
-                "\"window_rows\":[{}],\"window_bytes\":[{}],\"window_storage\":[{}],",
+                "\"peak_window_physical_bytes\":{},\"peak_prefetch_physical_bytes\":{},",
+                "\"window_rows\":[{}],\"window_bytes\":[{}],",
+                "\"window_physical_stored_bytes\":[{}],\"window_staging_bytes\":[{}],",
+                "\"window_retained_arrow_pinned_bytes\":[{}],\"window_scratch_bytes\":[{}],",
+                "\"window_storage\":[{}],",
                 "\"window_wire_compression\":[{}],",
                 "\"path\":\"{}\",\"scope\":\"{}\",\"poisoned\":{}}}"
             ),
@@ -4386,17 +4765,54 @@ impl IngestStats {
             self.prepared_cache_hits,
             self.peak_in_flight_bytes,
             self.window_budget_bytes,
+            self.physical_window_budget_bytes,
             self.incompressible_window_budget_bytes,
             self.insert_rows_threshold,
             self.measured_round_trip_us,
+            peak_window_physical_bytes,
+            peak_prefetch_physical_bytes,
             rows,
             bytes,
+            physical_stored_bytes,
+            staging_bytes,
+            retained_arrow_pinned_bytes,
+            scratch_bytes,
             storage,
             wire_compression,
             self.path,
             self.scope,
             self.poisoned,
         )
+    }
+
+    fn physical_peaks(&self) -> (usize, usize) {
+        let mut peak_window = 0usize;
+        let mut peak_prefetch = 0usize;
+        for (index, memory) in self.window_memory.iter().enumerate() {
+            let upload_bytes = memory
+                .physical_stored_bytes()
+                .saturating_add(self.window_scratch_bytes[index]);
+            let build_bytes = memory.peak_build_bytes.saturating_add(memory.scratch_bytes);
+            peak_window = peak_window.max(upload_bytes).max(build_bytes);
+            peak_prefetch = peak_prefetch.max(upload_bytes).max(build_bytes);
+
+            let Some(next) = self.window_memory.get(index + 1) else {
+                continue;
+            };
+            let live_buffers = merged_buffers(&memory.retained_buffers, &next.peak_build_buffers);
+            let current_fixed = memory
+                .encoded_stored_bytes
+                .saturating_add(self.window_scratch_bytes[index]);
+            let next_fixed = next
+                .peak_build_bytes
+                .saturating_sub(buffer_bytes(&next.peak_build_buffers))
+                .saturating_add(next.scratch_bytes);
+            let overlap = current_fixed
+                .saturating_add(next_fixed)
+                .saturating_add(buffer_bytes(&live_buffers));
+            peak_prefetch = peak_prefetch.max(overlap);
+        }
+        (peak_window, peak_prefetch)
     }
 }
 
@@ -4416,14 +4832,13 @@ fn adaptive_insert_rows(configured_rows: usize, measured_round_trip: Duration) -
 }
 
 fn adaptive_incompressible_window_bytes(
-    window_budget: usize,
-    columns: usize,
+    physical_window_budget: usize,
     measured_round_trip: Duration,
 ) -> usize {
-    if measured_round_trip >= ADAPTIVE_NETWORK_RTT || columns >= WIDE_COPY_ADAPTIVE_COLUMNS {
-        window_budget
+    if measured_round_trip >= REMOTE_WRITE_WINDOW_RTT {
+        physical_window_budget
     } else {
-        INCOMPRESSIBLE_WRITE_WINDOW_BYTES.min(window_budget)
+        INCOMPRESSIBLE_WRITE_WINDOW_BYTES.min(physical_window_budget)
     }
 }
 
@@ -4447,24 +4862,90 @@ fn fixed_encoded_row_width(schema: &SchemaRef) -> Result<Option<usize>> {
         })
 }
 
+fn adaptive_physical_window_bytes(
+    window_budget: usize,
+    measured_round_trip: Duration,
+    columns: usize,
+) -> usize {
+    if measured_round_trip >= REMOTE_WRITE_WINDOW_RTT {
+        window_budget
+    } else {
+        let local_budget = if columns >= WIDE_MEMORY_BOUND_COLUMNS {
+            WIDE_LOCAL_PHYSICAL_WINDOW_BYTES
+        } else {
+            LOCAL_PHYSICAL_WINDOW_BYTES
+        };
+        local_budget.min(window_budget)
+    }
+}
+
 fn automatic_write_window_bytes(constrained: bool) -> usize {
-    let ceiling = if constrained {
+    automatic_write_window_bytes_for_memory(constrained, system_memory_limit_bytes())
+}
+
+fn automatic_write_window_bytes_for_memory(
+    constrained: bool,
+    memory_limit: Option<usize>,
+) -> usize {
+    let target = if constrained {
         CONSTRAINED_WRITE_WINDOW_BYTES
     } else {
         DEFAULT_WRITE_WINDOW_BYTES
     };
-    let cgroup_divisor = if constrained { 4 } else { 8 };
-    let cgroup_limit = [
+    let divisor = if constrained { 4 } else { 8 };
+    memory_limit.map_or(target, |limit| {
+        target.min((limit / divisor).max(MIN_WRITE_WINDOW_BYTES))
+    })
+}
+
+fn system_memory_limit_bytes() -> Option<usize> {
+    [cgroup_memory_limit_bytes(), total_system_memory_bytes()]
+        .into_iter()
+        .flatten()
+        .min()
+}
+
+fn cgroup_memory_limit_bytes() -> Option<usize> {
+    [
         Path::new("/sys/fs/cgroup/memory.max"),
         Path::new("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
     ]
     .into_iter()
     .filter_map(|path| std::fs::read_to_string(path).ok())
     .filter_map(|value| value.trim().parse::<usize>().ok())
-    .find(|limit| *limit > 0 && *limit < (1usize << (usize::BITS - 2)));
-    cgroup_limit.map_or(ceiling, |limit| {
-        ceiling.min((limit / cgroup_divisor).max(MIN_WRITE_WINDOW_BYTES))
-    })
+    .find(|limit| *limit > 0 && *limit < (1usize << (usize::BITS - 2)))
+}
+
+fn cgroup_memory_limit_and_usage_bytes() -> Option<(usize, usize)> {
+    let limit = cgroup_memory_limit_bytes()?;
+    let current = [
+        Path::new("/sys/fs/cgroup/memory.current"),
+        Path::new("/sys/fs/cgroup/memory/memory.usage_in_bytes"),
+    ]
+    .into_iter()
+    .filter_map(|path| std::fs::read_to_string(path).ok())
+    .filter_map(|value| value.trim().parse::<usize>().ok())
+    .next()?;
+    Some((limit, current))
+}
+
+#[cfg(unix)]
+fn total_system_memory_bytes() -> Option<usize> {
+    // SAFETY: sysconf reads immutable process-wide system configuration.
+    let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
+    // SAFETY: sysconf reads immutable process-wide system configuration.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if pages <= 0 || page_size <= 0 {
+        return None;
+    }
+    usize::try_from(pages)
+        .ok()?
+        .checked_mul(usize::try_from(page_size).ok()?)
+}
+
+#[cfg(not(unix))]
+fn total_system_memory_bytes() -> Option<usize> {
+    None
 }
 
 fn validate_record_batch(batch: &RecordBatch) -> Result<()> {
@@ -6911,7 +7392,6 @@ mod tests {
         assert_eq!(
             adaptive_incompressible_window_bytes(
                 DEFAULT_WRITE_WINDOW_BYTES,
-                100,
                 Duration::from_micros(100),
             ),
             INCOMPRESSIBLE_WRITE_WINDOW_BYTES
@@ -6919,31 +7399,108 @@ mod tests {
         assert_eq!(
             adaptive_incompressible_window_bytes(
                 DEFAULT_WRITE_WINDOW_BYTES,
-                100,
-                ADAPTIVE_NETWORK_RTT,
+                REMOTE_WRITE_WINDOW_RTT,
             ),
             DEFAULT_WRITE_WINDOW_BYTES
         );
         assert_eq!(
-            adaptive_incompressible_window_bytes(
-                DEFAULT_WRITE_WINDOW_BYTES,
-                WIDE_COPY_ADAPTIVE_COLUMNS - 1,
-                Duration::ZERO,
-            ),
+            adaptive_incompressible_window_bytes(MIN_WRITE_WINDOW_BYTES, Duration::ZERO),
+            MIN_WRITE_WINDOW_BYTES
+        );
+    }
+
+    #[test]
+    fn automatic_write_windows_follow_memory_and_network_budgets() {
+        assert_eq!(
+            automatic_write_window_bytes_for_memory(false, None),
+            DEFAULT_WRITE_WINDOW_BYTES
+        );
+        assert_eq!(
+            automatic_write_window_bytes_for_memory(false, Some(DEFAULT_WRITE_WINDOW_BYTES),),
             INCOMPRESSIBLE_WRITE_WINDOW_BYTES
         );
         assert_eq!(
-            adaptive_incompressible_window_bytes(
+            automatic_write_window_bytes_for_memory(false, Some(32 * 1024 * 1024)),
+            MIN_WRITE_WINDOW_BYTES
+        );
+        assert_eq!(
+            automatic_write_window_bytes_for_memory(true, None),
+            CONSTRAINED_WRITE_WINDOW_BYTES
+        );
+        assert_eq!(
+            automatic_write_window_bytes_for_memory(true, Some(4 * 1024 * 1024 * 1024),),
+            1024 * 1024 * 1024
+        );
+        assert_eq!(
+            adaptive_physical_window_bytes(DEFAULT_WRITE_WINDOW_BYTES, Duration::ZERO, 1),
+            LOCAL_PHYSICAL_WINDOW_BYTES
+        );
+        assert_eq!(
+            adaptive_physical_window_bytes(
                 DEFAULT_WRITE_WINDOW_BYTES,
-                WIDE_COPY_ADAPTIVE_COLUMNS,
                 Duration::ZERO,
+                WIDE_MEMORY_BOUND_COLUMNS,
+            ),
+            WIDE_LOCAL_PHYSICAL_WINDOW_BYTES
+        );
+        assert_eq!(
+            adaptive_physical_window_bytes(
+                DEFAULT_WRITE_WINDOW_BYTES,
+                REMOTE_WRITE_WINDOW_RTT,
+                WIDE_MEMORY_BOUND_COLUMNS,
             ),
             DEFAULT_WRITE_WINDOW_BYTES
         );
         assert_eq!(
-            adaptive_incompressible_window_bytes(MIN_WRITE_WINDOW_BYTES, 1, Duration::ZERO,),
+            adaptive_physical_window_bytes(
+                MIN_WRITE_WINDOW_BYTES,
+                Duration::ZERO,
+                WIDE_MEMORY_BOUND_COLUMNS,
+            ),
             MIN_WRITE_WINDOW_BYTES
         );
+    }
+
+    #[test]
+    fn ingest_memory_reservations_keep_headroom_for_concurrent_work() {
+        let reservation = ingest_memory_reservation_bytes(128 * 1024 * 1024);
+        assert_eq!(reservation, 352 * 1024 * 1024);
+        assert!(ingest_memory_reservation_fits(
+            800 * 1024 * 1024,
+            128 * 1024 * 1024,
+            0,
+            reservation,
+        ));
+        assert!(!ingest_memory_reservation_fits(
+            800 * 1024 * 1024,
+            128 * 1024 * 1024,
+            reservation,
+            reservation,
+        ));
+        assert!(!ingest_memory_reservation_fits(
+            usize::MAX,
+            usize::MAX,
+            1,
+            1,
+        ));
+    }
+
+    #[test]
+    #[ignore = "run in an isolated Linux cgroup with a 512 MiB memory limit"]
+    fn concurrent_ingest_reservation_fails_before_cgroup_oom() {
+        let (limit, _) = cgroup_memory_limit_and_usage_bytes().expect("cgroup memory accounting");
+        assert!(limit <= 512 * 1024 * 1024);
+
+        let first = reserve_ingest_memory(128 * 1024 * 1024).expect("first reservation");
+        let error = match reserve_ingest_memory(128 * 1024 * 1024) {
+            Ok(_) => panic!("second reservation must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.status, Status::Internal);
+        assert!(error.message.contains("reserved by other ingests"));
+
+        drop(first);
+        assert!(reserve_ingest_memory(128 * 1024 * 1024).is_ok());
     }
 
     #[test]
@@ -7288,6 +7845,7 @@ mod tests {
             &mut reader,
             schema,
             DEFAULT_WRITE_WINDOW_BYTES,
+            LOCAL_PHYSICAL_WINDOW_BYTES,
             INCOMPRESSIBLE_WRITE_WINDOW_BYTES,
             Some(100_000),
             WireCompression::None,
@@ -7305,11 +7863,12 @@ mod tests {
 
     #[test]
     fn encoded_columns_keep_only_material_compression_savings() {
+        let mut compressed = CompressedArena::default();
         let mut compressible = EncodedColumn::new(None, WireCompression::None);
         compressible
-            .push(&vec![0; MIN_ENCODE_BUFFER_BYTES])
+            .push(&vec![0; MIN_ENCODE_BUFFER_BYTES], &mut compressed)
             .unwrap();
-        compressible.finish().unwrap();
+        compressible.finish(&mut compressed).unwrap();
         assert!(matches!(
             compressible.compression,
             CompressionMode::Enabled(_)
@@ -7326,8 +7885,10 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let mut incompressible = EncodedColumn::new(None, WireCompression::None);
-        incompressible.push(&incompressible_bytes).unwrap();
-        incompressible.finish().unwrap();
+        incompressible
+            .push(&incompressible_bytes, &mut compressed)
+            .unwrap();
+        incompressible.finish(&mut compressed).unwrap();
         assert!(matches!(
             incompressible.compression,
             CompressionMode::Disabled
@@ -7336,19 +7897,131 @@ mod tests {
     }
 
     #[test]
+    fn compressed_storage_coalesces_pieces_without_heap_retention() {
+        let mut compressed = CompressedArena::default();
+        let first = compressed
+            .store(&vec![1; MIN_ENCODE_BUFFER_BYTES / 4])
+            .unwrap();
+        let second = compressed
+            .store(&vec![2; MIN_ENCODE_BUFFER_BYTES / 4])
+            .unwrap();
+
+        assert_eq!(compressed.slabs.len(), 1);
+        assert_eq!(first.slab, second.slab);
+        assert_eq!(compressed.physical_bytes(), COMPRESSED_ARENA_SLAB_BYTES);
+        assert_eq!(compressed.used_bytes(), MIN_ENCODE_BUFFER_BYTES / 2);
+        assert_eq!(
+            first.slice(&compressed, MIN_ENCODE_BUFFER_BYTES / 4),
+            vec![1; MIN_ENCODE_BUFFER_BYTES / 4]
+        );
+    }
+
+    #[test]
     fn compression_probe_selects_shuffle_from_observed_timestamp_bytes() {
         let timestamps = (0..32_768i64)
             .flat_map(|value| (1_700_000_000_000_000i64 + value * 1_000).to_le_bytes())
             .collect::<Vec<_>>();
         let mut column = EncodedColumn::new(Some(8), WireCompression::None);
-        column.push(&timestamps).unwrap();
-        column.finish().unwrap();
+        let mut compressed = CompressedArena::default();
+        column.push(&timestamps, &mut compressed).unwrap();
+        column.finish(&mut compressed).unwrap();
 
         assert_eq!(
             column.compression,
             CompressionMode::Enabled(CompressionTransform::Shuffle(8))
         );
         assert!(column.stored_bytes() < timestamps.len() / 4);
+    }
+
+    #[test]
+    fn automatic_compression_uses_shuffle_without_claiming_wire_lz4() {
+        let timestamps = arrow_array::TimestampMicrosecondArray::from_iter_values(
+            (0..32_768).map(|value| 1_700_000_000_000_000i64 + value * 1_000),
+        );
+        let batch =
+            RecordBatch::try_from_iter([("time", Arc::new(timestamps) as ArrayRef)]).unwrap();
+        let schema = batch.schema();
+        let estimated = estimated_batch_size(&schema, &batch).unwrap();
+        let mut window = EncodedIngestWindow::for_schema(&schema, WireCompression::Auto).unwrap();
+        window
+            .append(
+                &schema,
+                vec![PendingBatch {
+                    batch,
+                    estimated_bytes: estimated,
+                    compaction_level: 0,
+                }],
+                estimated,
+            )
+            .unwrap();
+        window.finish().unwrap();
+
+        assert!(matches!(
+            window.columns[0].compression,
+            CompressionMode::Enabled(CompressionTransform::Shuffle(_))
+        ));
+        assert!(!window.uses_wire_lz4());
+    }
+
+    #[test]
+    fn pinned_buffer_accounting_uses_the_parent_allocation() {
+        let parent = Int64Array::from_iter_values(0..1_024);
+        let sliced = parent.slice(100, 10);
+        let batch = RecordBatch::try_from_iter([("value", Arc::new(sliced) as ArrayRef)]).unwrap();
+
+        let buffers = pinned_record_batch_buffers([&batch]);
+
+        assert_eq!(buffers.len(), 1);
+        assert!(buffer_bytes(&buffers) >= 1_024 * std::mem::size_of::<i64>());
+    }
+
+    #[test]
+    fn ingest_stats_attribute_prefetched_window_memory() {
+        let mut stats = IngestStats::new(512, 256, 128, 0, Duration::ZERO, "savepoint");
+        stats.record_window(CompletedIngestWindow {
+            rows: 10,
+            bytes: 100,
+            stored_bytes: 300,
+            storage: WindowStorage::Arrow,
+            wire_lz4: false,
+            memory: WindowMemoryUsage {
+                encoded_stored_bytes: 100,
+                retained_buffers: HashMap::from([(1, 200)]),
+                peak_staging_bytes: 200,
+                peak_build_bytes: 300,
+                peak_build_buffers: HashMap::from([(1, 200)]),
+                scratch_bytes: 10,
+            },
+            streaming: IngestStreamingUsage {
+                largest_chunk: 0,
+                largest_column_bytes: 0,
+            },
+        });
+        stats.record_window(CompletedIngestWindow {
+            rows: 10,
+            bytes: 100,
+            stored_bytes: 250,
+            storage: WindowStorage::Arrow,
+            wire_lz4: false,
+            memory: WindowMemoryUsage {
+                encoded_stored_bytes: 50,
+                retained_buffers: HashMap::from([(1, 200)]),
+                peak_staging_bytes: 300,
+                peak_build_bytes: 350,
+                peak_build_buffers: HashMap::from([(1, 200), (2, 100)]),
+                scratch_bytes: 20,
+            },
+            streaming: IngestStreamingUsage {
+                largest_chunk: 0,
+                largest_column_bytes: 0,
+            },
+        });
+
+        assert_eq!(stats.physical_peaks(), (370, 480));
+        let json = stats.to_json();
+        assert!(json.contains("\"window_physical_stored_bytes\":[300,250]"));
+        assert!(json.contains("\"window_retained_arrow_pinned_bytes\":[200,200]"));
+        assert!(json.contains("\"peak_prefetch_physical_bytes\":480"));
     }
 
     #[test]
@@ -7363,11 +8036,47 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let mut column = EncodedColumn::new(Some(8), WireCompression::None);
-        column.push(&values).unwrap();
-        column.finish().unwrap();
+        let mut compressed = CompressedArena::default();
+        column.push(&values, &mut compressed).unwrap();
+        column.finish(&mut compressed).unwrap();
 
         assert_eq!(column.compression, CompressionMode::Disabled);
         assert_eq!(column.stored_bytes(), values.len());
+    }
+
+    #[test]
+    fn incompressible_nullable_batches_do_not_switch_to_retained_encoding() {
+        let mut state = 0x9e3779b97f4a7c15u64;
+        let values = (0..32_768)
+            .map(|index| {
+                state ^= state << 7;
+                state ^= state >> 9;
+                state ^= state << 8;
+                (index != 7).then_some(state as i64)
+            })
+            .collect::<Vec<_>>();
+        let batch =
+            RecordBatch::try_from_iter([("value", Arc::new(Int64Array::from(values)) as ArrayRef)])
+                .unwrap();
+        let schema = batch.schema();
+        let estimated = estimated_batch_size(&schema, &batch).unwrap();
+        let mut window = EncodedIngestWindow::for_schema(&schema, WireCompression::None).unwrap();
+
+        window
+            .append(
+                &schema,
+                vec![PendingBatch {
+                    batch,
+                    estimated_bytes: estimated,
+                    compaction_level: 0,
+                }],
+                estimated,
+            )
+            .unwrap();
+
+        assert!(window.incompressible);
+        assert!(!window.retain_arrow_eligible);
+        assert!(!window.retain_arrow);
     }
 
     #[test]
@@ -7413,7 +8122,10 @@ mod tests {
     #[test]
     fn compression_falls_back_when_the_sample_does_not_represent_the_tail() {
         let mut column = EncodedColumn::new(Some(8), WireCompression::None);
-        column.push(&vec![0; ENCODE_CHUNK_BYTES]).unwrap();
+        let mut compressed = CompressedArena::default();
+        column
+            .push(&vec![0; ENCODE_CHUNK_BYTES], &mut compressed)
+            .unwrap();
         assert!(matches!(column.compression, CompressionMode::Enabled(_)));
 
         let mut state = 0x9e3779b97f4a7c15u64;
@@ -7425,8 +8137,8 @@ mod tests {
                 state.to_le_bytes()
             })
             .collect::<Vec<_>>();
-        column.push(&tail).unwrap();
-        column.finish().unwrap();
+        column.push(&tail, &mut compressed).unwrap();
+        column.finish(&mut compressed).unwrap();
 
         assert_eq!(column.compression, CompressionMode::Disabled);
         assert!(matches!(column.chunks[0], EncodedChunk::Lz4 { .. }));
@@ -7518,20 +8230,26 @@ mod tests {
             format in prop::sample::select(vec![CompressionFormat::Block, CompressionFormat::Frame]),
             input in prop::collection::vec(any::<u8>(), 0..4096),
         ) {
-            let (compressed, compressed_len) =
-                compress_bytes(&input, CompressionTransform::Shuffle(width), format).unwrap();
+            let mut workspace = CompressionWorkspace::default();
+            let compressed_len =
+                compress_bytes(&input, CompressionTransform::Shuffle(width), format, &mut workspace)
+                    .unwrap();
             let mut decoded = vec![0; input.len()];
             match format {
                 CompressionFormat::Block => {
                     let written = lz4_flex::block::decompress_into(
-                        &compressed[..compressed_len],
+                        &workspace.compressed[..compressed_len],
                         &mut decoded,
                     )
                     .unwrap();
                     prop_assert_eq!(written, input.len());
                 }
                 CompressionFormat::Frame => {
-                    decompress_frame_into(&compressed[..compressed_len], &mut decoded).unwrap();
+                    decompress_frame_into(
+                        &workspace.compressed[..compressed_len],
+                        &mut decoded,
+                    )
+                    .unwrap();
                 }
             }
             let mut restored = vec![0; input.len()];
@@ -7541,24 +8259,27 @@ mod tests {
     }
 
     #[test]
-    fn incompressible_windows_are_bounded_unless_rows_are_explicit() {
+    fn automatic_windows_obey_physical_and_incompressible_bounds() {
         let mut window = EncodedIngestWindow::new(0);
-        window.retain_arrow = true;
+        window.incompressible = true;
         window.estimated_bytes = INCOMPRESSIBLE_WRITE_WINDOW_BYTES - 1;
-        assert!(!should_finish_incompressible_window(
+        assert!(!should_finish_automatic_window(
             None,
+            LOCAL_PHYSICAL_WINDOW_BYTES,
             INCOMPRESSIBLE_WRITE_WINDOW_BYTES,
             &window
         ));
 
         window.estimated_bytes = INCOMPRESSIBLE_WRITE_WINDOW_BYTES;
-        assert!(should_finish_incompressible_window(
+        assert!(should_finish_automatic_window(
             None,
+            LOCAL_PHYSICAL_WINDOW_BYTES,
             INCOMPRESSIBLE_WRITE_WINDOW_BYTES,
             &window
         ));
-        assert!(!should_finish_incompressible_window(
+        assert!(!should_finish_automatic_window(
             Some(100_000),
+            LOCAL_PHYSICAL_WINDOW_BYTES,
             INCOMPRESSIBLE_WRITE_WINDOW_BYTES,
             &window
         ));
@@ -7567,7 +8288,7 @@ mod tests {
     #[test]
     fn incompressible_staging_honors_the_remaining_physical_window() {
         let mut window = EncodedIngestWindow::new(0);
-        window.retain_arrow = true;
+        window.incompressible = true;
         window.estimated_bytes = 16 * 1024 * 1024;
 
         assert_eq!(
@@ -7603,6 +8324,7 @@ mod tests {
             &mut reader,
             schema,
             DEFAULT_WRITE_WINDOW_BYTES,
+            LOCAL_PHYSICAL_WINDOW_BYTES,
             INCOMPRESSIBLE_WRITE_WINDOW_BYTES,
             Some(1_000_000),
             WireCompression::None,
@@ -7617,7 +8339,7 @@ mod tests {
     }
 
     #[test]
-    fn ingest_window_prefetch_builds_the_next_window_before_it_is_requested() {
+    fn ingest_window_prefetch_builds_the_next_window_during_upload() {
         let batch = RecordBatch::try_from_iter([(
             "value",
             Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
@@ -7634,6 +8356,7 @@ mod tests {
         let windows = start_ingest_window_prefetch(
             Box::new(reader),
             schema,
+            8,
             8,
             8,
             None,
@@ -7659,6 +8382,7 @@ mod tests {
                 schema: Arc::clone(&schema),
             }),
             schema,
+            8,
             8,
             8,
             None,
@@ -7695,6 +8419,7 @@ mod tests {
             &mut reader,
             schema,
             DEFAULT_WRITE_WINDOW_BYTES,
+            LOCAL_PHYSICAL_WINDOW_BYTES,
             INCOMPRESSIBLE_WRITE_WINDOW_BYTES,
             Some(rows),
             WireCompression::None,
@@ -7734,6 +8459,7 @@ mod tests {
             Arc::clone(&schema),
             budget,
             budget,
+            budget,
             None,
             WireCompression::None,
         );
@@ -7763,6 +8489,7 @@ mod tests {
         let mut scheduler = IngestWindowScheduler::new(
             &mut reader,
             Arc::clone(&schema),
+            budget,
             budget,
             budget,
             None,

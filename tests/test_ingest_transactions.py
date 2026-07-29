@@ -202,12 +202,17 @@ def test_default_scheduler_coalesces_small_upstream_batches(monetdb_uri: str) ->
 
 
 @pytest.mark.integration
-def test_default_scheduler_uses_larger_bound_only_for_narrow_fixed_constraints(
+def test_default_scheduler_distinguishes_logical_and_physical_budgets(
     monetdb_uri: str,
 ) -> None:
     batch = pa.record_batch({"value": pa.array([1], type=pa.int32())})
     with dbapi.connect(monetdb_uri) as connection, connection.cursor() as cursor:
         try:
+            cursor.adbc_ingest("ingest_regular_budget", batch, mode="replace")
+            regular = json.loads(cursor.adbc_statement.get_option(str(StatementOptions.INGEST_STATS)))[
+                "window_budget_bytes"
+            ]
+
             cursor.execute("CREATE TABLE ingest_unconstrained_budget(value INT)")
             cursor.adbc_ingest("ingest_unconstrained_budget", batch, mode="append")
             unconstrained = json.loads(cursor.adbc_statement.get_option(str(StatementOptions.INGEST_STATS)))[
@@ -230,11 +235,16 @@ def test_default_scheduler_uses_larger_bound_only_for_narrow_fixed_constraints(
                 "window_budget_bytes"
             ]
 
-            assert unconstrained <= 512 * 1024 * 1024
+            stats = json.loads(cursor.adbc_statement.get_option(str(StatementOptions.INGEST_STATS)))
+            assert regular <= 512 * 1024 * 1024
+            assert unconstrained == regular
             assert constrained <= 2 * 1024 * 1024 * 1024
             assert constrained >= unconstrained
-            assert variable == unconstrained
+            assert variable == regular
+            assert stats["physical_window_budget_bytes"] <= 128 * 1024 * 1024
+            assert stats["incompressible_window_budget_bytes"] <= 64 * 1024 * 1024
         finally:
+            cursor.execute("DROP TABLE IF EXISTS ingest_regular_budget")
             cursor.execute("DROP TABLE IF EXISTS ingest_unconstrained_budget")
             cursor.execute("DROP TABLE IF EXISTS ingest_constrained_budget")
             cursor.execute("DROP TABLE IF EXISTS ingest_variable_constraint_budget")

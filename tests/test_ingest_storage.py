@@ -37,6 +37,7 @@ def test_explicit_byte_window_is_the_incompressible_authority(monetdb_uri: str) 
 
     assert stats["path"] == "copy"
     assert stats["window_budget_bytes"] == 32 * MIB
+    assert stats["physical_window_budget_bytes"] == 32 * MIB
     assert stats["incompressible_window_budget_bytes"] == 32 * MIB
     assert stats["copy_count"] == 3
     window_bytes = cast(list[int], stats["window_bytes"])
@@ -81,3 +82,43 @@ def test_ingest_storage_stats_account_for_lz4_raw_and_arrow(monetdb_uri: str) ->
                 assert stats["stored_bytes"] < stats["encoded_bytes"]
             else:
                 assert stats["stored_bytes"] == stats["encoded_bytes"]
+            assert isinstance(stats["peak_window_physical_bytes"], int)
+            assert isinstance(stats["peak_prefetch_physical_bytes"], int)
+            for field in (
+                "window_physical_stored_bytes",
+                "window_staging_bytes",
+                "window_retained_arrow_pinned_bytes",
+                "window_scratch_bytes",
+            ):
+                assert len(cast(list[int], stats[field])) == cast(int, stats["copy_count"])
+            assert stats["peak_prefetch_physical_bytes"] >= stats["peak_window_physical_bytes"]
+
+
+@pytest.mark.integration
+def test_auto_uses_shuffled_storage_without_mislabeling_wire_compression(
+    monetdb_uri: str,
+) -> None:
+    rows = 1_000_000
+    batch = pa.record_batch(
+        {
+            "time": pa.array(
+                (1_700_000_000_000_000 + index * 1_000 for index in range(rows)),
+                type=pa.timestamp("us"),
+            ),
+        }
+    )
+    with (
+        dbapi.connect(monetdb_uri, autocommit=True) as connection,
+        connection.cursor(
+            adbc_stmt_kwargs={
+                StatementOptions.INGEST_INSERT_ROWS: 0,
+                StatementOptions.WIRE_COMPRESSION: "auto",
+            }
+        ) as cursor,
+    ):
+        assert cursor.adbc_ingest("auto_shuffle_storage", batch, mode="replace") == rows
+        stats = _stats(cursor)
+
+    assert stats["window_storage"] == ["lz4"]
+    assert stats["window_wire_compression"] == ["none"]
+    assert cast(int, stats["stored_bytes"]) < cast(int, stats["encoded_bytes"])
