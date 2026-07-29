@@ -46,20 +46,22 @@ integer seconds. The corresponding ADBC option names end in `_timeout_seconds`. 
 to 30 seconds, write defaults to 60 seconds, and read and operation timeouts default to disabled.
 Zero disables any timeout explicitly.
 
-Timeout and cancellation close the MAPI session. Cancellation is connection-scoped and may
-interrupt whichever statement currently owns the connection; open a new connection afterward.
+Client-side timeout and cancellation close the MAPI session. Their ADBC errors contain the
+binary detail `adbc.monetdb.connection_terminal=true`, which lets a pool invalidate the session
+without matching message text. A server SQLSTATE timeout or cancellation has no terminal marker
+and remains reusable when MonetDB keeps the session open. Cancellation is connection-scoped and
+may interrupt whichever statement currently owns the connection.
 
 ## Bulk ingestion
 
 The driver measures and coalesces producer batches into COPY windows using a 512 MiB logical
 encoded-byte target. Below 5 ms measured round trip, physical retained storage is limited to
 128 MiB and incompressible windows close at 64 MiB. Schemas with at least 512 columns use 48 MiB
-for both local limits. Above 5 ms, the physical limits rise to the logical target. Constrained
-append rows no larger than 16 bytes use a 2 GiB logical target to avoid repeated index
-maintenance. Every logical target is capped by a fraction of the lower of physical memory and a
-finite cgroup limit. Oversized producer batches are split without copying, and a single row larger
-than the configured budget is the only possible overrun. Producer batch size therefore does not
-need to match the driver window. The connection and statement option
+for both local limits. Above 5 ms, the physical limits rise to the logical target. Every logical
+target is capped by one eighth of the lower of physical memory and a finite cgroup limit.
+Oversized producer batches are split without copying, and a single row larger than the configured
+budget is the only possible overrun. Producer batch size therefore does not need to match the
+driver window. The connection and statement option
 `adbc.monetdb.write_window_bytes` changes all three budgets together;
 the diagnostic `adbc.monetdb.write_batch_rows` option forces an exact row count instead. On
 automatic settings, measured round trips of at least 5 ms raise both physical limits to the
@@ -94,16 +96,32 @@ per-window decision observable.
 A complete single-batch ingest of at most 100 rows and 8 MiB uses the cached prepared INSERT path;
 the row threshold adapts upward on measured higher-latency connections. Set
 `adbc.monetdb.ingest_insert_rows=0` to force COPY. The URI accepts `write_window_bytes`,
-`ingest_insert_rows`, `prepared_cache_capacity`, and `wire_compression` for URI-only consumers.
+`ingest_insert_rows`, `prepared_cache_capacity`, `wire_compression`, and `constrained_append` for
+URI-only consumers.
 
-In a caller-managed transaction, a client-side failure after completed COPY windows makes commit
-fail until rollback, including through raw transaction SQL, so a partial append is not
-accidentally committed. Advanced callers may set
+COPY-sized appends to an existing constrained table use an unconstrained staging table. MonetDB
+11.55.7 and newer use a session-local table. Versions 11.55.0–11.55.6 use a uniquely named
+transactional `UNLOGGED` table in the target schema, and therefore require `CREATE TABLE` there,
+because those server releases can lose a local temporary-table definition after a prepared
+statement. Temporary-table targets remain direct on those older releases. Bounded windows write
+to staging, followed by one target `INSERT … SELECT`, so MonetDB validates a growing primary or
+unique key once instead of once per client window. Upgrade to 11.55.7 or select `direct` if schema
+creation is unavailable. Unconstrained targets and tiny prepared INSERTs remain direct. The default
+`adbc.monetdb.constrained_append=auto` is suitable for general workloads; set it to `direct` only
+for a measured server/workload exception or a diagnostic comparison. Ingest stats distinguish
+`staging_copy_count`, `target_copy_count`, and `final_move_count`.
+
+In a caller-managed transaction, a client-side failure after completed direct target COPY windows
+makes commit fail until rollback, including through raw transaction SQL, so a partial append is
+not accidentally committed. Staged constrained appends change the target only in the final move;
+producer or constraint failure rolls back to the ingest savepoint and preserves earlier caller
+work. Advanced callers may set
 `adbc.monetdb.ingest_atomicity=savepoint` to roll back only the ingest, or
 `adbc.monetdb.ingest_partial=allow` to permit a partial commit. Statement option
 `adbc.monetdb.ingest_stats` returns post-execution JSON including the chosen path, measured round
 trip, effective thresholds, physical stored, staging, retained-Arrow pinned, scratch, and overlap
-high-water bytes, per-window storage and wire modes, and prepared-cache hits.
+high-water bytes, per-window storage and wire modes, prepared-cache hits, and
+target/staging/move counts.
 
 ## Client information
 

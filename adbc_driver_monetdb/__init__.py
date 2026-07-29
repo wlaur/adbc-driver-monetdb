@@ -44,6 +44,7 @@ class DatabaseOptions(StrEnum):
     INGEST_INSERT_ROWS = "adbc.monetdb.ingest_insert_rows"
     PREPARED_CACHE_CAPACITY = "adbc.monetdb.prepared_cache_capacity"
     WIRE_COMPRESSION = "adbc.monetdb.wire_compression"
+    CONSTRAINED_APPEND = "adbc.monetdb.constrained_append"
 
 
 class ConnectionOptions(StrEnum):
@@ -59,6 +60,7 @@ class ConnectionOptions(StrEnum):
     WIRE_COMPRESSION = "adbc.monetdb.wire_compression"
     INGEST_PARTIAL = "adbc.monetdb.ingest_partial"
     INGEST_ATOMICITY = "adbc.monetdb.ingest_atomicity"
+    CONSTRAINED_APPEND = "adbc.monetdb.constrained_append"
 
 
 class StatementOptions(StrEnum):
@@ -73,7 +75,9 @@ class StatementOptions(StrEnum):
     WIRE_COMPRESSION = "adbc.monetdb.wire_compression"
     INGEST_PARTIAL = "adbc.monetdb.ingest_partial"
     INGEST_ATOMICITY = "adbc.monetdb.ingest_atomicity"
+    CONSTRAINED_APPEND = "adbc.monetdb.constrained_append"
     INGEST_STATS = "adbc.monetdb.ingest_stats"
+    BIND_BY_NAME = "adbc.monetdb.bind_by_name"
 
 
 DatabaseOptionValues = TypedDict(
@@ -92,6 +96,7 @@ DatabaseOptionValues = TypedDict(
         "adbc.monetdb.ingest_insert_rows": str | int,
         "adbc.monetdb.prepared_cache_capacity": str | int,
         "adbc.monetdb.wire_compression": Literal["none", "auto", "lz4"],
+        "adbc.monetdb.constrained_append": Literal["auto", "direct"],
     },
     total=False,
 )
@@ -110,6 +115,7 @@ ConnectionOptionValues = TypedDict(
         "adbc.monetdb.wire_compression": Literal["none", "auto", "lz4"],
         "adbc.monetdb.ingest_partial": Literal["block", "allow"],
         "adbc.monetdb.ingest_atomicity": Literal["transaction", "savepoint"],
+        "adbc.monetdb.constrained_append": Literal["auto", "direct"],
     },
     total=False,
 )
@@ -127,6 +133,8 @@ StatementOptionValues = TypedDict(
         "adbc.monetdb.wire_compression": Literal["none", "auto", "lz4"],
         "adbc.monetdb.ingest_partial": Literal["block", "allow"],
         "adbc.monetdb.ingest_atomicity": Literal["transaction", "savepoint"],
+        "adbc.monetdb.constrained_append": Literal["auto", "direct"],
+        "adbc.monetdb.bind_by_name": str | bool,
     },
     total=False,
 )

@@ -9,10 +9,10 @@ use std::{
     sync::{
         Arc, Mutex, MutexGuard, Weak,
         atomic::{AtomicU64, AtomicUsize, Ordering},
-        mpsc::{Receiver, SyncSender, sync_channel},
+        mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel},
     },
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use adbc_core::error::{Error, Result, Status};
@@ -50,8 +50,6 @@ const LOCAL_PHYSICAL_WINDOW_BYTES: usize = 128 * 1024 * 1024;
 const WIDE_LOCAL_PHYSICAL_WINDOW_BYTES: usize = 48 * 1024 * 1024;
 const WIDE_MEMORY_BOUND_COLUMNS: usize = 512;
 const INCOMPRESSIBLE_WRITE_WINDOW_BYTES: usize = 64 * 1024 * 1024;
-const CONSTRAINED_WRITE_WINDOW_BYTES: usize = 1usize << 31;
-const NARROW_CONSTRAINED_ROW_BYTES: usize = 16;
 const MIN_WRITE_WINDOW_BYTES: usize = 4 * 1024 * 1024;
 const ENCODE_CHUNK_BYTES: usize = 1024 * 1024;
 const MIN_ENCODE_BUFFER_BYTES: usize = 64 * 1024;
@@ -79,8 +77,10 @@ const PREPARED_CACHE_CAPACITY_OPTION: &str = "adbc.monetdb.prepared_cache_capaci
 const WIRE_COMPRESSION_OPTION: &str = "adbc.monetdb.wire_compression";
 const INGEST_PARTIAL_OPTION: &str = "adbc.monetdb.ingest_partial";
 const INGEST_ATOMICITY_OPTION: &str = "adbc.monetdb.ingest_atomicity";
+const CONSTRAINED_APPEND_OPTION: &str = "adbc.monetdb.constrained_append";
 const INGEST_STATS_OPTION: &str = "adbc.monetdb.ingest_stats";
-const BIND_BY_NAME_OPTION: &str = "adbc.statement.bind_by_name";
+const BIND_BY_NAME_OPTION: &str = "adbc.monetdb.bind_by_name";
+const DRIVER_MANAGER_BIND_BY_NAME_OPTION: &str = "adbc.statement.bind_by_name";
 const CONNECT_TIMEOUT_OPTION: &str = "adbc.monetdb.connect_timeout_seconds";
 const READ_TIMEOUT_OPTION: &str = "adbc.monetdb.read_timeout_seconds";
 const WRITE_TIMEOUT_OPTION: &str = "adbc.monetdb.write_timeout_seconds";
@@ -88,7 +88,9 @@ const OPERATION_TIMEOUT_OPTION: &str = "adbc.monetdb.operation_timeout_seconds";
 const CLIENT_APPLICATION_OPTION: &str = "adbc.monetdb.client_application";
 const CLIENT_REMARK_OPTION: &str = "adbc.monetdb.client_remark";
 const CLIENT_INFO_OPTION: &str = "adbc.monetdb.client_info";
+const TERMINAL_ERROR_DETAIL: &str = "adbc.monetdb.connection_terminal";
 const MINIMUM_VERSION: (u16, u16, u16) = (11, 55, 0);
+const LOCAL_TEMP_STAGING_MINIMUM_VERSION: (u16, u16, u16) = (11, 55, 7);
 static SAVEPOINT_ID: AtomicU64 = AtomicU64::new(0);
 static RESERVED_INGEST_MEMORY_BYTES: AtomicUsize = AtomicUsize::new(0);
 thread_local! {
@@ -118,6 +120,7 @@ const URI_QUERY_KEYS: &[&str] = &[
     "ingest_insert_rows",
     "prepared_cache_capacity",
     "wire_compression",
+    "constrained_append",
 ];
 
 fn tuning_option_from_uri_key(key: &str) -> Option<&'static str> {
@@ -126,6 +129,7 @@ fn tuning_option_from_uri_key(key: &str) -> Option<&'static str> {
         "ingest_insert_rows" => Some(INGEST_INSERT_ROWS_OPTION),
         "prepared_cache_capacity" => Some(PREPARED_CACHE_CAPACITY_OPTION),
         "wire_compression" => Some(WIRE_COMPRESSION_OPTION),
+        "constrained_append" => Some(CONSTRAINED_APPEND_OPTION),
         _ => None,
     }
 }
@@ -136,6 +140,7 @@ fn tuning_uri_key(option: &str) -> Option<&'static str> {
         INGEST_INSERT_ROWS_OPTION => Some("ingest_insert_rows"),
         PREPARED_CACHE_CAPACITY_OPTION => Some("prepared_cache_capacity"),
         WIRE_COMPRESSION_OPTION => Some("wire_compression"),
+        CONSTRAINED_APPEND_OPTION => Some("constrained_append"),
         _ => None,
     }
 }
@@ -158,6 +163,9 @@ fn validate_tuning_option(key: &str, value: &OptionValue) -> Result<()> {
         }
         WIRE_COMPRESSION_OPTION => {
             WireCompression::parse(value)?;
+        }
+        CONSTRAINED_APPEND_OPTION => {
+            ConstrainedAppend::parse(value)?;
         }
         _ => return Err(not_implemented(key)),
     }
@@ -420,6 +428,38 @@ impl IngestAtomicity {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConstrainedAppend {
+    Auto,
+    Direct,
+}
+
+impl ConstrainedAppend {
+    fn parse(value: &OptionValue) -> Result<Self> {
+        let OptionValue::String(value) = value else {
+            return Err(error(
+                format!("option '{CONSTRAINED_APPEND_OPTION}' must be a string"),
+                Status::InvalidArguments,
+            ));
+        };
+        match value.as_str() {
+            "auto" => Ok(Self::Auto),
+            "direct" => Ok(Self::Direct),
+            _ => Err(error(
+                format!("option '{CONSTRAINED_APPEND_OPTION}' must be 'auto' or 'direct'"),
+                Status::InvalidArguments,
+            )),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Direct => "direct",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WireCompression {
     None,
     Auto,
@@ -573,6 +613,7 @@ fn map_display(error: impl fmt::Display, status: Status) -> Error {
 struct DriverConnection {
     inner: Mutex<monetdb::Connection>,
     pending_deallocations: Mutex<Vec<u64>>,
+    prepared_generation: AtomicU64,
     ingest_poison: Mutex<Option<IngestPoison>>,
 }
 
@@ -581,6 +622,7 @@ impl DriverConnection {
         Self {
             inner: Mutex::new(connection),
             pending_deallocations: Mutex::new(Vec::new()),
+            prepared_generation: AtomicU64::new(0),
             ingest_poison: Mutex::new(None),
         }
     }
@@ -637,6 +679,14 @@ fn lock_connection(connection: &SharedConnection) -> Result<MutexGuard<'_, monet
         .inner
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    queue_pending_deallocations(connection, &connection_guard);
+    Ok(connection_guard)
+}
+
+fn queue_pending_deallocations(
+    connection: &DriverConnection,
+    connection_guard: &monetdb::Connection,
+) {
     let pending = connection
         .pending_deallocations
         .lock()
@@ -646,10 +696,28 @@ fn lock_connection(connection: &SharedConnection) -> Result<MutexGuard<'_, monet
     for id in pending {
         connection_guard.try_deallocate(id);
     }
-    Ok(connection_guard)
+}
+
+fn invalidate_prepared_cache(connection: &DriverConnection, prepared_cache: &SharedPreparedCache) {
+    connection
+        .prepared_generation
+        .fetch_add(1, Ordering::AcqRel);
+    prepared_cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
 }
 
 fn map_cursor_error(value: CursorError) -> Error {
+    let terminal = matches!(
+        &value,
+        CursorError::Closed
+            | CursorError::Cancelled
+            | CursorError::Timeout
+            | CursorError::IO(_)
+            | CursorError::Framing(_)
+            | CursorError::BadReply(_)
+    );
     let status = match value {
         CursorError::Closed | CursorError::NoResultSet => Status::InvalidState,
         CursorError::Cancelled => Status::Cancelled,
@@ -669,6 +737,10 @@ fn map_cursor_error(value: CursorError) -> Error {
         && let Some(sqlstate) = error.sqlstate().and_then(parse_sqlstate)
     {
         result.sqlstate = sqlstate;
+    }
+    if terminal {
+        result.vendor_code = adbc_core::constants::ADBC_ERROR_VENDOR_CODE_PRIVATE_DATA;
+        result.details = Some(vec![(TERMINAL_ERROR_DETAIL.to_owned(), b"true".to_vec())]);
     }
     result
 }
@@ -878,6 +950,7 @@ impl Optionable for MonetdbDatabase {
                         return Ok(DEFAULT_PREPARED_CACHE_CAPACITY.to_string());
                     }
                     WIRE_COMPRESSION_OPTION => "auto",
+                    CONSTRAINED_APPEND_OPTION => "auto",
                     _ => unreachable!("tuning option was recognized"),
                 }
                 .to_owned());
@@ -1128,6 +1201,7 @@ impl Database for MonetdbDatabase {
             measured_round_trip,
             ingest_partial: IngestPartial::Block,
             ingest_atomicity: IngestAtomicity::Transaction,
+            constrained_append: ConstrainedAppend::Auto,
             options,
             version,
             catalog,
@@ -1140,6 +1214,7 @@ impl Database for MonetdbDatabase {
             INGEST_INSERT_ROWS_OPTION,
             PREPARED_CACHE_CAPACITY_OPTION,
             WIRE_COMPRESSION_OPTION,
+            CONSTRAINED_APPEND_OPTION,
         ] {
             if let Some(value) = self.options.get(key) {
                 result.set_option(OptionConnection::Other(key.to_owned()), value.clone())?;
@@ -1228,6 +1303,7 @@ pub struct MonetdbConnection {
     measured_round_trip: Duration,
     ingest_partial: IngestPartial,
     ingest_atomicity: IngestAtomicity,
+    constrained_append: ConstrainedAppend,
     options: Options,
     version: (u16, u16, u16),
     catalog: String,
@@ -1238,6 +1314,7 @@ type PreparedSlot = Arc<Mutex<Arc<PreparedEntry>>>;
 
 struct PreparedEntry {
     id: u64,
+    generation: u64,
     parameters: Schema,
     result: Schema,
     connection: Weak<DriverConnection>,
@@ -1247,6 +1324,7 @@ impl PreparedEntry {
     fn new(metadata: PreparedMetadata, connection: &SharedConnection) -> Self {
         Self {
             id: metadata.id,
+            generation: connection.prepared_generation.load(Ordering::Acquire),
             parameters: metadata.parameters,
             result: metadata.result,
             connection: Arc::downgrade(connection),
@@ -1259,6 +1337,9 @@ impl Drop for PreparedEntry {
         let Some(connection) = self.connection.upgrade() else {
             return;
         };
+        if self.generation != connection.prepared_generation.load(Ordering::Acquire) {
+            return;
+        }
         match connection.inner.try_lock() {
             Ok(connection) => {
                 connection.try_deallocate(self.id);
@@ -1432,6 +1513,12 @@ impl Optionable for MonetdbConnection {
             self.options.set(key, value);
             return Ok(());
         }
+        if key.as_ref() == CONSTRAINED_APPEND_OPTION {
+            self.constrained_append = ConstrainedAppend::parse(&value)?;
+            self.options
+                .set(key, self.constrained_append.as_str().into());
+            return Ok(());
+        }
         match &key {
             OptionConnection::AutoCommit => {
                 let enabled = option_bool(&value)?;
@@ -1468,10 +1555,7 @@ impl Optionable for MonetdbConnection {
                     &format!("SET SCHEMA {}", quote_identifier(schema)?),
                     self.timeouts,
                 )?;
-                self.prepared_cache
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clear();
+                invalidate_prepared_cache(&self.inner, &self.prepared_cache);
             }
             OptionConnection::ReadOnly => {
                 let enabled = option_bool(&value)?;
@@ -1537,6 +1621,9 @@ impl Optionable for MonetdbConnection {
         }
         if key.as_ref() == INGEST_ATOMICITY_OPTION {
             return Ok(self.ingest_atomicity.as_str().to_owned());
+        }
+        if key.as_ref() == CONSTRAINED_APPEND_OPTION {
+            return Ok(self.constrained_append.as_str().to_owned());
         }
         self.options.get_string(key)
     }
@@ -1609,6 +1696,8 @@ impl Connection for MonetdbConnection {
             measured_round_trip: self.measured_round_trip,
             ingest_partial: self.ingest_partial,
             ingest_atomicity: self.ingest_atomicity,
+            constrained_append: self.constrained_append,
+            server_version: self.version,
             ingest_stats: None,
             bound: None,
             prepared: false,
@@ -1778,6 +1867,8 @@ pub struct MonetdbStatement {
     measured_round_trip: Duration,
     ingest_partial: IngestPartial,
     ingest_atomicity: IngestAtomicity,
+    constrained_append: ConstrainedAppend,
+    server_version: (u16, u16, u16),
     ingest_stats: Option<String>,
     bound: Option<Box<dyn RecordBatchReader + Send>>,
     prepared: bool,
@@ -1836,13 +1927,22 @@ impl Optionable for MonetdbStatement {
             self.options.set(key, value);
             return Ok(());
         }
+        if key.as_ref() == CONSTRAINED_APPEND_OPTION {
+            self.constrained_append = ConstrainedAppend::parse(&value)?;
+            self.options
+                .set(key, self.constrained_append.as_str().into());
+            return Ok(());
+        }
         if key.as_ref() == INGEST_STATS_OPTION {
             return Err(error(
                 format!("option '{INGEST_STATS_OPTION}' is read-only"),
                 Status::InvalidArguments,
             ));
         }
-        if key.as_ref() == BIND_BY_NAME_OPTION {
+        if matches!(
+            key.as_ref(),
+            BIND_BY_NAME_OPTION | DRIVER_MANAGER_BIND_BY_NAME_OPTION
+        ) {
             self.bind_by_name = option_bool(&value)?;
             self.options.set(key, value);
             return Ok(());
@@ -1904,7 +2004,10 @@ impl Optionable for MonetdbStatement {
     }
 
     fn get_option_string(&self, key: Self::Option) -> Result<String> {
-        if key.as_ref() == BIND_BY_NAME_OPTION {
+        if matches!(
+            key.as_ref(),
+            BIND_BY_NAME_OPTION | DRIVER_MANAGER_BIND_BY_NAME_OPTION
+        ) {
             return Ok(self.bind_by_name.to_string());
         }
         if key.as_ref() == READ_PREFETCH_OPTION {
@@ -1930,6 +2033,9 @@ impl Optionable for MonetdbStatement {
         }
         if key.as_ref() == INGEST_ATOMICITY_OPTION {
             return Ok(self.ingest_atomicity.as_str().to_owned());
+        }
+        if key.as_ref() == CONSTRAINED_APPEND_OPTION {
+            return Ok(self.constrained_append.as_str().to_owned());
         }
         if key.as_ref() == INGEST_STATS_OPTION {
             return self
@@ -2089,10 +2195,7 @@ impl Statement for MonetdbStatement {
         validate_unbound_query(query)?;
         let invalidates_cache = query_invalidates_prepared_cache(query)?;
         if invalidates_cache {
-            self.prepared_cache
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clear();
+            invalidate_prepared_cache(&self.connection, &self.prepared_cache);
         }
         let result = query_result_with_timeouts(
             &self.connection,
@@ -2102,10 +2205,7 @@ impl Statement for MonetdbStatement {
             self.timeouts,
         );
         if invalidates_cache && result.is_ok() {
-            self.prepared_cache
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clear();
+            invalidate_prepared_cache(&self.connection, &self.prepared_cache);
         }
         result
     }
@@ -2129,17 +2229,11 @@ impl Statement for MonetdbStatement {
             .ok_or_else(|| error("SQL query is not set", Status::InvalidState))?;
         let invalidates_cache = query_invalidates_prepared_cache(query)?;
         if invalidates_cache {
-            self.prepared_cache
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clear();
+            invalidate_prepared_cache(&self.connection, &self.prepared_cache);
         }
         let result = execute_update_script(&self.connection, query, self.timeouts);
         if invalidates_cache && result.is_ok() {
-            self.prepared_cache
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clear();
+            invalidate_prepared_cache(&self.connection, &self.prepared_cache);
         }
         result
     }
@@ -2338,7 +2432,7 @@ impl MonetdbStatement {
         if layout.is_named() != self.bind_by_name {
             return Err(error(
                 if layout.is_named() {
-                    "named parameters require adbc.statement.bind_by_name"
+                    "named parameters require adbc.monetdb.bind_by_name"
                 } else {
                     "positional parameters cannot be bound by name"
                 },
@@ -2409,10 +2503,7 @@ impl MonetdbStatement {
             .optional_string(OptionStatement::IngestMode)
             .unwrap_or("adbc.ingest.mode.create");
         if mode != "adbc.ingest.mode.append" {
-            self.prepared_cache
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clear();
+            invalidate_prepared_cache(&self.connection, &self.prepared_cache);
         }
         let temporary = self
             .options
@@ -2466,20 +2557,7 @@ impl MonetdbStatement {
             }
         }
 
-        let columns = schema
-            .fields()
-            .iter()
-            .map(|field| {
-                let sql_type = monetdb_arrow::sql_type_for_field(field)
-                    .map_err(|value| map_display(value, Status::NotImplemented))?;
-                Ok(format!(
-                    "{} {}{}",
-                    quote_identifier(field.name())?,
-                    sql_type,
-                    if field.is_nullable() { "" } else { " NOT NULL" }
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let columns = ingest_column_definitions(&schema, true)?;
         let create = format!(
             "CREATE {}TABLE {} ({}){}",
             if temporary { "LOCAL TEMPORARY " } else { "" },
@@ -2523,33 +2601,69 @@ impl MonetdbStatement {
                     table,
                     self.timeouts,
                 )?);
-        let automatic_window = self.write_window_bytes.is_none() && self.write_batch_rows.is_none();
-        let narrow_constrained_append = if automatic_window && append_to_existing {
-            let fixed_row_width = fixed_encoded_row_width(&schema)?;
-            fixed_row_width.is_some_and(|width| width <= NARROW_CONSTRAINED_ROW_BYTES)
-                && table_has_constraints(
-                    &connection,
-                    if temporary { Some("tmp") } else { schema_name },
-                    table,
-                    self.timeouts,
-                )?
-        } else {
-            false
-        };
-        let caller_scope = if insert_candidate.is_some() {
+        let constrained_append_candidate = insert_candidate.is_none()
+            && append_to_existing
+            && self.constrained_append == ConstrainedAppend::Auto
+            && (!temporary || self.server_version >= LOCAL_TEMP_STAGING_MINIMUM_VERSION);
+        let caller_scope = if insert_candidate.is_some() || constrained_append_candidate {
             CallerTransactionScope::Savepoint
         } else if append_to_existing && self.ingest_atomicity == IngestAtomicity::Transaction {
             CallerTransactionScope::Direct
         } else {
             CallerTransactionScope::Savepoint
         };
-        let (mut cursor, atomic_scope) =
+        let (mut cursor, mut atomic_scope) =
             begin_atomic(&connection, "ingest", caller_scope, self.timeouts)?;
+        let staged_constrained_append = if constrained_append_candidate {
+            match table_has_constraints(
+                &mut cursor,
+                if temporary { Some("tmp") } else { schema_name },
+                table,
+            ) {
+                Ok(value) => value,
+                Err(root) => {
+                    return finish_atomic(
+                        &connection,
+                        &mut cursor,
+                        atomic_scope,
+                        Err(root),
+                        self.timeouts,
+                    );
+                }
+            }
+        } else {
+            false
+        };
+        if staged_constrained_append {
+            invalidate_prepared_cache(&self.connection, &self.prepared_cache);
+        } else if constrained_append_candidate
+            && self.ingest_atomicity == IngestAtomicity::Transaction
+        {
+            let releasable = match &atomic_scope {
+                AtomicScope::Savepoint {
+                    name,
+                    retain_until_transaction_end: false,
+                } => Some(name.clone()),
+                _ => None,
+            };
+            if let Some(name) = releasable {
+                if let Err(root) = cursor.execute(&format!("RELEASE SAVEPOINT {name}")) {
+                    return finish_atomic(
+                        &connection,
+                        &mut cursor,
+                        atomic_scope,
+                        Err(map_cursor_error(root)),
+                        self.timeouts,
+                    );
+                }
+                atomic_scope = AtomicScope::CallerTransaction;
+            }
+        }
         let caller_transaction = matches!(&atomic_scope, AtomicScope::CallerTransaction);
         let scope_name = atomic_scope.name();
         let window_budget = self
             .write_window_bytes
-            .unwrap_or_else(|| automatic_write_window_bytes(narrow_constrained_append));
+            .unwrap_or_else(automatic_write_window_bytes);
         let physical_window_budget = self.write_window_bytes.unwrap_or_else(|| {
             adaptive_physical_window_bytes(
                 window_budget,
@@ -2578,15 +2692,14 @@ impl MonetdbStatement {
                 temporary,
             };
             let setup = execute_ingest_target_mode(&mut cursor, &target);
-            drop(cursor);
-            drop(connection);
             let mut prepared_cache_hit = false;
             let inserted = setup.and_then(|()| {
                 let mut prepared = None;
                 let mut prepare_error = None;
                 for insert_query in insert_parameter_queries(&operation_target, &schema)? {
-                    match prepare_cached_with_status(
+                    match prepare_cached_with_status_locked(
                         &self.connection,
+                        &connection,
                         &self.prepared_cache,
                         &insert_query,
                         schema.fields().len(),
@@ -2608,12 +2721,23 @@ impl MonetdbStatement {
                                 Status::Internal,
                             )
                         })?;
-                        diagnose_append_target_after_prepare_error(
-                            &self.connection,
-                            &target,
-                            &schema,
-                            self.timeouts,
-                        )?;
+                        if matches!(
+                            target.mode,
+                            "adbc.ingest.mode.append" | "adbc.ingest.mode.create_append"
+                        ) {
+                            let mismatch_status = append_mismatch_status(target.mode);
+                            let destination = append_table_columns(
+                                &mut cursor,
+                                if target.temporary {
+                                    Some("tmp")
+                                } else {
+                                    target.schema_name
+                                },
+                                target.table,
+                                mismatch_status,
+                            )?;
+                            validate_append_schema(&schema, &destination, mismatch_status)?;
+                        }
                         return Err(root);
                     }
                 };
@@ -2636,9 +2760,6 @@ impl MonetdbStatement {
                         prepared: None,
                     })
                     .collect::<Vec<_>>();
-                let connection = lock_connection(&self.connection)?;
-                let mut cursor = connection.cursor();
-                cursor.set_timeouts(self.timeouts);
                 let mut total = 0i64;
                 let mut has_count = false;
                 execute_update_batch(&mut cursor, &queries, &mut total, &mut has_count)?;
@@ -2665,9 +2786,6 @@ impl MonetdbStatement {
                         Ok(rows)
                     })
             });
-            let connection = lock_connection(&self.connection)?;
-            let mut cursor = connection.cursor();
-            cursor.set_timeouts(self.timeouts);
             let result = finish_atomic(
                 &connection,
                 &mut cursor,
@@ -2684,10 +2802,7 @@ impl MonetdbStatement {
             drop(cursor);
             drop(connection);
             if mode != "adbc.ingest.mode.append" && result.is_ok() {
-                self.prepared_cache
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clear();
+                invalidate_prepared_cache(&self.connection, &self.prepared_cache);
             }
             return result;
         }
@@ -2700,18 +2815,50 @@ impl MonetdbStatement {
                 table,
                 temporary,
             };
-            prepare_ingest_target(&mut cursor, &target, &schema)?;
+            let destination = prepare_ingest_target(&mut cursor, &target, &schema)?;
+            let stage = if staged_constrained_append {
+                let destination = destination.as_deref().ok_or_else(|| {
+                    error(
+                        "constrained append staging requires an existing destination",
+                        Status::Internal,
+                    )
+                })?;
+                let local = self.server_version >= LOCAL_TEMP_STAGING_MINIMUM_VERSION;
+                let persistent_schema = if local {
+                    None
+                } else {
+                    Some(match schema_name {
+                        Some(value) => value.to_owned(),
+                        None => current_schema_name(&mut cursor)?,
+                    })
+                };
+                let stage = constrained_append_stage(
+                    &schema,
+                    destination,
+                    &operation_target,
+                    local,
+                    persistent_schema.as_deref(),
+                )?;
+                cursor.execute(&stage.create).map_err(map_cursor_error)?;
+                stats.path = "staged_copy";
+                Some(stage)
+            } else {
+                None
+            };
+            let copy_target = stage.as_ref().map_or(operation_target.as_str(), |stage| {
+                stage.qualified_name.as_str()
+            });
 
             let files = (0..schema.fields().len())
                 .map(|index| format!("'c{index}'"))
                 .collect::<Vec<_>>()
                 .join(", ");
             let copy =
-                format!("COPY LITTLE ENDIAN BINARY INTO {operation_target} FROM {files} ON CLIENT");
+                format!("COPY LITTLE ENDIAN BINARY INTO {copy_target} FROM {files} ON CLIENT");
             let copy_lz4 = format!(
-                "COPY LITTLE ENDIAN BINARY INTO {operation_target} FROM {files} ON 'lz4' CLIENT"
+                "COPY LITTLE ENDIAN BINARY INTO {copy_target} FROM {files} ON 'lz4' CLIENT"
             );
-            let windows = start_ingest_window_prefetch(
+            let mut windows = start_ingest_window_prefetch(
                 reader,
                 Arc::clone(&schema),
                 window_budget,
@@ -2722,7 +2869,7 @@ impl MonetdbStatement {
             )?;
             let mut rows = 0i64;
             let upload_result = (|| {
-                while let Some(mut window) = windows.next_window()? {
+                while let Some(mut window) = windows.next_window(self.timeouts.operation)? {
                     let wire_lz4 = window.uses_wire_lz4();
                     let stored_bytes = window.stored_bytes();
                     let storage = window.storage_mode();
@@ -2886,20 +3033,22 @@ impl MonetdbStatement {
                             })
                         })
                         .transpose();
-                    encoder_result?;
-                    upload_result?;
-                    stats.record_window(CompletedIngestWindow {
-                        rows: window.rows,
-                        bytes: window_bytes,
-                        stored_bytes,
-                        storage,
-                        wire_lz4,
-                        memory: memory_usage,
-                        streaming: IngestStreamingUsage {
-                            largest_chunk,
-                            largest_column_bytes,
+                    combine_error(upload_result, encoder_result, "ingest encoder cleanup")?;
+                    stats.record_window(
+                        CompletedIngestWindow {
+                            rows: window.rows,
+                            bytes: window_bytes,
+                            stored_bytes,
+                            storage,
+                            wire_lz4,
+                            memory: memory_usage,
+                            streaming: IngestStreamingUsage {
+                                largest_chunk,
+                                largest_column_bytes,
+                            },
                         },
-                    });
+                        staged_constrained_append,
+                    );
                     let server_rows = cursor.affected_rows().ok_or_else(|| {
                         error(
                             "MonetDB did not report the COPY row count",
@@ -2922,11 +3071,47 @@ impl MonetdbStatement {
                 }
                 Ok(rows)
             })();
-            let scheduler_stats = windows.finish()?;
-            stats.input_batches = scheduler_stats.input_batches;
-            stats.coalesced_windows = scheduler_stats.coalesced_windows;
-            stats.split_windows = scheduler_stats.split_windows;
-            upload_result
+            let scheduler_result = windows.finish();
+            if let Ok(Some(scheduler_stats)) = &scheduler_result {
+                stats.input_batches = scheduler_stats.input_batches;
+                stats.coalesced_windows = scheduler_stats.coalesced_windows;
+                stats.split_windows = scheduler_stats.split_windows;
+            }
+            let upload_result =
+                combine_error(upload_result, scheduler_result, "ingest prefetch cleanup");
+            let moved = upload_result.and_then(|rows| {
+                let Some(stage) = &stage else {
+                    return Ok(rows);
+                };
+                cursor
+                    .execute(&stage.move_to_target)
+                    .map_err(map_cursor_error)?;
+                let moved = cursor.affected_rows().ok_or_else(|| {
+                    error(
+                        "MonetDB did not report the constrained append row count",
+                        Status::InvalidData,
+                    )
+                })?;
+                if moved != rows {
+                    return Err(error(
+                        format!(
+                            "MonetDB moved {moved} staged rows from an ingest containing {rows} rows"
+                        ),
+                        Status::InvalidData,
+                    ));
+                }
+                stats.final_move_count = 1;
+                Ok(rows)
+            });
+            if let Some(stage) = &stage {
+                combine_atomic_error(
+                    moved,
+                    cursor.execute(&stage.drop),
+                    "dropping the constrained append staging table",
+                )
+            } else {
+                moved
+            }
         })();
         let operation_failed = result.is_err();
         let result = finish_atomic(
@@ -2939,24 +3124,45 @@ impl MonetdbStatement {
         .map(Some);
         if operation_failed
             && caller_transaction
-            && stats.copy_count > 0
+            && stats.target_copy_count > 0
             && self.ingest_partial == IngestPartial::Block
         {
             self.connection
-                .poison_ingest(&operation_target, stats.copy_count);
+                .poison_ingest(&operation_target, stats.target_copy_count);
             stats.poisoned = true;
         }
         self.ingest_stats = Some(stats.to_json());
         drop(cursor);
         drop(connection);
         if mode != "adbc.ingest.mode.append" && result.is_ok() {
-            self.prepared_cache
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clear();
+            invalidate_prepared_cache(&self.connection, &self.prepared_cache);
         }
         result
     }
+}
+
+fn ingest_column_definitions(
+    schema: &SchemaRef,
+    preserve_nullability: bool,
+) -> Result<Vec<String>> {
+    schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let sql_type = monetdb_arrow::sql_type_for_field(field)
+                .map_err(|value| map_display(value, Status::NotImplemented))?;
+            Ok(format!(
+                "{} {}{}",
+                quote_identifier(field.name())?,
+                sql_type,
+                if preserve_nullability && !field.is_nullable() {
+                    " NOT NULL"
+                } else {
+                    ""
+                }
+            ))
+        })
+        .collect()
 }
 
 struct IngestTarget<'a> {
@@ -2968,11 +3174,91 @@ struct IngestTarget<'a> {
     temporary: bool,
 }
 
+struct ConstrainedAppendStage {
+    qualified_name: String,
+    create: String,
+    move_to_target: String,
+    drop: String,
+}
+
+fn constrained_append_stage(
+    schema: &SchemaRef,
+    destination: &[AppendColumn],
+    operation_target: &str,
+    local: bool,
+    persistent_schema: Option<&str>,
+) -> Result<ConstrainedAppendStage> {
+    let name = if local {
+        savepoint_name("ingest_stage")
+    } else {
+        format!(
+            "{}_{}",
+            savepoint_name("ingest_stage"),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        )
+    };
+    let quoted_name = quote_identifier(&name)?;
+    let qualified_name = qualified_name(
+        if local {
+            Some("tmp")
+        } else {
+            Some(persistent_schema.ok_or_else(|| {
+                error(
+                    "persistent constrained append staging requires a schema",
+                    Status::Internal,
+                )
+            })?)
+        },
+        &name,
+    )?;
+    let create_target = if local {
+        quoted_name
+    } else {
+        qualified_name.clone()
+    };
+    let source_columns = schema
+        .fields()
+        .iter()
+        .map(|field| quote_identifier(field.name()))
+        .collect::<Result<Vec<_>>>()?
+        .join(", ");
+    let destination_columns = destination
+        .iter()
+        .map(|column| quote_identifier(&column.name))
+        .collect::<Result<Vec<_>>>()?
+        .join(", ");
+    Ok(ConstrainedAppendStage {
+        create: format!(
+            "CREATE {}TABLE {create_target} ({}){}",
+            if local {
+                "LOCAL TEMPORARY "
+            } else {
+                "UNLOGGED "
+            },
+            ingest_column_definitions(schema, false)?.join(", "),
+            if local {
+                " ON COMMIT PRESERVE ROWS"
+            } else {
+                ""
+            }
+        ),
+        move_to_target: format!(
+            "INSERT INTO {operation_target} ({destination_columns}) \
+             SELECT {source_columns} FROM {qualified_name}"
+        ),
+        drop: format!("DROP TABLE {qualified_name}"),
+        qualified_name,
+    })
+}
+
 fn prepare_ingest_target(
     cursor: &mut monetdb::Cursor,
     target: &IngestTarget<'_>,
     schema: &SchemaRef,
-) -> Result<()> {
+) -> Result<Option<Vec<AppendColumn>>> {
     execute_ingest_target_mode(cursor, target)?;
     if matches!(
         target.mode,
@@ -2994,8 +3280,9 @@ fn prepare_ingest_target(
             mismatch_status,
         )?;
         validate_append_schema(schema, &destination, mismatch_status)?;
+        return Ok(Some(destination));
     }
-    Ok(())
+    Ok(None)
 }
 
 fn execute_ingest_target_mode(
@@ -3071,35 +3358,6 @@ fn append_mismatch_status(mode: &str) -> Status {
     }
 }
 
-fn diagnose_append_target_after_prepare_error(
-    connection: &SharedConnection,
-    target: &IngestTarget<'_>,
-    schema: &SchemaRef,
-    timeouts: Timeouts,
-) -> Result<()> {
-    if !matches!(
-        target.mode,
-        "adbc.ingest.mode.append" | "adbc.ingest.mode.create_append"
-    ) {
-        return Ok(());
-    }
-    let connection = lock_connection(connection)?;
-    let mut cursor = connection.cursor();
-    cursor.set_timeouts(timeouts);
-    let mismatch_status = append_mismatch_status(target.mode);
-    let destination = append_table_columns(
-        &mut cursor,
-        if target.temporary {
-            Some("tmp")
-        } else {
-            target.schema_name
-        },
-        target.table,
-        mismatch_status,
-    )?;
-    validate_append_schema(schema, &destination, mismatch_status)
-}
-
 fn upload_column_index(filename: &str, columns: usize) -> std::result::Result<usize, CursorError> {
     filename
         .strip_prefix('c')
@@ -3143,33 +3401,61 @@ struct IngestSchedulerStats {
 }
 
 struct IngestWindowPrefetch {
-    receiver: Receiver<Result<Option<EncodedIngestWindow>>>,
-    worker: JoinHandle<IngestSchedulerStats>,
-    _memory_reservation: IngestMemoryReservation,
+    receiver: Option<Receiver<Result<Option<EncodedIngestWindow>>>>,
+    worker: Option<JoinHandle<IngestSchedulerStats>>,
 }
 
 impl IngestWindowPrefetch {
-    fn next_window(&self) -> Result<Option<EncodedIngestWindow>> {
-        self.receiver.recv().map_err(|_| {
+    fn next_window(
+        &mut self,
+        operation_timeout: Option<Duration>,
+    ) -> Result<Option<EncodedIngestWindow>> {
+        let receiver = self.receiver.as_ref().ok_or_else(|| {
             error(
-                "ingest window prefetch stopped before producing a result",
-                Status::Internal,
+                "ingest window prefetch is no longer available",
+                Status::InvalidState,
             )
-        })?
+        })?;
+        let received = match operation_timeout {
+            Some(timeout) => receiver.recv_timeout(timeout).map_err(|value| match value {
+                RecvTimeoutError::Timeout => error(
+                    "ingest source did not produce a window before the operation timeout",
+                    Status::Timeout,
+                ),
+                RecvTimeoutError::Disconnected => error(
+                    "ingest window prefetch stopped before producing a result",
+                    Status::Internal,
+                ),
+            }),
+            None => receiver.recv().map_err(|_| {
+                error(
+                    "ingest window prefetch stopped before producing a result",
+                    Status::Internal,
+                )
+            }),
+        };
+        if received
+            .as_ref()
+            .is_err_and(|error| error.status == Status::Timeout)
+        {
+            self.receiver.take();
+        }
+        received?
     }
 
-    fn finish(self) -> Result<IngestSchedulerStats> {
-        let Self {
-            receiver,
-            worker,
-            _memory_reservation,
-        } = self;
+    fn finish(mut self) -> Result<Option<IngestSchedulerStats>> {
+        let detached = self.receiver.is_none();
+        let receiver = self.receiver.take();
+        let worker = self.worker.take().expect("prefetch worker is present");
         drop(receiver);
+        if detached {
+            drop(worker);
+            return Ok(None);
+        }
         let result = worker
             .join()
             .map_err(|_| error("ingest window prefetch thread panicked", Status::Internal));
-        drop(_memory_reservation);
-        result
+        result.map(Some)
     }
 }
 
@@ -3187,6 +3473,7 @@ fn start_ingest_window_prefetch(
     let worker = thread::Builder::new()
         .name("monetdb-ingest-window".into())
         .spawn(move || {
+            let _memory_reservation = memory_reservation;
             let mut scheduler = IngestWindowScheduler::new(
                 reader.as_mut(),
                 schema,
@@ -3216,9 +3503,8 @@ fn start_ingest_window_prefetch(
             )
         })?;
     Ok(IngestWindowPrefetch {
-        receiver,
-        worker,
-        _memory_reservation: memory_reservation,
+        receiver: Some(receiver),
+        worker: Some(worker),
     })
 }
 
@@ -3455,28 +3741,29 @@ fn route_ingest_reader(
     if insert_rows > 0
         && first.num_rows() > 0
         && first.num_rows() <= insert_rows
-        && estimated_bytes <= PARAMETER_UPDATE_BATCH_BYTES
         && second.is_none()
     {
-        let binary_compatible = schema
-            .fields()
-            .iter()
-            .zip(first.columns())
-            .all(|(field, column)| monetdb_arrow::encode_column(field, column.as_ref()).is_ok());
-        if binary_compatible {
-            let arguments = (0..first.num_rows())
-                .map(|row| render_arguments(&first, row).map(|values| values.join(", ")))
-                .collect::<Result<Vec<_>>>();
-            if let Ok(arguments) = arguments {
-                return Ok((
-                    reader,
-                    Some(InsertCandidate {
-                        batch: first,
-                        arguments,
-                        estimated_bytes,
-                    }),
-                ));
-            }
+        for (field, column) in schema.fields().iter().zip(first.columns()) {
+            monetdb_arrow::encode_column(field, column.as_ref())
+                .map_err(|value| map_display(value, Status::InvalidData))?;
+        }
+        let arguments = (0..first.num_rows())
+            .map(|row| render_arguments(&first, row).map(|values| values.join(", ")))
+            .collect::<Result<Vec<_>>>()?;
+        let rendered_bytes = arguments.iter().try_fold(0usize, |total, arguments| {
+            total
+                .checked_add(arguments.len().saturating_add(32))
+                .ok_or_else(|| error("rendered INSERT byte count overflows", Status::Internal))
+        })?;
+        if rendered_bytes <= PARAMETER_UPDATE_BATCH_BYTES {
+            return Ok((
+                reader,
+                Some(InsertCandidate {
+                    batch: first,
+                    arguments,
+                    estimated_bytes,
+                }),
+            ));
         }
     }
     let mut prefix = VecDeque::from([first]);
@@ -4561,6 +4848,9 @@ struct IngestStats {
     coalesced_windows: usize,
     split_windows: usize,
     copy_count: usize,
+    target_copy_count: usize,
+    staging_copy_count: usize,
+    final_move_count: usize,
     encoded_bytes: usize,
     stored_bytes: usize,
     prepared_cache_hits: usize,
@@ -4629,6 +4919,9 @@ impl IngestStats {
             coalesced_windows: 0,
             split_windows: 0,
             copy_count: 0,
+            target_copy_count: 0,
+            staging_copy_count: 0,
+            final_move_count: 0,
             encoded_bytes: 0,
             stored_bytes: 0,
             prepared_cache_hits: 0,
@@ -4653,7 +4946,7 @@ impl IngestStats {
         }
     }
 
-    fn record_window(&mut self, window: CompletedIngestWindow) {
+    fn record_window(&mut self, window: CompletedIngestWindow, staging: bool) {
         let CompletedIngestWindow {
             rows,
             bytes,
@@ -4664,6 +4957,11 @@ impl IngestStats {
             streaming,
         } = window;
         self.copy_count += 1;
+        if staging {
+            self.staging_copy_count += 1;
+        } else {
+            self.target_copy_count += 1;
+        }
         self.encoded_bytes = self.encoded_bytes.saturating_add(bytes);
         self.stored_bytes = self.stored_bytes.saturating_add(stored_bytes);
         let upload_message_bytes = streaming
@@ -4743,7 +5041,8 @@ impl IngestStats {
         format!(
             concat!(
                 "{{\"input_batches\":{},\"coalesced_windows\":{},\"split_windows\":{},",
-                "\"copy_count\":{},\"encoded_bytes\":{},\"stored_bytes\":{},",
+                "\"copy_count\":{},\"target_copy_count\":{},\"staging_copy_count\":{},",
+                "\"final_move_count\":{},\"encoded_bytes\":{},\"stored_bytes\":{},",
                 "\"prepared_cache_hits\":{},",
                 "\"peak_in_flight_bytes\":{},\"window_budget_bytes\":{},",
                 "\"physical_window_budget_bytes\":{},\"incompressible_window_budget_bytes\":{},",
@@ -4760,6 +5059,9 @@ impl IngestStats {
             self.coalesced_windows,
             self.split_windows,
             self.copy_count,
+            self.target_copy_count,
+            self.staging_copy_count,
+            self.final_move_count,
             self.encoded_bytes,
             self.stored_bytes,
             self.prepared_cache_hits,
@@ -4842,26 +5144,6 @@ fn adaptive_incompressible_window_bytes(
     }
 }
 
-fn fixed_encoded_row_width(schema: &SchemaRef) -> Result<Option<usize>> {
-    schema
-        .fields()
-        .iter()
-        .try_fold(Some(0usize), |total, field| {
-            let Some(total) = total else {
-                return Ok(None);
-            };
-            let Some(width) = monetdb_arrow::fixed_encoded_width(field)
-                .map_err(|value| map_display(value, Status::NotImplemented))?
-            else {
-                return Ok(None);
-            };
-            total
-                .checked_add(width)
-                .map(Some)
-                .ok_or_else(|| error("fixed ingest row width overflows", Status::Internal))
-        })
-}
-
 fn adaptive_physical_window_bytes(
     window_budget: usize,
     measured_round_trip: Duration,
@@ -4879,20 +5161,13 @@ fn adaptive_physical_window_bytes(
     }
 }
 
-fn automatic_write_window_bytes(constrained: bool) -> usize {
-    automatic_write_window_bytes_for_memory(constrained, system_memory_limit_bytes())
+fn automatic_write_window_bytes() -> usize {
+    automatic_write_window_bytes_for_memory(system_memory_limit_bytes())
 }
 
-fn automatic_write_window_bytes_for_memory(
-    constrained: bool,
-    memory_limit: Option<usize>,
-) -> usize {
-    let target = if constrained {
-        CONSTRAINED_WRITE_WINDOW_BYTES
-    } else {
-        DEFAULT_WRITE_WINDOW_BYTES
-    };
-    let divisor = if constrained { 4 } else { 8 };
+fn automatic_write_window_bytes_for_memory(memory_limit: Option<usize>) -> usize {
+    let target = DEFAULT_WRITE_WINDOW_BYTES;
+    let divisor = 8;
     memory_limit.map_or(target, |limit| {
         target.min((limit / divisor).max(MIN_WRITE_WINDOW_BYTES))
     })
@@ -5515,6 +5790,33 @@ fn prepare_cached_with_status(
     ))
 }
 
+fn prepare_cached_with_status_locked(
+    shared_connection: &SharedConnection,
+    connection: &monetdb::Connection,
+    cache: &SharedPreparedCache,
+    query: &str,
+    parameter_count: usize,
+    timeouts: Timeouts,
+) -> Result<(Arc<PreparedEntry>, bool)> {
+    let query = normalize_prepared_query(query);
+    if let Some(entry) = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(query)
+    {
+        return Ok((entry, true));
+    }
+    let metadata = prepare_query_inner_locked(connection, query, parameter_count, false, timeouts)?;
+    let candidate = Arc::new(PreparedEntry::new(metadata, shared_connection));
+    Ok((
+        cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(query.to_owned(), candidate),
+        false,
+    ))
+}
+
 struct PreparedField {
     data_type: MonetType,
     undetermined: bool,
@@ -5550,6 +5852,16 @@ fn prepare_query_inner(
 ) -> Result<PreparedMetadata> {
     let query = normalize_prepared_query(query);
     let connection = lock_connection(connection)?;
+    prepare_query_inner_locked(&connection, query, parameter_count, allow_any, timeouts)
+}
+
+fn prepare_query_inner_locked(
+    connection: &monetdb::Connection,
+    query: &str,
+    parameter_count: usize,
+    allow_any: bool,
+    timeouts: Timeouts,
+) -> Result<PreparedMetadata> {
     let use_savepoint = !connection
         .server_info()
         .map_err(map_cursor_error)?
@@ -6265,6 +6577,23 @@ fn begin_atomic(
     ))
 }
 
+fn current_schema_name(cursor: &mut monetdb::Cursor) -> Result<String> {
+    cursor
+        .execute("SELECT current_schema")
+        .map_err(map_cursor_error)?;
+    if !cursor.next_row().map_err(map_cursor_error)? {
+        return Err(error(
+            "current-schema query returned no row",
+            Status::InvalidData,
+        ));
+    }
+    cursor
+        .get_str(0)
+        .map_err(map_cursor_error)?
+        .map(str::to_owned)
+        .ok_or_else(|| error("current schema is NULL", Status::InvalidData))
+}
+
 fn table_exists(
     connection: &monetdb::Connection,
     schema_name: Option<&str>,
@@ -6290,26 +6619,25 @@ fn table_exists(
 }
 
 fn table_has_constraints(
-    connection: &monetdb::Connection,
+    cursor: &mut monetdb::Cursor,
     schema_name: Option<&str>,
     table_name: &str,
-    timeouts: Timeouts,
 ) -> Result<bool> {
     let schema_filter = schema_name
         .map(metadata::raw_string_literal)
         .transpose()?
         .unwrap_or_else(|| "current_schema".to_owned());
     let table = metadata::raw_string_literal(table_name)?;
-    let mut cursor = connection.cursor();
-    cursor.set_timeouts(timeouts);
     cursor
         .execute(&format!(
             "SELECT CAST(COUNT(*) AS VARCHAR(32)) \
-             FROM information_schema.table_constraints \
-             WHERE table_schema = {schema_filter} AND table_name = {table}"
+             FROM sys.keys AS k \
+             JOIN sys.tables AS t ON t.id = k.table_id \
+             JOIN sys.schemas AS s ON s.id = t.schema_id \
+             WHERE s.name = {schema_filter} AND t.name = {table}"
         ))
         .map_err(map_cursor_error)?;
-    count_query_result(&mut cursor, "table constraint")
+    count_query_result(cursor, "table constraint")
 }
 
 fn delete_on_commit_temporary_table_exists(
@@ -6370,6 +6698,23 @@ fn combine_atomic_error<T>(
         }
         (Ok(_), Err(secondary)) => {
             let mut secondary = map_cursor_error(secondary);
+            secondary.message = format!("{context} failed: {}", secondary.message);
+            Err(secondary)
+        }
+    }
+}
+
+fn combine_error<T, U>(result: Result<T>, secondary: Result<U>, context: &str) -> Result<T> {
+    match (result, secondary) {
+        (result, Ok(_)) => result,
+        (Err(mut root), Err(secondary)) => {
+            root.message = format!(
+                "{}; {context} also failed: {}",
+                root.message, secondary.message
+            );
+            Err(root)
+        }
+        (Ok(_), Err(mut secondary)) => {
             secondary.message = format!("{context} failed: {}", secondary.message);
             Err(secondary)
         }
@@ -7189,6 +7534,26 @@ mod tests {
         }
     }
 
+    struct BlockingReader {
+        schema: SchemaRef,
+        release: Receiver<()>,
+    }
+
+    impl Iterator for BlockingReader {
+        type Item = std::result::Result<RecordBatch, ArrowError>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            let _ = self.release.recv();
+            None
+        }
+    }
+
+    impl RecordBatchReader for BlockingReader {
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+    }
+
     #[test]
     fn extracts_sqlstate() {
         assert_eq!(
@@ -7260,6 +7625,20 @@ mod tests {
             connect_error_status(&monetdb::ConnectError::TooManyRedirects),
             Status::IO
         );
+    }
+
+    #[test]
+    fn marks_only_terminal_client_failures_with_structured_error_details() {
+        let timeout = map_cursor_error(CursorError::Timeout);
+        assert_eq!(timeout.status, Status::Timeout);
+        assert_eq!(
+            timeout.details,
+            Some(vec![(TERMINAL_ERROR_DETAIL.to_owned(), b"true".to_vec())])
+        );
+
+        let producer = map_cursor_error(CursorError::FileTransfer("reader failed".into()));
+        assert_eq!(producer.status, Status::InvalidData);
+        assert!(producer.details.is_none());
     }
 
     #[test]
@@ -7363,8 +7742,13 @@ mod tests {
             IngestAtomicity::parse(&OptionValue::String("savepoint".into())).unwrap(),
             IngestAtomicity::Savepoint
         );
+        assert_eq!(
+            ConstrainedAppend::parse(&OptionValue::String("auto".into())).unwrap(),
+            ConstrainedAppend::Auto
+        );
         assert!(IngestPartial::parse(&OptionValue::String("invalid".into())).is_err());
         assert!(IngestAtomicity::parse(&OptionValue::Int(1)).is_err());
+        assert!(ConstrainedAppend::parse(&OptionValue::String("stage".into())).is_err());
         for (value, expected) in [
             ("none", WireCompression::None),
             ("auto", WireCompression::Auto),
@@ -7412,24 +7796,16 @@ mod tests {
     #[test]
     fn automatic_write_windows_follow_memory_and_network_budgets() {
         assert_eq!(
-            automatic_write_window_bytes_for_memory(false, None),
+            automatic_write_window_bytes_for_memory(None),
             DEFAULT_WRITE_WINDOW_BYTES
         );
         assert_eq!(
-            automatic_write_window_bytes_for_memory(false, Some(DEFAULT_WRITE_WINDOW_BYTES),),
+            automatic_write_window_bytes_for_memory(Some(DEFAULT_WRITE_WINDOW_BYTES)),
             INCOMPRESSIBLE_WRITE_WINDOW_BYTES
         );
         assert_eq!(
-            automatic_write_window_bytes_for_memory(false, Some(32 * 1024 * 1024)),
+            automatic_write_window_bytes_for_memory(Some(32 * 1024 * 1024)),
             MIN_WRITE_WINDOW_BYTES
-        );
-        assert_eq!(
-            automatic_write_window_bytes_for_memory(true, None),
-            CONSTRAINED_WRITE_WINDOW_BYTES
-        );
-        assert_eq!(
-            automatic_write_window_bytes_for_memory(true, Some(4 * 1024 * 1024 * 1024),),
-            1024 * 1024 * 1024
         );
         assert_eq!(
             adaptive_physical_window_bytes(DEFAULT_WRITE_WINDOW_BYTES, Duration::ZERO, 1),
@@ -7978,44 +8354,50 @@ mod tests {
     #[test]
     fn ingest_stats_attribute_prefetched_window_memory() {
         let mut stats = IngestStats::new(512, 256, 128, 0, Duration::ZERO, "savepoint");
-        stats.record_window(CompletedIngestWindow {
-            rows: 10,
-            bytes: 100,
-            stored_bytes: 300,
-            storage: WindowStorage::Arrow,
-            wire_lz4: false,
-            memory: WindowMemoryUsage {
-                encoded_stored_bytes: 100,
-                retained_buffers: HashMap::from([(1, 200)]),
-                peak_staging_bytes: 200,
-                peak_build_bytes: 300,
-                peak_build_buffers: HashMap::from([(1, 200)]),
-                scratch_bytes: 10,
+        stats.record_window(
+            CompletedIngestWindow {
+                rows: 10,
+                bytes: 100,
+                stored_bytes: 300,
+                storage: WindowStorage::Arrow,
+                wire_lz4: false,
+                memory: WindowMemoryUsage {
+                    encoded_stored_bytes: 100,
+                    retained_buffers: HashMap::from([(1, 200)]),
+                    peak_staging_bytes: 200,
+                    peak_build_bytes: 300,
+                    peak_build_buffers: HashMap::from([(1, 200)]),
+                    scratch_bytes: 10,
+                },
+                streaming: IngestStreamingUsage {
+                    largest_chunk: 0,
+                    largest_column_bytes: 0,
+                },
             },
-            streaming: IngestStreamingUsage {
-                largest_chunk: 0,
-                largest_column_bytes: 0,
+            false,
+        );
+        stats.record_window(
+            CompletedIngestWindow {
+                rows: 10,
+                bytes: 100,
+                stored_bytes: 250,
+                storage: WindowStorage::Arrow,
+                wire_lz4: false,
+                memory: WindowMemoryUsage {
+                    encoded_stored_bytes: 50,
+                    retained_buffers: HashMap::from([(1, 200)]),
+                    peak_staging_bytes: 300,
+                    peak_build_bytes: 350,
+                    peak_build_buffers: HashMap::from([(1, 200), (2, 100)]),
+                    scratch_bytes: 20,
+                },
+                streaming: IngestStreamingUsage {
+                    largest_chunk: 0,
+                    largest_column_bytes: 0,
+                },
             },
-        });
-        stats.record_window(CompletedIngestWindow {
-            rows: 10,
-            bytes: 100,
-            stored_bytes: 250,
-            storage: WindowStorage::Arrow,
-            wire_lz4: false,
-            memory: WindowMemoryUsage {
-                encoded_stored_bytes: 50,
-                retained_buffers: HashMap::from([(1, 200)]),
-                peak_staging_bytes: 300,
-                peak_build_bytes: 350,
-                peak_build_buffers: HashMap::from([(1, 200), (2, 100)]),
-                scratch_bytes: 20,
-            },
-            streaming: IngestStreamingUsage {
-                largest_chunk: 0,
-                largest_column_bytes: 0,
-            },
-        });
+            true,
+        );
 
         assert_eq!(stats.physical_peaks(), (370, 480));
         let json = stats.to_json();
@@ -8353,7 +8735,7 @@ mod tests {
             offset: 0,
             signal,
         };
-        let windows = start_ingest_window_prefetch(
+        let mut windows = start_ingest_window_prefetch(
             Box::new(reader),
             schema,
             8,
@@ -8364,10 +8746,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(windows.next_window().unwrap().unwrap().rows, 1);
+        assert_eq!(windows.next_window(None).unwrap().unwrap().rows, 1);
         signals.recv_timeout(Duration::from_secs(1)).unwrap();
         signals.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert_eq!(windows.finish().unwrap().input_batches, 2);
+        assert_eq!(windows.finish().unwrap().unwrap().input_batches, 2);
     }
 
     #[test]
@@ -8377,7 +8759,7 @@ mod tests {
             DataType::Int64,
             false,
         )]));
-        let windows = start_ingest_window_prefetch(
+        let mut windows = start_ingest_window_prefetch(
             Box::new(PanickingReader {
                 schema: Arc::clone(&schema),
             }),
@@ -8392,7 +8774,7 @@ mod tests {
 
         assert_eq!(
             windows
-                .next_window()
+                .next_window(None)
                 .err()
                 .expect("prefetch must fail")
                 .status,
@@ -8401,6 +8783,37 @@ mod tests {
         let panic = windows.finish().err().expect("prefetch join must fail");
         assert_eq!(panic.status, Status::Internal);
         assert!(panic.message.contains("panicked"));
+    }
+
+    #[test]
+    fn ingest_window_prefetch_applies_the_operation_timeout_without_joining_a_hung_reader() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let (release, wait) = std::sync::mpsc::channel();
+        let mut windows = start_ingest_window_prefetch(
+            Box::new(BlockingReader {
+                schema: Arc::clone(&schema),
+                release: wait,
+            }),
+            schema,
+            8,
+            8,
+            8,
+            None,
+            WireCompression::None,
+        )
+        .unwrap();
+
+        let timeout = windows
+            .next_window(Some(Duration::from_millis(10)))
+            .err()
+            .expect("blocking the source must time out");
+        assert_eq!(timeout.status, Status::Timeout);
+        assert!(windows.finish().unwrap().is_none());
+        release.send(()).unwrap();
     }
 
     #[test]

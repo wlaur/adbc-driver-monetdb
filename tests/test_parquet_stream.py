@@ -148,6 +148,8 @@ def test_parquet_stream_rejects_invalid_configuration(tmp_path: Path) -> None:
         ParquetArrowStream(path, reclaim_bytes=0)
     with pytest.raises(IndexError, match="row group 3"):
         ParquetArrowStream(path, row_groups=[3])
+    with pytest.raises(ValueError, match="must not contain duplicates"):
+        ParquetArrowStream(path, row_groups=[1, 1])
     with pytest.raises(ValueError, match="epoch column 'missing'"):
         ParquetArrowStream(path, epoch_columns={"missing": "s"})
     with pytest.raises(TypeError, match="epoch column 'flag' must be integer"):

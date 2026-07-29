@@ -113,7 +113,10 @@ long-running query is not terminated merely because it exceeds a client-side wal
 Zero explicitly selects no deadline; negative values and values above the portable socket limit of
 4,294,967 seconds are rejected. A connection timeout covers DNS, every address attempt, TCP or Unix
 connection, TLS, authentication, redirects, and initial driver metadata. A timeout or cancellation
-closes the MAPI session, so the partially read connection cannot be reused.
+raised by the client transport closes the MAPI session, so the partially read connection cannot
+be reused. Those terminal errors include the binary error detail
+`adbc.monetdb.connection_terminal=true`. A server-reported SQLSTATE timeout or cancellation does
+not carry that marker and leaves the session reusable when MonetDB does.
 
 The URI names are `connect_timeout`, `read_timeout`, `write_timeout`, and
 `operation_timeout`. Unknown query names are rejected so misspelled settings cannot be silently
@@ -181,9 +184,7 @@ timeout. Use `adbc_cancel()` when session destruction is intended, or set
 `adbc.monetdb.read_prefetch` to `"false"` when prompt pool reuse matters more than fetch/decode
 overlap.
 
-Ingestion uses a 512 MiB logical encoded-byte window. For constrained append targets whose
-fixed-width wire rows are at most 16 bytes, the logical target is 2 GiB to avoid repeated index
-maintenance.
+Ingestion uses a 512 MiB logical encoded-byte window.
 The driver measures every upstream Arrow batch, coalesces small batches, and splits large ones
 without copying their buffers so each window stays within the byte budget. A single row larger
 than the budget is the only possible overrun. Tiered compaction keeps metadata bounded without
@@ -232,10 +233,26 @@ process-wide and are released on success or failure.
 
 Compared with an application that stages complete column files on disk, a very wide,
 incompressible stream may consequently produce more COPY windows and use more MonetDB memory while
-the server consolidates or reloads those appends. Raising the window would retain more Arrow data
-in client RAM; spilling the encoded columns would recreate the disk-staging path. The automatic
-cap deliberately favors bounded client memory and no staging files. Compressible streams avoid
-this tradeoff because their large logical windows remain small in physical memory.
+the server consolidates or reloads unconstrained appends. Raising the window would retain more
+Arrow data in client RAM; spilling the encoded columns would recreate the disk-staging path. The
+automatic cap deliberately favors bounded client memory and no client-side staging files.
+Compressible streams avoid this tradeoff because their large logical windows remain small in
+physical memory.
+
+COPY-sized appends to an existing table with a primary-key, unique, foreign-key, or check
+constraint use an unconstrained staging table. Bounded windows are copied into that table, then
+one `INSERT … SELECT` applies the complete stream to the real target and validates its constraints
+once. MonetDB 11.55.7 and newer use a session-local table. Versions 11.55.0–11.55.6 use a uniquely
+named transactional `UNLOGGED` table in the target schema because those releases can lose a local
+temporary-table definition after a prepared statement; that compatibility path requires
+`CREATE TABLE` in the target schema. The staging table is dropped on success and its ingest
+savepoint removes it on failure. Temporary-table targets on those older releases remain direct.
+Upgrade to 11.55.7 or set `adbc.monetdb.constrained_append=direct` when schema creation is not
+available. Unconstrained targets and the small prepared-INSERT route remain direct. Set
+`adbc.monetdb.constrained_append=direct` only to diagnose server behavior or when independent
+measurements show that repeated target COPYs are preferable; `auto` is the general-purpose
+default. The option is accepted at database, connection, and statement scope and as
+`constrained_append` in a URI.
 
 `adbc.monetdb.write_window_bytes` changes the logical, physical, and incompressible-data budgets
 together; zero selects the automatic defaults. `adbc.monetdb.write_batch_rows` remains a
@@ -268,13 +285,17 @@ mixing explicit identity values with generated ones must manage that sequence.
 After an ingest, the read-only statement option `adbc.monetdb.ingest_stats` returns JSON containing
 the chosen path, measured round trip, effective INSERT threshold, logical and physical stored
 bytes, storage and wire-compression mode per window, prepared-cache hits, input-batch and COPY
-counts, coalesced/split window counts, and transaction scope. Physical-memory fields include
+counts, coalesced/split window counts, and transaction scope. `target_copy_count`,
+`staging_copy_count`, and `final_move_count` distinguish writes to the real target from internal
+staging work. Physical-memory fields include
 per-window stored, staging, retained-Arrow pinned, and scratch bytes plus single-window and
 prefetch-overlap high-water estimates.
 
 Window construction runs one logical window ahead of the active COPY on a zero-capacity handoff.
 This overlaps Arrow production and encoding with the current upload while bounding lookahead to
 one window. Reader failures and worker panics are joined and returned before ingest completion.
+The statement operation timeout also bounds waiting for the producer; a timed-out producer is
+detached so it cannot indefinitely hold the connection lock.
 
 For Parquet input, install `adbc-driver-monetdb[pyarrow]` and use
 `ParquetArrowStream`. It decodes one physical row group at a time and bounds emitted batches by
@@ -301,7 +322,8 @@ with dbapi.connect("monetdb://localhost:50000/db") as connection:
 `epoch_columns` can reinterpret nullable integer columns as Arrow timestamps in seconds,
 milliseconds, microseconds, or nanoseconds, or as day-based Arrow dates. Values and nulls are
 preserved and transformed batch by batch, so files with integer epoch storage do not need an
-eager Polars conversion.
+eager Polars conversion. `row_groups` preserves the caller's order but rejects duplicates, which
+prevents silently ingesting one physical row group twice.
 
 `PolarsArrowStream` remains useful for non-Parquet lazy pipelines. Its capacity-one handoff is
 backpressured, but Polars 1.43's Parquet source can decode ahead proportional to the dataset even
@@ -310,14 +332,16 @@ make it strictly bounded; prefer `ParquetArrowStream` for Parquet until Polars e
 memory budget ([Polars issue #28569](https://github.com/pola-rs/polars/issues/28569)). The base
 driver remains importable without either optional dependency.
 
-An append to an existing table inside an explicit transaction executes directly for every Arrow
-stream window. This avoids MonetDB retaining and replaying a full table version for an operation
-savepoint. If a client-side stream or encoding error occurs after one or more completed COPY
-windows, subsequent reads remain available but `commit()` raises `InvalidState` until
+An unconstrained append to an existing table inside an explicit transaction executes directly for
+every Arrow stream window. This avoids MonetDB retaining and replaying a full table version for an
+operation savepoint. If a client-side stream or encoding error occurs after one or more completed
+target COPY windows, subsequent reads remain available but `commit()` raises `InvalidState` until
 `rollback()` removes the partial append. The same guard applies to raw SQL `COMMIT`, and a
-successful raw SQL `ROLLBACK` clears it. Server errors retain their DB-API exception and SQLSTATE;
-MonetDB itself leaves that transaction aborted until rollback. Autocommit ingestion wraps the
-complete stream in an internal transaction, rolls it back on error, and restores the connection.
+successful raw SQL `ROLLBACK` clears it. A staged constrained append changes the target only in its
+final move, so producer and constraint failures roll back to the ingest savepoint and preserve
+earlier caller work. Server errors retain their DB-API exception and SQLSTATE. Autocommit
+ingestion wraps the complete stream in an internal transaction, rolls it back on error, and
+restores the connection.
 
 Two advanced statement or connection options change that contract. Setting
 `adbc.monetdb.ingest_atomicity` to `"savepoint"` preserves earlier caller work and rolls back only
@@ -342,6 +366,25 @@ multi-row bound DML retains a savepoint so the whole parameter batch remains ato
 
 `dbapi.Binary` accepts bytes-like values (`bytes`, `bytearray`, and `memoryview`) and returns
 `bytes`. Text is rejected with `TypeError`; encode text explicitly before binding it as binary.
+
+### Tuning guide
+
+Defaults are intended for mixed analytical workloads. Change a setting only with a workload-level
+measurement; statement scope is preferable when one operation is exceptional.
+
+| Option | Default | Scope | Tune when |
+|---|---:|---|---|
+| `read_batch_rows` | 131,072 | connection, statement | Lower to cap result-buffer memory; raise only when larger Arrow batches measurably improve scans |
+| `read_prefetch` | `true` | connection, statement | Disable when promptly returning a connection to a pool matters more than fetch/decode overlap |
+| `write_window_bytes` | `0` (adaptive) | database, connection, statement, URI | Set a byte budget only for measured memory/network constraints; it changes all write budgets together |
+| `write_batch_rows` | `0` (disabled) | connection, statement | Diagnostic exact-row override; it disables byte adaptation and is not a normal production setting |
+| `ingest_insert_rows` | 100, latency-adaptive | database, connection, statement, URI | Set `0` to compare/force COPY or raise a floor for measured high-latency tiny writes |
+| `wire_compression` | `auto` | database, connection, statement, URI | Use `lz4` for bandwidth-bound links or `none` to rule out server decompression while keeping client storage compression |
+| `constrained_append` | `auto` | database, connection, statement, URI | Use `direct` only to diagnose or benchmark repeated target COPY behavior |
+| `ingest_atomicity` | `transaction` | connection, statement | Use `savepoint` for direct unconstrained appends when preserving prior caller work outweighs MonetDB WAL amplification |
+| `ingest_partial` | `block` | connection, statement | Use `allow` only when committing completed direct target windows after a producer failure is intentional |
+| `prepared_cache_capacity` | 512 | database, connection, URI | Adjust for a measured working set of distinct prepared SQL statements |
+| `bind_by_name` | `false` | statement | Enable for Arrow parameters whose fields map to named `:parameter` slots; DB-API dictionaries do this automatically |
 
 ## Performance expectations
 
@@ -384,7 +427,7 @@ close that connection and open another one before issuing more work.
 Client information is sent at login by default. The `client` value in
 [`sys.sessions`](https://www.monetdb.org/documentation-Dec2025/user-guide/sql-catalog/users-roles-privileges-sessions/)
 identifies this driver and its protocol library, for example
-`adbc_driver_monetdb 0.9.1 / monetdb-rust 0.2.2-wlaur.1`. The Python shim uses the basename of
+`adbc_driver_monetdb 0.10.0 / monetdb-rust 0.2.2-wlaur.1`. The Python shim uses the basename of
 `sys.argv[0]` as the default `application`. Hostname and process id are also sent by default, as
 they are by pymonetdb and libmapi; use `client_info=false` if that host metadata should not leave
 the client.
@@ -453,7 +496,7 @@ covering the common SQL-driver baseline.
 | Transactions, autocommit, commit, rollback, and current-schema get/set | Supported |
 | `GetInfo`, `GetObjects`, `GetTableSchema`, and `GetTableTypes` | Supported |
 | TLS and authentication | Certificate file/hash and client certificates are integration-tested; the rustls system-root path is supported |
-| Configurable connect/read/write/operation timeouts and cross-thread cancellation | Supported; timeout/cancel closes the session |
+| Configurable connect/read/write/operation timeouts and cross-thread cancellation | Supported; terminal client failures carry a structured connection marker, while recoverable server SQLSTATE failures do not |
 | SQLSTATE diagnostics and semantic ADBC statuses | Supported before streaming starts; mid-stream errors retain the server diagnostics in their message, but Arrow stream exceptions cannot expose structured SQLSTATE fields |
 | Python DB-API, Polars URI/connection/cursor paths, pandas, wheels, and source builds | Supported |
 

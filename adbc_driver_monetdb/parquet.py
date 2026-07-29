@@ -30,7 +30,16 @@ class _ArrowStreamReader(Protocol):
 
 
 class ParquetArrowStream:
-    """Bounded Arrow stream that decodes one Parquet row group at a time."""
+    """Bounded Arrow stream that decodes one Parquet row group at a time.
+
+    ``batch_rows`` and ``batch_bytes`` cap each emitted Arrow batch; the tighter
+    estimate wins. ``row_groups`` preserves the requested order and must contain
+    unique valid indices. Keep ``use_threads=False`` when the driver's encoder
+    already saturates the host, and enable it only when Parquet decoding is the
+    measured bottleneck. ``reclaim_bytes`` asks PyArrow to return unused allocator
+    pages after that much decoded row-group data; use ``None`` when allocator
+    reclamation costs more than its memory benefit.
+    """
 
     def __init__(
         self,
@@ -71,6 +80,11 @@ class ParquetArrowStream:
                 owned_source.close()
             raise
         selected_row_groups = tuple(range(parquet_file.num_row_groups)) if row_groups is None else tuple(row_groups)
+        if len(set(selected_row_groups)) != len(selected_row_groups):
+            parquet_file.close()
+            if owned_source is not None:
+                owned_source.close()
+            raise ValueError("row_groups must not contain duplicates")
         for row_group in selected_row_groups:
             if row_group < 0 or row_group >= parquet_file.num_row_groups:
                 parquet_file.close()

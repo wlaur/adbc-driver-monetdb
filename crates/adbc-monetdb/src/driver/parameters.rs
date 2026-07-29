@@ -107,7 +107,7 @@ impl QueryTemplate {
             ParameterLayout::Named(names) => {
                 if !bind_by_name {
                     return Err(error(
-                        "named parameters require adbc.statement.bind_by_name",
+                        "named parameters require adbc.monetdb.bind_by_name",
                         Status::InvalidArguments,
                     ));
                 }
