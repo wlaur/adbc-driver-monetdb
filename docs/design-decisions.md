@@ -27,6 +27,14 @@ requirements change their premises.
   closes the session. Closing a prefetched reader drops its receiver, waits for a bounded grace
   period, and then detaches a still-running fetch so abandoning a result does not implicitly
   destroy the session.
+- Client transport timeout, cancellation, I/O, framing, and closed-session errors carry the ADBC
+  detail `adbc.monetdb.connection_terminal=true`. Server SQLSTATE timeout and cancellation errors
+  do not. This gives pools a structured invalidation contract without treating every timeout as
+  fatal or matching human-readable diagnostics.
+- Named Arrow binding is exposed as `adbc.monetdb.bind_by_name`. The driver also accepts
+  `adbc.statement.bind_by_name` because the Python ADBC driver manager emits that spelling
+  internally for DB-API dictionaries; it is an interoperability input rather than the driver's
+  documented public option.
 - The driver repository does not maintain a separate changelog. Pull requests, Git history, and
   generated GitHub release notes are the change record.
 - DBC libraries are built directly for each target rather than extracted from Python wheels.
@@ -55,9 +63,8 @@ requirements change their premises.
   target from physical retained storage. Below a measured 5 ms round trip, ordinary schemas have
   a 128 MiB physical limit and incompressible windows close at 64 MiB. Schemas with at least 512
   columns use 48 MiB for both local limits; above 5 ms, both physical limits rise to the logical
-  target. Constrained append rows no larger than 16 bytes use a 2 GiB logical target. Logical
-  targets are capped at one eighth and one quarter, respectively, of the lower of host physical
-  memory and a finite cgroup limit. Every producer
+  target. Logical targets are capped at one eighth of the lower of host physical memory and a
+  finite cgroup limit. Every producer
   batch is measured from its Arrow buffers before it
   enters the pending queue. Windows consume only batches and zero-copy slices whose measured wire
   size fits the remaining budget; a binary search finds the largest fitting slice of an oversized
@@ -65,9 +72,13 @@ requirements change their premises.
   Thirty-two equal-level pending batches are compacted at a time, bounding metadata while copying
   each row at most logarithmically even for streams of one-row batches. Full-suite calibration
   matters here: on Dec2025, repeatedly extending a multi-million-row table can dominate ingest
-  time because MonetDB maintains constraint indexes for each append. Constraint metadata and fixed
-  wire width are therefore inspected only for the 2 GiB logical class. Boundaries stay independent
-  of producer batching and an exact-row diagnostic override remains available.
+  time because MonetDB maintains constraint indexes for each append. COPY-sized appends to an
+  existing constrained target therefore stream into a session-local unconstrained table and use
+  one final target `INSERT … SELECT`. This keeps ordinary client bounds, avoids recognizing
+  workload-specific schemas, and validates the growing target index once. Unconstrained targets
+  and tiny prepared INSERTs remain direct. An explicit `direct` option exists for diagnostic and
+  measured server-specific exceptions. Boundaries stay independent of producer batching and an
+  exact-row diagnostic override remains available.
 - The earlier unconditional 512 MiB physical default was rejected after the 764,331 × 786
   time-series chain showed 1,585 MiB driver-only RSS and 3,271 MiB end-to-end client RSS. A
   128 MiB retained-storage run used 505 MiB and added 1.5–2.2 seconds per 2.2 GiB locally. The
@@ -133,16 +144,17 @@ requirements change their premises.
   coalescing also removed repeated COPY round trips. On a 160 MB, 20-column random-REAL upload,
   replacing copied framing with scatter framing reduced the median of five warmed runs from
   168.6 to 161.2 ms (4.4%) and removed one message-sized allocation.
-- Appends to an existing table inside a caller-managed transaction execute directly for every
-  COPY window. Operation savepoints caused MonetDB to retain and materialize disproportionate
-  storage for large, wide streams even after the savepoint was released. A server error aborts the
-  caller transaction until rollback. A client-side error after a completed window marks the
-  connection rollback-only: reads remain available, but connection APIs and raw SQL both block
-  commit until a successful rollback clears the state. This preserves caller ownership without
-  silently discarding earlier work. Explicit savepoint and partial-commit modes remain advanced
-  opt-ins. Autocommit still wraps the complete stream in an internal transaction; create and
-  replace modes retain their operation savepoint because their DDL must be recovered without
-  discarding unrelated caller work.
+- Unconstrained appends to an existing table inside a caller-managed transaction execute directly
+  for every COPY window. Operation savepoints caused MonetDB to retain and materialize
+  disproportionate storage for large, wide streams even after release. A client-side error after
+  a completed target window marks the connection rollback-only: reads remain available, but
+  connection APIs and raw SQL both block commit until a successful rollback clears the state.
+  Staged constrained appends write no target rows before the final move and retain an operation
+  savepoint, so producer and constraint failures can preserve earlier caller work without risking
+  a partial target. Explicit savepoint and partial-commit modes remain advanced opt-ins for the
+  direct path. Autocommit wraps the complete stream in an internal transaction; create and replace
+  modes retain their operation savepoint because their DDL must be recovered without discarding
+  unrelated caller work.
 - The prefetch worker fetches complete raw `Xexportbin` frames while the caller decodes the
   previous frame. A worker that both fetches and decodes would serialize those phases and lose the
   overlap.
@@ -270,6 +282,12 @@ requirements change their premises.
   immediately before the public `sys.columns` view can misbind that view's internal `_columns`
   reference to the temporary schema. The base catalogs provide the same metadata without that
   server-side binder defect; the minimum-version integration job covers the sequence.
+- MonetDB 11.55.0–11.55.6 can acknowledge a local temporary-table definition without retaining it
+  when a prepared statement has already run in the caller transaction. Constrained append staging
+  therefore uses a transaction-scoped, uniquely named `UNLOGGED` table in the target schema on
+  those versions and a session-local table from 11.55.7 onward. Both are dropped after a successful
+  final move and rolled back with the ingest savepoint on failure. Temporary-table targets stay on
+  the direct path on the affected versions because persistent tables cannot be created in `tmp`.
 - Server-side LZ4 is selected from observed bytes, not from another latency heuristic. The `auto`
   default sends plain frames only when every column in a window cleared the savings threshold; an
   incompressible or shuffled column keeps the whole window on the ordinary upload path. `none`

@@ -59,6 +59,10 @@ def test_ingest_routes_single_small_batch_by_rows_and_bytes(monetdb_uri: str) ->
         assert cursor.adbc_ingest("ingest_route_large", large, mode="replace") == 1
         assert _stats(cursor)["path"] == "copy"
 
+        hex_expanded = pa.record_batch({"value": pa.array([b"x" * (5 * 1024 * 1024)])})
+        assert cursor.adbc_ingest("ingest_route_blob", hex_expanded, mode="replace") == 1
+        assert _stats(cursor)["path"] == "copy"
+
 
 @pytest.mark.integration
 def test_ingest_insert_override_precedence_and_multibatch_routing(monetdb_uri: str) -> None:
@@ -85,12 +89,16 @@ def test_ingest_insert_override_precedence_and_multibatch_routing(monetdb_uri: s
 @pytest.mark.integration
 def test_uri_tuning_and_prepared_cache_observability(monetdb_uri: str) -> None:
     separator = "&" if "?" in monetdb_uri else "?"
-    uri = f"{monetdb_uri}{separator}ingest_insert_rows=2&prepared_cache_capacity=1&write_window_bytes=8388608"
+    uri = (
+        f"{monetdb_uri}{separator}ingest_insert_rows=2&prepared_cache_capacity=1&"
+        "write_window_bytes=8388608&constrained_append=direct"
+    )
     batch = pa.record_batch({"value": pa.array([1], type=pa.int32())})
     with dbapi.connect(uri) as connection:
         assert connection.adbc_connection.get_option_int(str(ConnectionOptions.INGEST_INSERT_ROWS)) == 2
         assert connection.adbc_connection.get_option_int(str(ConnectionOptions.PREPARED_CACHE_CAPACITY)) == 1
         assert connection.adbc_connection.get_option_int(str(ConnectionOptions.WRITE_WINDOW_BYTES)) == 8_388_608
+        assert connection.adbc_connection.get_option(str(ConnectionOptions.CONSTRAINED_APPEND)) == "direct"
         with connection.cursor() as cursor:
             for table in ["ingest_cache_a", "ingest_cache_b"]:
                 cursor.execute(f"DROP TABLE IF EXISTS {table}")
@@ -161,7 +169,6 @@ def test_nonfinite_float_is_rejected_before_copy_null_sentinel_encoding(
 
         with pytest.raises(adbc_driver_manager.DataError, match="non-finite"):
             cursor.adbc_ingest("ingest_nan_route", batch, mode="append")
-        assert _stats(cursor)["path"] == "copy"
         assert cursor.execute("SELECT COUNT(*) FROM ingest_nan_route").fetchone() == (0,)
 
 
@@ -210,7 +217,8 @@ def test_explicit_identity_values_do_not_advance_the_sequence(
         cursor.execute(f"INSERT INTO {table}(value) VALUES ('first')")
         with connection.cursor(adbc_stmt_kwargs={StatementOptions.INGEST_INSERT_ROWS: threshold}) as ingest:
             assert ingest.adbc_ingest(table, batch, mode="append") == 1
-            assert _stats(ingest)["path"] == path
+            expected_path = "insert" if path == "insert" else "staged_copy"
+            assert _stats(ingest)["path"] == expected_path
         with pytest.raises(adbc_driver_manager.IntegrityError):
             cursor.execute(f"INSERT INTO {table}(value) VALUES ('next')")
         assert cursor.execute(f"SELECT id, value FROM {table} ORDER BY id").fetchall() == [

@@ -293,7 +293,7 @@ def test_repeated_wide_appends_have_bounded_transaction_storage(monetdb_uri: str
 
 
 @pytest.mark.integration
-def test_single_copy_append_server_error_aborts_dbapi_transaction_until_rollback(
+def test_staged_single_copy_constraint_error_preserves_the_caller_transaction(
     monetdb_uri: str,
 ) -> None:
     with dbapi.connect(monetdb_uri, autocommit=True) as setup:
@@ -307,23 +307,32 @@ def test_single_copy_append_server_error_aborts_dbapi_transaction_until_rollback
             connection.cursor(adbc_stmt_kwargs={StatementOptions.INGEST_INSERT_ROWS: "0"}) as cursor,
         ):
             cursor.execute("INSERT INTO ingest_constraint_error VALUES (2)")
+            cursor.execute("SELECT value FROM ingest_constraint_error WHERE value = ?", [1])
+            assert cursor.fetchall() == [(1,)]
             duplicate = pa.table({"value": pa.array([3, 3], type=pa.int32())})
             with pytest.raises(adbc_driver_manager.IntegrityError) as caught:
                 cursor.adbc_ingest("ingest_constraint_error", duplicate, mode="append")
             assert caught.value.status_code == adbc_driver_manager.AdbcStatusCode.INTEGRITY
             assert caught.value.sqlstate == "40002"
-            with pytest.raises(adbc_driver_manager.ProgrammingError) as aborted:
-                cursor.execute("SELECT value FROM ingest_constraint_error")
-            assert aborted.value.status_code == adbc_driver_manager.AdbcStatusCode.INVALID_STATE
-            assert aborted.value.sqlstate == "25005"
-            connection.rollback()
             cursor.execute("SELECT value FROM ingest_constraint_error ORDER BY value")
-            assert cursor.fetchall() == [(1,)]
+            assert cursor.fetchall() == [(1,), (2,)]
+            stats = json.loads(cursor.adbc_statement.get_option(str(StatementOptions.INGEST_STATS)))
+            assert stats["path"] == "staged_copy"
+            assert stats["staging_copy_count"] == 1
+            assert stats["target_copy_count"] == 0
+            assert stats["final_move_count"] == 0
+            assert stats["poisoned"] is False
             cursor.execute("INSERT INTO ingest_constraint_error VALUES (4)")
+            cursor.execute("CREATE TABLE ingest_after_constraint_error(value INT)")
+            cursor.execute("DROP TABLE ingest_after_constraint_error")
             connection.commit()
 
         with dbapi.connect(monetdb_uri, autocommit=True) as audit:
-            assert audit.execute("SELECT value FROM ingest_constraint_error ORDER BY value").fetchall() == [(1,), (4,)]
+            assert audit.execute("SELECT value FROM ingest_constraint_error ORDER BY value").fetchall() == [
+                (1,),
+                (2,),
+                (4,),
+            ]
     finally:
         with dbapi.connect(monetdb_uri, autocommit=True) as cleanup:
             cleanup.execute("DROP TABLE IF EXISTS ingest_constraint_error")
@@ -351,7 +360,7 @@ def test_single_copy_append_server_error_rolls_back_internal_autocommit_transact
 
 
 @pytest.mark.integration
-def test_multi_batch_append_server_error_aborts_dbapi_transaction_until_rollback(
+def test_staged_multi_batch_constraint_error_preserves_the_caller_transaction(
     monetdb_uri: str,
 ) -> None:
     with dbapi.connect(monetdb_uri, autocommit=True) as setup:
@@ -370,16 +379,16 @@ def test_multi_batch_append_server_error_aborts_dbapi_transaction_until_rollback
                 cursor.adbc_ingest("ingest_stream_error", reader, mode="append")
             assert caught.value.status_code == adbc_driver_manager.AdbcStatusCode.INTEGRITY
             assert caught.value.sqlstate == "40002"
-            with pytest.raises(adbc_driver_manager.ProgrammingError) as aborted:
-                cursor.execute("SELECT value FROM ingest_stream_error")
-            assert aborted.value.status_code == adbc_driver_manager.AdbcStatusCode.INVALID_STATE
-            assert aborted.value.sqlstate == "25005"
-            connection.rollback()
+            cursor.execute("SELECT value FROM ingest_stream_error")
+            assert cursor.fetchall() == [(1,)]
             cursor.execute("INSERT INTO ingest_stream_error VALUES (4)")
             connection.commit()
 
         with dbapi.connect(monetdb_uri, autocommit=True) as audit:
-            assert audit.execute("SELECT value FROM ingest_stream_error").fetchall() == [(4,)]
+            assert audit.execute("SELECT value FROM ingest_stream_error ORDER BY value").fetchall() == [
+                (1,),
+                (4,),
+            ]
     finally:
         with dbapi.connect(monetdb_uri, autocommit=True) as cleanup:
             cleanup.execute("DROP TABLE IF EXISTS ingest_stream_error")
@@ -412,3 +421,87 @@ def test_multi_batch_append_server_error_rolls_back_internal_autocommit_transact
                 assert cursor.fetchall() == [(1,)]
         finally:
             connection.execute("DROP TABLE IF EXISTS ingest_autocommit_stream_error")
+
+
+@pytest.mark.integration
+def test_constrained_append_stages_many_windows_and_moves_to_the_target_once(
+    monetdb_uri: str,
+) -> None:
+    batch = pa.record_batch(
+        {
+            "left_id": pa.array([1, 1, 2, 2], type=pa.int32()),
+            "right_id": pa.array([1, 2, 1, 2], type=pa.int32()),
+            "value": pa.array(["a", "b", "c", "d"]),
+        }
+    )
+    options: dict[str, object] = {
+        str(StatementOptions.INGEST_INSERT_ROWS): 0,
+        str(StatementOptions.WRITE_BATCH_ROWS): 2,
+    }
+    with dbapi.connect(monetdb_uri, autocommit=True) as connection:
+        try:
+            connection.execute("DROP TABLE IF EXISTS ingest_composite_stage")
+            connection.execute(
+                "CREATE TABLE ingest_composite_stage("
+                "left_id INT, right_id INT, value STRING, "
+                "PRIMARY KEY(left_id, right_id))"
+            )
+            with connection.cursor(adbc_stmt_kwargs=options) as cursor:
+                assert cursor.adbc_ingest("ingest_composite_stage", batch, mode="append") == 4
+                stats = json.loads(cursor.adbc_statement.get_option(str(StatementOptions.INGEST_STATS)))
+                assert stats["path"] == "staged_copy"
+                assert stats["copy_count"] == 2
+                assert stats["staging_copy_count"] == 2
+                assert stats["target_copy_count"] == 0
+                assert stats["final_move_count"] == 1
+                assert cursor.execute(
+                    "SELECT left_id, right_id, value FROM ingest_composite_stage ORDER BY left_id, right_id"
+                ).fetchall() == [
+                    (1, 1, "a"),
+                    (1, 2, "b"),
+                    (2, 1, "c"),
+                    (2, 2, "d"),
+                ]
+                assert cursor.execute(
+                    "SELECT COUNT(*) FROM tmp._tables WHERE name LIKE 'adbc_ingest_stage_%'"
+                ).fetchone() == (0,)
+                assert cursor.execute(
+                    "SELECT COUNT(*) FROM sys.tables WHERE name LIKE 'adbc_ingest_stage_%'"
+                ).fetchone() == (0,)
+        finally:
+            connection.execute("DROP TABLE IF EXISTS ingest_composite_stage")
+
+
+@pytest.mark.integration
+def test_direct_constrained_append_knob_retains_partial_write_protection(
+    monetdb_uri: str,
+) -> None:
+    batch = pa.record_batch({"value": pa.array([2], type=pa.int32())})
+    options: dict[str, object] = {
+        str(StatementOptions.CONSTRAINED_APPEND): "direct",
+        str(StatementOptions.WRITE_BATCH_ROWS): 1,
+    }
+    with dbapi.connect(monetdb_uri, autocommit=True) as setup:
+        setup.execute("DROP TABLE IF EXISTS ingest_direct_constraint")
+        setup.execute("CREATE TABLE ingest_direct_constraint(value INT PRIMARY KEY)")
+
+    try:
+        with dbapi.connect(monetdb_uri) as connection, connection.cursor(adbc_stmt_kwargs=options) as cursor:
+            with pytest.raises(Exception, match="intentional upstream failure"):
+                cursor.adbc_ingest(
+                    "ingest_direct_constraint",
+                    _reader_that_fails_after(batch),
+                    mode="append",
+                )
+            stats = json.loads(cursor.adbc_statement.get_option(str(StatementOptions.INGEST_STATS)))
+            assert stats["path"] == "copy"
+            assert stats["target_copy_count"] == 1
+            assert stats["staging_copy_count"] == 0
+            assert stats["final_move_count"] == 0
+            assert stats["poisoned"] is True
+            with pytest.raises(adbc_driver_manager.ProgrammingError, match="ROLLBACK is required"):
+                connection.commit()
+            connection.rollback()
+    finally:
+        with dbapi.connect(monetdb_uri, autocommit=True) as cleanup:
+            cleanup.execute("DROP TABLE IF EXISTS ingest_direct_constraint")

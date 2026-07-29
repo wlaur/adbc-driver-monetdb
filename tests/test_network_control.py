@@ -3,13 +3,15 @@ import sys
 from queue import Queue
 from threading import Event, Thread
 from time import monotonic
-from typing import Literal
+from typing import Literal, cast
 
 import adbc_driver_manager
 import pyarrow as pa
 import pytest
 
 from adbc_driver_monetdb import DatabaseOptions, StatementOptions, dbapi
+
+TERMINAL_ERROR_DETAIL = b"adbc.monetdb.connection_terminal"
 
 
 def _read_exact(stream: socket.socket, size: int) -> bytes:
@@ -247,6 +249,8 @@ def test_statement_read_timeout_closes_black_holed_connection() -> None:
         with pytest.raises(adbc_driver_manager.OperationalError) as caught:
             cursor.execute("SELECT 1")
         assert caught.value.status_code == adbc_driver_manager.AdbcStatusCode.TIMEOUT
+        details = cast("dict[bytes, bytes]", dict(caught.value.details or []))
+        assert details[TERMINAL_ERROR_DETAIL] == b"true"
         assert monotonic() - started < 5
         assert server.query_received.is_set()
         with pytest.raises(adbc_driver_manager.ProgrammingError):
@@ -350,6 +354,8 @@ def test_statement_cancel_interrupts_black_holed_query() -> None:
         result = outcome.get_nowait()
         assert isinstance(result, adbc_driver_manager.OperationalError)
         assert result.status_code == adbc_driver_manager.AdbcStatusCode.CANCELLED
+        details = cast("dict[bytes, bytes]", dict(result.details or []))
+        assert details[TERMINAL_ERROR_DETAIL] == b"true"
         assert "connection closed by cancel" in str(result)
         with pytest.raises(adbc_driver_manager.ProgrammingError):
             cursor.execute("SELECT 2")
@@ -364,6 +370,8 @@ def test_query_disconnect_is_io_and_closes_connection() -> None:
         with pytest.raises(adbc_driver_manager.OperationalError) as disconnected:
             cursor.execute("SELECT value")
         assert disconnected.value.status_code == adbc_driver_manager.AdbcStatusCode.IO
+        details = cast("dict[bytes, bytes]", dict(disconnected.value.details or []))
+        assert details[TERMINAL_ERROR_DETAIL] == b"true"
         with pytest.raises(adbc_driver_manager.ProgrammingError):
             cursor.execute("SELECT value")
 
