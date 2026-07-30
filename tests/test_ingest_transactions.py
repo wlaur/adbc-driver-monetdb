@@ -505,3 +505,27 @@ def test_direct_constrained_append_knob_retains_partial_write_protection(
     finally:
         with dbapi.connect(monetdb_uri, autocommit=True) as cleanup:
             cleanup.execute("DROP TABLE IF EXISTS ingest_direct_constraint")
+
+
+@pytest.mark.integration
+def test_ingest_preserves_drop_on_commit_temporary_table(monetdb_uri: str) -> None:
+    # An ON COMMIT DROP temporary table must survive an ingest into an unrelated table:
+    # releasing the internal savepoint ends its lifetime, so the savepoint has to be
+    # retained until the caller's transaction ends, exactly as for ON COMMIT DELETE ROWS.
+    with dbapi.connect(monetdb_uri, autocommit=True) as setup:
+        setup.execute("DROP TABLE IF EXISTS ingest_drop_on_commit_target")
+        setup.execute("CREATE TABLE ingest_drop_on_commit_target(value INT)")
+
+    try:
+        batch = pa.record_batch({"value": pa.array([1, 2], type=pa.int32())})
+        with dbapi.connect(monetdb_uri) as connection, connection.cursor() as cursor:
+            cursor.execute("CREATE LOCAL TEMPORARY TABLE ingest_drop_scratch(value INT) ON COMMIT DROP")
+            cursor.adbc_ingest("ingest_drop_on_commit_target", batch, mode="append")
+
+            cursor.execute("SELECT COUNT(*) FROM ingest_drop_scratch")
+            assert cursor.fetchone() == (0,)
+
+            connection.rollback()
+    finally:
+        with dbapi.connect(monetdb_uri, autocommit=True) as cleanup:
+            cleanup.execute("DROP TABLE IF EXISTS ingest_drop_on_commit_target")
