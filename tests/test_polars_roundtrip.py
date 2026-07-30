@@ -976,7 +976,7 @@ def test_append_to_delete_on_commit_temporary_table_stays_in_caller_transaction(
 
 
 @pytest.mark.integration
-def test_constrained_temporary_append_uses_staging_on_supported_servers(
+def test_constrained_temporary_append_uses_staging_only_on_supported_servers(
     monetdb_uri: str,
 ) -> None:
     batch = pa.record_batch({"value": pa.array([1, 2], type=pa.int64())})
@@ -996,10 +996,21 @@ def test_constrained_temporary_append_uses_staging_on_supported_servers(
             == 2
         )
         stats = json.loads(cursor.adbc_statement.get_option(str(StatementOptions.INGEST_STATS)))
-        assert stats["path"] == "staged_copy"
-        assert stats["staging_copy_count"] == 1
-        assert stats["target_copy_count"] == 0
-        assert stats["final_move_count"] == 1
+        supports_temporary_staging = tuple(int(component) for component in MONETDB_SERVER_VERSION.split(".")) >= (
+            11,
+            55,
+            7,
+        )
+        if supports_temporary_staging:
+            assert stats["path"] == "staged_copy"
+            assert stats["staging_copy_count"] == 1
+            assert stats["target_copy_count"] == 0
+            assert stats["final_move_count"] == 1
+        else:
+            assert stats["path"] == "copy"
+            assert stats["staging_copy_count"] == 0
+            assert stats["target_copy_count"] == 1
+            assert stats["final_move_count"] == 0
         assert cursor.execute("SELECT value FROM ingest_constrained_temp ORDER BY value").fetchall() == [(1,), (2,)]
 
 
