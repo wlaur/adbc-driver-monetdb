@@ -1,4 +1,5 @@
 import gc
+import json
 import os
 import subprocess
 import sys
@@ -931,11 +932,14 @@ def test_append_to_delete_on_commit_temporary_table_stays_in_caller_transaction(
     monetdb_uri: str,
 ) -> None:
     df = pl.DataFrame({"value": [1, 2, 3]})
-    with dbapi.connect(monetdb_uri) as conn, conn.cursor() as cursor:
+    options = {str(StatementOptions.INGEST_INSERT_ROWS): "0"}
+    with dbapi.connect(monetdb_uri) as conn, conn.cursor(adbc_stmt_kwargs=options) as cursor:
         cursor.execute("CREATE LOCAL TEMPORARY TABLE ingest_delete_on_commit(value BIGINT)")
         cursor.execute("CREATE LOCAL TEMPORARY TABLE ingest_preserve_on_commit(value BIGINT) ON COMMIT PRESERVE ROWS")
 
         assert cursor.adbc_ingest("ingest_delete_on_commit", df, mode="append", temporary=True) == 3
+        stats = json.loads(cursor.adbc_statement.get_option(str(StatementOptions.INGEST_STATS)))
+        assert stats["scope"] == "transaction"
         assert (
             cursor.adbc_ingest(
                 "ingest_delete_on_commit",
@@ -946,6 +950,8 @@ def test_append_to_delete_on_commit_temporary_table_stays_in_caller_transaction(
             == 1
         )
         assert cursor.adbc_ingest("ingest_preserve_on_commit", df, mode="append", temporary=True) == 3
+        stats = json.loads(cursor.adbc_statement.get_option(str(StatementOptions.INGEST_STATS)))
+        assert stats["scope"] == "transaction"
 
         cursor.execute("SELECT COUNT(*) FROM ingest_delete_on_commit")
         assert cursor.fetchone() == (4,)
@@ -967,6 +973,45 @@ def test_append_to_delete_on_commit_temporary_table_stays_in_caller_transaction(
         assert cursor.fetchone() == (0,)
         cursor.execute("SELECT COUNT(*) FROM ingest_preserve_on_commit")
         assert cursor.fetchone() == (3,)
+
+
+@pytest.mark.integration
+def test_constrained_temporary_append_uses_staging_only_on_supported_servers(
+    monetdb_uri: str,
+) -> None:
+    batch = pa.record_batch({"value": pa.array([1, 2], type=pa.int64())})
+    options = {str(StatementOptions.INGEST_INSERT_ROWS): "0"}
+    with dbapi.connect(monetdb_uri) as conn, conn.cursor(adbc_stmt_kwargs=options) as cursor:
+        cursor.execute(
+            "CREATE LOCAL TEMPORARY TABLE ingest_constrained_temp(value BIGINT PRIMARY KEY) ON COMMIT PRESERVE ROWS"
+        )
+
+        assert (
+            cursor.adbc_ingest(
+                "ingest_constrained_temp",
+                batch,
+                mode="append",
+                temporary=True,
+            )
+            == 2
+        )
+        stats = json.loads(cursor.adbc_statement.get_option(str(StatementOptions.INGEST_STATS)))
+        supports_temporary_staging = tuple(int(component) for component in MONETDB_SERVER_VERSION.split(".")) >= (
+            11,
+            55,
+            7,
+        )
+        if supports_temporary_staging:
+            assert stats["path"] == "staged_copy"
+            assert stats["staging_copy_count"] == 1
+            assert stats["target_copy_count"] == 0
+            assert stats["final_move_count"] == 1
+        else:
+            assert stats["path"] == "copy"
+            assert stats["staging_copy_count"] == 0
+            assert stats["target_copy_count"] == 1
+            assert stats["final_move_count"] == 0
+        assert cursor.execute("SELECT value FROM ingest_constrained_temp ORDER BY value").fetchall() == [(1,), (2,)]
 
 
 @pytest.mark.integration

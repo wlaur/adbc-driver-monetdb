@@ -229,7 +229,10 @@ On Linux, a finite cgroup limit also protects concurrent ingests before their pr
 allocate memory. Each active ingest reserves two physical windows, two staging groups, and 64 MiB
 of producer headroom against 90% of the cgroup limit. A request that does not fit is returned as
 an ADBC error; its connection is not killed by the cgroup OOM handler. Reservations are
-process-wide and are released on success or failure.
+process-wide and are released when the producer exits. If an operation timeout detaches a producer
+that is still running, its reservation remains charged until that worker stops; releasing it
+earlier would let a later ingest allocate against memory that is still in use. Admission failures
+carry SQLSTATE `HY001`.
 
 Compared with an application that stages complete column files on disk, a very wide,
 incompressible stream may consequently produce more COPY windows and use more MonetDB memory while
@@ -272,10 +275,12 @@ disable wire compression while retaining the same client-storage probe. The
 option is accepted at database, connection, and statement scope and as `wire_compression` in the
 URI. Ingest stats report the choice for every window in `window_wire_compression`.
 
-A complete, single-batch ingest of at most 100 rows and 8 MiB uses one cached prepared INSERT
-script instead of binary COPY. This avoids one client-file exchange per column and is especially
-important for tiny wide appends. The threshold increases from the measured connection round trip
-on higher-latency links, while the byte cap remains fixed. Set
+A complete, single-batch ingest of at most 100 rows uses one cached prepared INSERT script when
+both its encoded input and rendered SQL fit conservative fixed limits. Rendering stops
+incrementally at 8 MiB, and the input gate leaves room for string escaping and BLOB hex expansion.
+This avoids one client-file exchange per column and is especially important for tiny wide
+appends. The row threshold increases from the measured connection round trip on higher-latency
+links, while the byte limits remain fixed. Set
 `adbc.monetdb.ingest_insert_rows=0` to force COPY, or set a positive floor on the connection or
 statement; the same key without the `adbc.monetdb.` prefix is accepted in a URI. An explicit
 `write_batch_rows` setting continues to force the COPY scheduler. Explicit values supplied for an
@@ -293,9 +298,12 @@ prefetch-overlap high-water estimates.
 
 Window construction runs one logical window ahead of the active COPY on a zero-capacity handoff.
 This overlaps Arrow production and encoding with the current upload while bounding lookahead to
-one window. Reader failures and worker panics are joined and returned before ingest completion.
-The statement operation timeout also bounds waiting for the producer; a timed-out producer is
-detached so it cannot indefinitely hold the connection lock.
+one window. Reader failures and worker panics reported by the prefetch worker are returned before
+ingest completion. After any ingest error, a worker that has not stopped is detached rather than
+joined indefinitely. During ingest streaming, the statement operation timeout is one deadline
+across producer waits, COPY windows, and a staged final move. A detached producer cannot
+indefinitely hold the connection lock; its cgroup memory reservation remains charged until the
+worker exits.
 
 For Parquet input, install `adbc-driver-monetdb[pyarrow]` and use
 `ParquetArrowStream`. It decodes one physical row group at a time and bounds emitted batches by
@@ -427,7 +435,7 @@ close that connection and open another one before issuing more work.
 Client information is sent at login by default. The `client` value in
 [`sys.sessions`](https://www.monetdb.org/documentation-Dec2025/user-guide/sql-catalog/users-roles-privileges-sessions/)
 identifies this driver and its protocol library, for example
-`adbc_driver_monetdb 0.10.0 / monetdb-rust 0.2.2-wlaur.1`. The Python shim uses the basename of
+`adbc_driver_monetdb 0.10.1 / monetdb-rust 0.2.2-wlaur.1`. The Python shim uses the basename of
 `sys.argv[0]` as the default `application`. Hostname and process id are also sent by default, as
 they are by pymonetdb and libmapi; use `client_info=false` if that host metadata should not leave
 the client.

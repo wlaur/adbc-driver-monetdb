@@ -727,7 +727,9 @@ fn map_cursor_error(value: CursorError) -> Error {
         CursorError::Conversion { .. }
         | CursorError::InvalidRange { .. }
         | CursorError::ResultNotResident { .. } => Status::InvalidData,
-        CursorError::FileTransfer(_) | CursorError::UploadRefused { .. } => Status::InvalidData,
+        CursorError::FileTransfer(_)
+        | CursorError::UploadComplete
+        | CursorError::UploadRefused { .. } => Status::InvalidData,
         CursorError::PreparedResult => Status::InvalidState,
         CursorError::Metadata(_) | CursorError::Poisoned => Status::Internal,
         CursorError::Server(ref error) => sqlstate_status(error.sqlstate(), error.message()),
@@ -2605,59 +2607,32 @@ impl MonetdbStatement {
             && append_to_existing
             && self.constrained_append == ConstrainedAppend::Auto
             && (!temporary || self.server_version >= LOCAL_TEMP_STAGING_MINIMUM_VERSION);
-        let caller_scope = if insert_candidate.is_some() || constrained_append_candidate {
+        let constraint_state = if constrained_append_candidate {
+            let mut metadata_cursor = connection.cursor();
+            metadata_cursor.set_timeouts(self.timeouts);
+            Some(table_constraint_state(
+                &mut metadata_cursor,
+                if temporary { Some("tmp") } else { schema_name },
+                table,
+            )?)
+        } else {
+            None
+        };
+        let staged_constrained_append = constraint_state.is_some_and(|state| state.constrained);
+        let caller_scope = if insert_candidate.is_some()
+            || staged_constrained_append
+            || constraint_state.is_some_and(|state| !state.exists)
+        {
             CallerTransactionScope::Savepoint
         } else if append_to_existing && self.ingest_atomicity == IngestAtomicity::Transaction {
             CallerTransactionScope::Direct
         } else {
             CallerTransactionScope::Savepoint
         };
-        let (mut cursor, mut atomic_scope) =
+        let (mut cursor, atomic_scope) =
             begin_atomic(&connection, "ingest", caller_scope, self.timeouts)?;
-        let staged_constrained_append = if constrained_append_candidate {
-            match table_has_constraints(
-                &mut cursor,
-                if temporary { Some("tmp") } else { schema_name },
-                table,
-            ) {
-                Ok(value) => value,
-                Err(root) => {
-                    return finish_atomic(
-                        &connection,
-                        &mut cursor,
-                        atomic_scope,
-                        Err(root),
-                        self.timeouts,
-                    );
-                }
-            }
-        } else {
-            false
-        };
         if staged_constrained_append {
             invalidate_prepared_cache(&self.connection, &self.prepared_cache);
-        } else if constrained_append_candidate
-            && self.ingest_atomicity == IngestAtomicity::Transaction
-        {
-            let releasable = match &atomic_scope {
-                AtomicScope::Savepoint {
-                    name,
-                    retain_until_transaction_end: false,
-                } => Some(name.clone()),
-                _ => None,
-            };
-            if let Some(name) = releasable {
-                if let Err(root) = cursor.execute(&format!("RELEASE SAVEPOINT {name}")) {
-                    return finish_atomic(
-                        &connection,
-                        &mut cursor,
-                        atomic_scope,
-                        Err(map_cursor_error(root)),
-                        self.timeouts,
-                    );
-                }
-                atomic_scope = AtomicScope::CallerTransaction;
-            }
         }
         let caller_transaction = matches!(&atomic_scope, AtomicScope::CallerTransaction);
         let scope_name = atomic_scope.name();
@@ -2867,9 +2842,16 @@ impl MonetdbStatement {
                 self.write_batch_rows,
                 self.wire_compression,
             )?;
+            let operation_deadline = self
+                .timeouts
+                .operation
+                .and_then(|timeout| Instant::now().checked_add(timeout));
             let mut rows = 0i64;
             let upload_result = (|| {
-                while let Some(mut window) = windows.next_window(self.timeouts.operation)? {
+                while let Some(mut window) =
+                    windows.next_window(remaining_ingest_timeout(operation_deadline)?)?
+                {
+                    cursor.set_timeouts(ingest_timeouts(self.timeouts, operation_deadline)?);
                     let wire_lz4 = window.uses_wire_lz4();
                     let stored_bytes = window.stored_bytes();
                     let storage = window.storage_mode();
@@ -3071,6 +3053,9 @@ impl MonetdbStatement {
                 }
                 Ok(rows)
             })();
+            if upload_result.is_err() {
+                windows.detach();
+            }
             let scheduler_result = windows.finish();
             if let Ok(Some(scheduler_stats)) = &scheduler_result {
                 stats.input_batches = scheduler_stats.input_batches;
@@ -3083,9 +3068,11 @@ impl MonetdbStatement {
                 let Some(stage) = &stage else {
                     return Ok(rows);
                 };
+                cursor.set_timeouts(ingest_timeouts(self.timeouts, operation_deadline)?);
                 cursor
                     .execute(&stage.move_to_target)
                     .map_err(map_cursor_error)?;
+                stats.final_move_count = 1;
                 let moved = cursor.affected_rows().ok_or_else(|| {
                     error(
                         "MonetDB did not report the constrained append row count",
@@ -3100,19 +3087,21 @@ impl MonetdbStatement {
                         Status::InvalidData,
                     ));
                 }
-                stats.final_move_count = 1;
                 Ok(rows)
             });
-            if let Some(stage) = &stage {
-                combine_atomic_error(
-                    moved,
-                    cursor.execute(&stage.drop),
-                    "dropping the constrained append staging table",
-                )
-            } else {
-                moved
+            match (moved, &stage) {
+                (Ok(rows), Some(stage)) => {
+                    cursor.set_timeouts(ingest_timeouts(self.timeouts, operation_deadline)?);
+                    combine_atomic_error(
+                        Ok(rows),
+                        cursor.execute(&stage.drop),
+                        "dropping the constrained append staging table",
+                    )
+                }
+                (result, _) => result,
             }
         })();
+        cursor.set_timeouts(self.timeouts);
         let operation_failed = result.is_err();
         let result = finish_atomic(
             &connection,
@@ -3457,6 +3446,32 @@ impl IngestWindowPrefetch {
             .map_err(|_| error("ingest window prefetch thread panicked", Status::Internal));
         result.map(Some)
     }
+
+    fn detach(&mut self) {
+        self.receiver.take();
+    }
+}
+
+fn remaining_ingest_timeout(deadline: Option<Instant>) -> Result<Option<Duration>> {
+    deadline
+        .map(|deadline| {
+            deadline
+                .checked_duration_since(Instant::now())
+                .ok_or_else(|| error("ingest operation timeout expired", Status::Timeout))
+        })
+        .transpose()
+}
+
+fn ingest_timeouts(timeouts: Timeouts, deadline: Option<Instant>) -> Result<Timeouts> {
+    let Some(remaining) = remaining_ingest_timeout(deadline)? else {
+        return Ok(timeouts);
+    };
+    let bounded = |timeout: Option<Duration>| Some(timeout.unwrap_or(remaining).min(remaining));
+    Ok(Timeouts {
+        read: bounded(timeouts.read),
+        write: bounded(timeouts.write),
+        operation: Some(remaining),
+    })
 }
 
 fn start_ingest_window_prefetch(
@@ -3536,14 +3551,17 @@ fn reserve_ingest_memory(physical_window_budget: usize) -> Result<IngestMemoryRe
     let mut reserved = RESERVED_INGEST_MEMORY_BYTES.load(Ordering::Acquire);
     loop {
         if !ingest_memory_reservation_fits(allowed, current, reserved, bytes) {
-            return Err(error(
+            let mut reservation_error = error(
                 format!(
                     "ingest requires a {bytes}-byte memory reservation, but the cgroup has \
                      {current} bytes in use, {reserved} bytes reserved by other ingests, and \
                      a {limit}-byte limit"
                 ),
                 Status::Internal,
-            ));
+            );
+            reservation_error.sqlstate =
+                parse_sqlstate("HY001").expect("HY001 is a valid SQLSTATE");
+            return Err(reservation_error);
         }
         match RESERVED_INGEST_MEMORY_BYTES.compare_exchange_weak(
             reserved,
@@ -3742,20 +3760,26 @@ fn route_ingest_reader(
         && first.num_rows() > 0
         && first.num_rows() <= insert_rows
         && second.is_none()
+        && estimated_bytes <= PARAMETER_UPDATE_BATCH_BYTES / 2
     {
         for (field, column) in schema.fields().iter().zip(first.columns()) {
             monetdb_arrow::encode_column(field, column.as_ref())
                 .map_err(|value| map_display(value, Status::InvalidData))?;
         }
-        let arguments = (0..first.num_rows())
-            .map(|row| render_arguments(&first, row).map(|values| values.join(", ")))
-            .collect::<Result<Vec<_>>>()?;
-        let rendered_bytes = arguments.iter().try_fold(0usize, |total, arguments| {
-            total
-                .checked_add(arguments.len().saturating_add(32))
-                .ok_or_else(|| error("rendered INSERT byte count overflows", Status::Internal))
-        })?;
-        if rendered_bytes <= PARAMETER_UPDATE_BATCH_BYTES {
+        let mut arguments = Vec::with_capacity(first.num_rows());
+        let mut rendered_bytes = 0usize;
+        for row in 0..first.num_rows() {
+            let row_arguments = render_arguments(&first, row)?.join(", ");
+            rendered_bytes = rendered_bytes
+                .checked_add(row_arguments.len().saturating_add(32))
+                .ok_or_else(|| error("rendered INSERT byte count overflows", Status::Internal))?;
+            if rendered_bytes > PARAMETER_UPDATE_BATCH_BYTES {
+                arguments.clear();
+                break;
+            }
+            arguments.push(row_arguments);
+        }
+        if !arguments.is_empty() {
             return Ok((
                 reader,
                 Some(InsertCandidate {
@@ -6618,26 +6642,60 @@ fn table_exists(
     count_query_result(&mut cursor, "table")
 }
 
-fn table_has_constraints(
+#[derive(Clone, Copy)]
+struct TableConstraintState {
+    exists: bool,
+    constrained: bool,
+}
+
+fn table_constraint_state(
     cursor: &mut monetdb::Cursor,
     schema_name: Option<&str>,
     table_name: &str,
-) -> Result<bool> {
+) -> Result<TableConstraintState> {
     let schema_filter = schema_name
         .map(metadata::raw_string_literal)
         .transpose()?
         .unwrap_or_else(|| "current_schema".to_owned());
     let table = metadata::raw_string_literal(table_name)?;
+    let keys = if schema_name == Some("tmp") {
+        "tmp.keys"
+    } else {
+        "sys.keys"
+    };
     cursor
         .execute(&format!(
-            "SELECT CAST(COUNT(*) AS VARCHAR(32)) \
-             FROM sys.keys AS k \
-             JOIN sys.tables AS t ON t.id = k.table_id \
+            "SELECT CAST(COUNT(DISTINCT t.id) AS VARCHAR(32)), \
+                    CAST(COUNT(k.id) AS VARCHAR(32)) \
+             FROM sys.tables AS t \
              JOIN sys.schemas AS s ON s.id = t.schema_id \
+             LEFT JOIN {keys} AS k ON k.table_id = t.id \
              WHERE s.name = {schema_filter} AND t.name = {table}"
         ))
         .map_err(map_cursor_error)?;
-    count_query_result(cursor, "table constraint")
+    if !cursor.next_row().map_err(map_cursor_error)? {
+        return Err(error(
+            "table constraint metadata query returned no row",
+            Status::InvalidData,
+        ));
+    }
+    let parse_count = |index| -> Result<u64> {
+        cursor
+            .get_str(index)
+            .map_err(map_cursor_error)?
+            .ok_or_else(|| error("table constraint count is NULL", Status::InvalidData))?
+            .parse::<u64>()
+            .map_err(|value| {
+                error(
+                    format!("invalid table constraint count: {value}"),
+                    Status::InvalidData,
+                )
+            })
+    };
+    Ok(TableConstraintState {
+        exists: parse_count(0)? != 0,
+        constrained: parse_count(1)? != 0,
+    })
 }
 
 fn delete_on_commit_temporary_table_exists(
@@ -7873,6 +7931,7 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.status, Status::Internal);
+        assert_eq!(error.sqlstate, parse_sqlstate("HY001").unwrap());
         assert!(error.message.contains("reserved by other ingests"));
 
         drop(first);

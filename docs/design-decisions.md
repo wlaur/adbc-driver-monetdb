@@ -103,8 +103,10 @@ requirements change their premises.
   process-wide reservation covers two physical windows, two 16 MiB staging groups, and 64 MiB of
   producer headroom, while preserving 10% of the cgroup for unrelated work. This deliberately
   conservative model prevents simultaneous connections in one client process from racing the
-  cgroup OOM handler. Rejected work receives an ADBC allocation error and every exit path releases
-  its reservation.
+  cgroup OOM handler. Rejected work receives SQLSTATE `HY001`. The reservation is owned by the
+  prefetch worker and is released when that worker exits. A worker detached after an operation
+  timeout retains its reservation until it actually stops, because releasing admission capacity
+  while the worker can still allocate would make the limit unsound.
 - The bounded Parquet producer reclaims unused PyArrow allocator pages after each 2 GiB of decoded
   row-group data and at stream close. Reclaiming every row group was rejected because many small
   TPC-DS files regressed sharply; waiting until the end allowed a paced 36.4 GiB ClickBench decode
@@ -207,6 +209,10 @@ requirements change their premises.
   same connection clears the cache before execution. MonetDB can also silently discard a plan
   after DDL from another session; an `EXEC: PREPARED Statement missing` response evicts that exact
   entry and retries once when doing so cannot roll back user work.
+- Constrained-append staging invalidates the complete prepared cache because MonetDB clears every
+  server-side prepared handle when the staging DDL runs, including for a session-local table.
+  Scoped client invalidation would retain IDs that no longer exist; there are no surviving server
+  handles to deallocate after the generation changes.
 - MonetDB aborts an explicit transaction when `EXECUTE` reports a missing prepared statement, so
   the driver retries only in autocommit or inside its own multi-row savepoint. A one-row bound DML
   statement executes directly to avoid three transaction-control round trips; a rare stale-plan
@@ -248,7 +254,9 @@ requirements change their premises.
 
 ## Ingest routing, retention, and topology
 
-- A complete one-batch ingest of at most 100 rows and 8 MiB uses the cached prepared INSERT path.
+- A complete one-batch ingest of at most 100 rows uses the cached prepared INSERT path when a
+  conservative expansion-aware input gate passes and incrementally rendered SQL remains at most
+  8 MiB.
   At 1,001 columns, binary COPY costs about 210 ms regardless of one or ten rows because the
   server requests one client file per column; a prepared one-row INSERT costs 3–5 ms. The row
   threshold is configurable, zero disables the route, and multi-batch readers always stay on
@@ -274,9 +282,10 @@ requirements change their premises.
   correctness. Retained Arrow batches are encoded through a capacity-one worker channel, so
   encoding of a bounded piece overlaps upload of the preceding piece.
 - A zero-capacity window handoff builds one logical ingest window while the preceding COPY is
-  uploading. The bound prevents unbounded producer read-ahead, and the join path surfaces reader
-  errors or worker panics before the statement completes. On the 764,331 × 786 time-series input,
-  this reduced the large-table ingest query from 8.21 to 6.52 seconds.
+  uploading. The bound prevents unbounded producer read-ahead. Reported reader errors and worker
+  panics are surfaced before the statement completes; after an ingest error, a worker that has not
+  stopped is detached so cleanup cannot block indefinitely. On the 764,331 × 786 time-series
+  input, this reduced the large-table ingest query from 8.21 to 6.52 seconds.
 - Append-schema reads use `sys._columns`/`sys._tables`, or their `tmp` counterparts when the ADBC
   temporary-table option is set. On the supported 11.55.1 release, a temporary-table preflight
   immediately before the public `sys.columns` view can misbind that view's internal `_columns`

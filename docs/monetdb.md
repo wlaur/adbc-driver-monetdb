@@ -93,8 +93,9 @@ decoded locally because MonetDB does not reverse that transform. The same key is
 `wire_compression` in the URI, and `window_wire_compression` in ingest stats makes every
 per-window decision observable.
 
-A complete single-batch ingest of at most 100 rows and 8 MiB uses the cached prepared INSERT path;
-the row threshold adapts upward on measured higher-latency connections. Set
+A complete single-batch ingest of at most 100 rows uses the cached prepared INSERT path when its
+encoded input passes a conservative expansion-aware gate and its incrementally rendered SQL stays
+within 8 MiB; the row threshold adapts upward on measured higher-latency connections. Set
 `adbc.monetdb.ingest_insert_rows=0` to force COPY. The URI accepts `write_window_bytes`,
 `ingest_insert_rows`, `prepared_cache_capacity`, `wire_compression`, and `constrained_append` for
 URI-only consumers.

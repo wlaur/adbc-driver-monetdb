@@ -67,7 +67,7 @@ def test_measured_latency_adapts_insert_routing_and_copy_windows() -> None:
     )
     bulk = _wide_random_batch(9_000_000, 1)
     wide = _wide_random_batch(8_000, 1_000)
-    tiny = _wide_random_batch(1_000, 1_000)
+    tiny = _wide_random_batch(100, 1_000)
     latency_stats: dict[int, dict[str, object]] = {}
     wide_latency_stats: dict[int, dict[str, object]] = {}
     try:
