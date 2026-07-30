@@ -2584,7 +2584,7 @@ impl MonetdbStatement {
                 mode,
                 "adbc.ingest.mode.append" | "adbc.ingest.mode.create_append"
             )
-            && delete_on_commit_temporary_table_exists(&connection, Some(table), self.timeouts)?
+            && transaction_scoped_temporary_table_exists(&connection, Some(table), self.timeouts)?
             && connection
                 .server_info()
                 .map_err(map_cursor_error)?
@@ -6587,7 +6587,7 @@ fn begin_atomic(
         return Ok((cursor, AtomicScope::CallerTransaction));
     }
     let retain_until_transaction_end =
-        delete_on_commit_temporary_table_exists(connection, None, timeouts)?;
+        transaction_scoped_temporary_table_exists(connection, None, timeouts)?;
     let savepoint = savepoint_name(purpose);
     cursor
         .execute(&format!("SAVEPOINT {savepoint}"))
@@ -6698,7 +6698,13 @@ fn table_constraint_state(
     })
 }
 
-fn delete_on_commit_temporary_table_exists(
+/// Whether a temporary table exists whose lifetime ends with the transaction.
+///
+/// `sys.tables.commit_action` encodes the temporary-table commit action:
+/// 1 = ON COMMIT DELETE ROWS, 2 = ON COMMIT PRESERVE ROWS, 3 = ON COMMIT DROP.
+/// Both 1 and 3 are transaction-scoped: ending the transaction, including
+/// releasing a savepoint taken inside it, empties or destroys the table.
+fn transaction_scoped_temporary_table_exists(
     connection: &monetdb::Connection,
     table_name: Option<&str>,
     timeouts: Timeouts,
@@ -6716,7 +6722,7 @@ fn delete_on_commit_temporary_table_exists(
             "SELECT CAST(COUNT(*) AS VARCHAR(32)) \
              FROM sys.tables AS t \
              JOIN sys.schemas AS s ON s.id = t.schema_id \
-             WHERE s.name = 'tmp' AND t.commit_action = 1{table_filter}"
+             WHERE s.name = 'tmp' AND t.commit_action IN (1, 3){table_filter}"
         ))
         .map_err(map_cursor_error)?;
     count_query_result(&mut cursor, "temporary table")
