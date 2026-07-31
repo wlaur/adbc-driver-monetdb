@@ -935,16 +935,26 @@ fn timestamp_literal(
     ))
 }
 
+// sql/server/sql_datetime.c parse_interval() only advances past fractional seconds that parse to a
+// non-zero value (`if (msec && nn)`), so a rendered ".000" is left as trailing input and rejected
+// with "Interval type miss match". Whole-millisecond-zero intervals must omit the fraction.
+fn interval_fraction(millis: u64) -> String {
+    if millis == 0 {
+        String::new()
+    } else {
+        format!(".{millis:03}")
+    }
+}
+
 fn duration_literal(array: &dyn Array, unit: TimeUnit, row: usize) -> Result<String> {
     let millis = duration_millis(array, unit, row)?;
     let negative = millis < 0;
     let absolute = millis.unsigned_abs();
     let seconds = absolute / 1_000;
-    let fraction = absolute % 1_000;
+    let fraction = interval_fraction(absolute % 1_000);
     Ok(format!(
-        "INTERVAL '{}{}.{fraction:03}' SECOND",
-        if negative { "-" } else { "" },
-        seconds
+        "INTERVAL '{}{seconds}{fraction}' SECOND",
+        if negative { "-" } else { "" }
     ))
 }
 
@@ -957,9 +967,9 @@ fn day_interval_literal(array: &dyn Array, unit: TimeUnit, row: usize) -> Result
     let hours = total_seconds / 3_600 % 24;
     let minutes = total_seconds / 60 % 60;
     let seconds = total_seconds % 60;
-    let fraction = absolute % 1_000;
+    let fraction = interval_fraction(absolute % 1_000);
     Ok(format!(
-        "INTERVAL '{}{days} {hours:02}:{minutes:02}:{seconds:02}.{fraction:03}' DAY TO SECOND",
+        "INTERVAL '{}{days} {hours:02}:{minutes:02}:{seconds:02}{fraction}' DAY TO SECOND",
         if negative { "-" } else { "" }
     ))
 }
@@ -1322,6 +1332,32 @@ mod tests {
             )
             .unwrap(),
             "TIMETZ '01:02:03.000000+00:00'"
+        );
+    }
+
+    #[test]
+    fn omits_the_zero_fraction_monetdb_refuses_to_parse_in_interval_literals() {
+        let metadata = |name: &str| [("ARROW:extension:name".to_owned(), name.to_owned())].into();
+        let second = Field::new("s", DataType::Duration(TimeUnit::Millisecond), false);
+        let day = Field::new("d", DataType::Duration(TimeUnit::Millisecond), false)
+            .with_metadata(metadata("monetdb.interval_day"));
+        let render = |field: &Field, millis: i64| {
+            literal(field, &DurationMillisecondArray::from(vec![millis]), 0).unwrap()
+        };
+
+        assert_eq!(render(&second, 90_000), "INTERVAL '90' SECOND");
+        assert_eq!(render(&second, 0), "INTERVAL '0' SECOND");
+        assert_eq!(render(&second, -90_000), "INTERVAL '-90' SECOND");
+        assert_eq!(render(&second, 90_250), "INTERVAL '90.250' SECOND");
+        assert_eq!(render(&second, 90_001), "INTERVAL '90.001' SECOND");
+
+        assert_eq!(
+            render(&day, 172_800_000),
+            "INTERVAL '2 00:00:00' DAY TO SECOND"
+        );
+        assert_eq!(
+            render(&day, -172_800_000),
+            "INTERVAL '-2 00:00:00' DAY TO SECOND"
         );
     }
 

@@ -2669,51 +2669,62 @@ impl MonetdbStatement {
             let setup = execute_ingest_target_mode(&mut cursor, &target);
             let mut prepared_cache_hit = false;
             let inserted = setup.and_then(|()| {
-                let mut prepared = None;
-                let mut prepare_error = None;
-                for insert_query in insert_parameter_queries(&operation_target, &schema)? {
-                    match prepare_cached_with_status_locked(
-                        &self.connection,
-                        &connection,
-                        &self.prepared_cache,
-                        &insert_query,
-                        schema.fields().len(),
-                        self.timeouts,
-                    ) {
-                        Ok(value) => {
-                            prepared = Some(value);
-                            break;
+                let stream_names = schema
+                    .fields()
+                    .iter()
+                    .map(|field| field.name().clone())
+                    .collect::<Vec<_>>();
+                type PreparedAttempt = (Option<(Arc<PreparedEntry>, bool)>, Option<Error>);
+                let prepare = |names: &[String]| -> Result<PreparedAttempt> {
+                    let mut prepared = None;
+                    let mut prepare_error = None;
+                    for insert_query in insert_parameter_queries(&operation_target, names)? {
+                        match prepare_cached_with_status_locked(
+                            &self.connection,
+                            &connection,
+                            &self.prepared_cache,
+                            &insert_query,
+                            names.len(),
+                            self.timeouts,
+                        ) {
+                            Ok(value) => {
+                                prepared = Some(value);
+                                break;
+                            }
+                            Err(value) => prepare_error = Some(value),
                         }
-                        Err(value) => prepare_error = Some(value),
+                    }
+                    Ok((prepared, prepare_error))
+                };
+                let (mut prepared, prepare_error) = prepare(&stream_names)?;
+                if prepared.is_none()
+                    && matches!(
+                        target.mode,
+                        "adbc.ingest.mode.append" | "adbc.ingest.mode.create_append"
+                    )
+                {
+                    let mismatch_status = append_mismatch_status(target.mode);
+                    let destination = append_table_columns(
+                        &mut cursor,
+                        if target.temporary {
+                            Some("tmp")
+                        } else {
+                            target.schema_name
+                        },
+                        target.table,
+                        mismatch_status,
+                    )?;
+                    let aligned = align_append_schema(&schema, &destination, mismatch_status)?;
+                    if aligned != stream_names {
+                        prepared = prepare(&aligned)?.0;
                     }
                 }
                 let (entry, cache_hit) = match prepared {
                     Some(value) => value,
                     None => {
-                        let root = prepare_error.ok_or_else(|| {
-                            error(
-                                "no INSERT form was available for ingest",
-                                Status::Internal,
-                            )
-                        })?;
-                        if matches!(
-                            target.mode,
-                            "adbc.ingest.mode.append" | "adbc.ingest.mode.create_append"
-                        ) {
-                            let mismatch_status = append_mismatch_status(target.mode);
-                            let destination = append_table_columns(
-                                &mut cursor,
-                                if target.temporary {
-                                    Some("tmp")
-                                } else {
-                                    target.schema_name
-                                },
-                                target.table,
-                                mismatch_status,
-                            )?;
-                            validate_append_schema(&schema, &destination, mismatch_status)?;
-                        }
-                        return Err(root);
+                        return Err(prepare_error.unwrap_or_else(|| {
+                            error("no INSERT form was available for ingest", Status::Internal)
+                        }));
                     }
                 };
                 if matches!(
@@ -2828,10 +2839,17 @@ impl MonetdbStatement {
                 .map(|index| format!("'c{index}'"))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let copy =
-                format!("COPY LITTLE ENDIAN BINARY INTO {copy_target} FROM {files} ON CLIENT");
+            // The staging table is created from the stream's own schema, so only a direct append to
+            // an existing table needs the destination column list that makes COPY match by name.
+            let copy_columns = match destination.as_deref().filter(|_| stage.is_none()) {
+                Some(names) => format!(" ({})", quoted_column_list(names)?),
+                None => String::new(),
+            };
+            let copy = format!(
+                "COPY LITTLE ENDIAN BINARY INTO {copy_target}{copy_columns} FROM {files} ON CLIENT"
+            );
             let copy_lz4 = format!(
-                "COPY LITTLE ENDIAN BINARY INTO {copy_target} FROM {files} ON 'lz4' CLIENT"
+                "COPY LITTLE ENDIAN BINARY INTO {copy_target}{copy_columns} FROM {files} ON 'lz4' CLIENT"
             );
             let mut windows = start_ingest_window_prefetch(
                 reader,
@@ -3172,7 +3190,7 @@ struct ConstrainedAppendStage {
 
 fn constrained_append_stage(
     schema: &SchemaRef,
-    destination: &[AppendColumn],
+    destination: &[String],
     operation_target: &str,
     local: bool,
     persistent_schema: Option<&str>,
@@ -3214,11 +3232,7 @@ fn constrained_append_stage(
         .map(|field| quote_identifier(field.name()))
         .collect::<Result<Vec<_>>>()?
         .join(", ");
-    let destination_columns = destination
-        .iter()
-        .map(|column| quote_identifier(&column.name))
-        .collect::<Result<Vec<_>>>()?
-        .join(", ");
+    let destination_columns = quoted_column_list(destination)?;
     Ok(ConstrainedAppendStage {
         create: format!(
             "CREATE {}TABLE {create_target} ({}){}",
@@ -3247,17 +3261,13 @@ fn prepare_ingest_target(
     cursor: &mut monetdb::Cursor,
     target: &IngestTarget<'_>,
     schema: &SchemaRef,
-) -> Result<Option<Vec<AppendColumn>>> {
+) -> Result<Option<Vec<String>>> {
     execute_ingest_target_mode(cursor, target)?;
     if matches!(
         target.mode,
         "adbc.ingest.mode.append" | "adbc.ingest.mode.create_append"
     ) {
-        let mismatch_status = if target.mode == "adbc.ingest.mode.create_append" {
-            Status::AlreadyExists
-        } else {
-            Status::InvalidArguments
-        };
+        let mismatch_status = append_mismatch_status(target.mode);
         let destination = append_table_columns(
             cursor,
             if target.temporary {
@@ -3268,8 +3278,7 @@ fn prepare_ingest_target(
             target.table,
             mismatch_status,
         )?;
-        validate_append_schema(schema, &destination, mismatch_status)?;
-        return Ok(Some(destination));
+        return align_append_schema(schema, &destination, mismatch_status).map(Some);
     }
     Ok(None)
 }
@@ -3301,34 +3310,24 @@ fn execute_ingest_target_mode(
     Ok(())
 }
 
-fn insert_parameter_queries(target: &str, schema: &SchemaRef) -> Result<Vec<String>> {
-    let placeholders = std::iter::repeat_n("?", schema.fields().len())
+fn insert_parameter_queries(target: &str, names: &[String]) -> Result<Vec<String>> {
+    let placeholders = std::iter::repeat_n("?", names.len())
         .collect::<Vec<_>>()
         .join(", ");
     let mut queries = Vec::with_capacity(2);
-    if schema
-        .fields()
-        .iter()
-        .all(|field| is_simple_unquoted_identifier(field.name()))
-    {
+    if names.iter().all(|name| is_simple_unquoted_identifier(name)) {
         queries.push(format!(
             "INSERT INTO {target} ({}) VALUES ({placeholders})",
-            schema
-                .fields()
+            names
                 .iter()
-                .map(|field| field.name().as_str())
+                .map(String::as_str)
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
     }
     queries.push(format!(
         "INSERT INTO {target} ({}) VALUES ({placeholders})",
-        schema
-            .fields()
-            .iter()
-            .map(|field| quote_identifier(field.name()))
-            .collect::<Result<Vec<_>>>()?
-            .join(", ")
+        quoted_column_list(names)?
     ));
     Ok(queries)
 }
@@ -5360,35 +5359,43 @@ fn append_table_columns(
     Ok(columns)
 }
 
-fn validate_append_schema(
+fn align_append_schema(
     schema: &SchemaRef,
     columns: &[AppendColumn],
     mismatch_status: Status,
-) -> Result<()> {
-    if schema.fields().len() != columns.len() {
-        return Err(error(
-            format!(
-                "append stream has {} columns but destination table has {}",
-                schema.fields().len(),
-                columns.len()
-            ),
-            mismatch_status,
-        ));
-    }
-    for (index, (field, column)) in schema.fields().iter().zip(columns).enumerate() {
-        if !append_column_names_match(field.name(), &column.name) {
+) -> Result<Vec<String>> {
+    let mut matched = vec![false; columns.len()];
+    let mut targets = Vec::with_capacity(schema.fields().len());
+    for field in schema.fields() {
+        let Some(index) = columns
+            .iter()
+            .position(|column| append_column_names_match(field.name(), &column.name))
+        else {
             return Err(error(
                 format!(
-                    "append column {index} is named {:?}, but destination column is named {:?}; append schemas are positional and column order must match",
+                    "append column {:?} does not exist in the destination table; it has columns {}",
                     field.name(),
-                    column.name
+                    columns
+                        .iter()
+                        .map(|column| format!("{:?}", column.name))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                mismatch_status,
+            ));
+        };
+        if std::mem::replace(&mut matched[index], true) {
+            return Err(error(
+                format!(
+                    "append stream names destination column {:?} more than once",
+                    columns[index].name
                 ),
                 mismatch_status,
             ));
         }
         let source = monetdb_arrow::monet_type_for_field(field)
             .map_err(|value| map_display(value, Status::NotImplemented))?;
-        let destination = &column.data_type;
+        let destination = &columns[index].data_type;
         if !append_monet_types_match(&source, destination) {
             return Err(error(
                 format!(
@@ -5398,8 +5405,17 @@ fn validate_append_schema(
                 mismatch_status,
             ));
         }
+        targets.push(columns[index].name.clone());
     }
-    Ok(())
+    Ok(targets)
+}
+
+fn quoted_column_list(names: &[String]) -> Result<String> {
+    Ok(names
+        .iter()
+        .map(|name| quote_identifier(name))
+        .collect::<Result<Vec<_>>>()?
+        .join(", "))
 }
 
 fn validate_prepared_insert_schema(
@@ -7552,6 +7568,101 @@ fn qualified_name(schema: Option<&str>, table: &str) -> Result<String> {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn aligns_append_streams_to_destination_columns_by_name() {
+        let column = |name: &str, data_type: MonetType| AppendColumn {
+            name: name.to_owned(),
+            data_type,
+            nullable: true,
+        };
+        let destination = [
+            column("time", MonetType::Timestamp),
+            column("a", MonetType::Real),
+            column("b", MonetType::Double),
+        ];
+        let stream = |fields: Vec<Field>| Arc::new(Schema::new(fields));
+        let time = Field::new(
+            "time",
+            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+            true,
+        );
+        let a = Field::new("a", DataType::Float32, true);
+        let b = Field::new("b", DataType::Float64, true);
+
+        assert_eq!(
+            align_append_schema(
+                &stream(vec![b.clone(), time.clone(), a.clone()]),
+                &destination,
+                Status::InvalidArguments
+            )
+            .unwrap(),
+            ["b", "time", "a"]
+        );
+        assert_eq!(
+            align_append_schema(
+                &stream(vec![b.clone()]),
+                &destination,
+                Status::InvalidArguments
+            )
+            .unwrap(),
+            ["b"]
+        );
+        assert_eq!(
+            align_append_schema(
+                &stream(vec![b.clone().with_name("B")]),
+                &destination,
+                Status::InvalidArguments
+            )
+            .unwrap(),
+            ["b"]
+        );
+
+        let unknown = align_append_schema(
+            &stream(vec![b.clone().with_name("missing")]),
+            &destination,
+            Status::InvalidArguments,
+        )
+        .unwrap_err();
+        assert!(
+            unknown
+                .message
+                .contains("does not exist in the destination")
+        );
+
+        let duplicated = align_append_schema(
+            &stream(vec![b.clone(), b.clone().with_name("B")]),
+            &destination,
+            Status::InvalidArguments,
+        )
+        .unwrap_err();
+        assert!(duplicated.message.contains("more than once"));
+
+        let mistyped = align_append_schema(
+            &stream(vec![a.clone().with_data_type(DataType::Float64)]),
+            &destination,
+            Status::InvalidArguments,
+        )
+        .unwrap_err();
+        assert!(mistyped.message.contains("destination type is REAL"));
+    }
+
+    #[test]
+    fn renders_insert_column_lists_from_the_names_it_is_given() {
+        let names = ["a".to_owned(), "b".to_owned()];
+        assert_eq!(
+            insert_parameter_queries("t", &names).unwrap(),
+            [
+                "INSERT INTO t (a, b) VALUES (?, ?)",
+                "INSERT INTO t (\"a\", \"b\") VALUES (?, ?)"
+            ]
+        );
+        let quoted = ["Col One".to_owned()];
+        assert_eq!(
+            insert_parameter_queries("t", &quoted).unwrap(),
+            ["INSERT INTO t (\"Col One\") VALUES (?)"]
+        );
+    }
 
     struct SignallingReader {
         batch: RecordBatch,
