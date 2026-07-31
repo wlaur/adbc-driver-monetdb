@@ -184,6 +184,15 @@ timeout. Use `adbc_cancel()` when session destruction is intended, or set
 `adbc.monetdb.read_prefetch` to `"false"` when prompt pool reuse matters more than fetch/decode
 overlap.
 
+Appending to an existing table matches stream columns to destination columns by name,
+case-insensitively, on every route and at every stream size. The stream may therefore present its
+columns in any order, and it may supply a subset of the table's columns: a column it does not
+supply takes its `DEFAULT`, or `NULL` when it has none — which the server rejects for a `NOT NULL`
+column. A stream column that names no destination column, two stream columns that name the same
+destination column, and a column whose type does not match its destination are all rejected before
+any data is sent. Create, replace, and create-append modes that actually create the table still
+build it from the stream's own schema.
+
 Ingestion uses a 512 MiB logical encoded-byte window.
 The driver measures every upstream Arrow batch, coalesces small batches, and splits large ones
 without copying their buffers so each window stays within the byte budget. A single row larger
@@ -435,7 +444,7 @@ close that connection and open another one before issuing more work.
 Client information is sent at login by default. The `client` value in
 [`sys.sessions`](https://www.monetdb.org/documentation-Dec2025/user-guide/sql-catalog/users-roles-privileges-sessions/)
 identifies this driver and its protocol library, for example
-`adbc_driver_monetdb 0.10.2 / monetdb-rust 0.2.2-wlaur.1`. The Python shim uses the basename of
+`adbc_driver_monetdb 0.10.3 / monetdb-rust 0.2.2-wlaur.1`. The Python shim uses the basename of
 `sys.argv[0]` as the default `application`. Hostname and process id are also sent by default, as
 they are by pymonetdb and libmapi; use `client_info=false` if that host metadata should not leave
 the client.

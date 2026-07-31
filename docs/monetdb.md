@@ -100,6 +100,11 @@ within 8 MiB; the row threshold adapts upward on measured higher-latency connect
 `ingest_insert_rows`, `prepared_cache_capacity`, `wire_compression`, and `constrained_append` for
 URI-only consumers.
 
+Appending to an existing table matches stream columns to destination columns by name,
+case-insensitively, on every route and at every stream size. The stream may present its columns in
+any order and may supply a subset of them; a column it omits takes its `DEFAULT`, or `NULL` when it
+has none. Unknown, duplicated, and mistyped stream columns are rejected before any data is sent.
+
 COPY-sized appends to an existing constrained table use an unconstrained staging table. MonetDB
 11.55.7 and newer use a session-local table. Versions 11.55.0–11.55.6 use a uniquely named
 transactional `UNLOGGED` table in the target schema, and therefore require `CREATE TABLE` there,

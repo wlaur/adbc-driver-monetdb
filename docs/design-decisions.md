@@ -186,6 +186,12 @@ requirements change their premises.
   integers, or booleans use those scalar Arrow types. Polars may explicitly decode the resulting
   `String` storage into a known struct schema when an application wants that narrower view.
 - `TIMESTAMPTZ` decoding under `SET TIME ZONE` is correct and is pinned by a live regression test.
+- Interval parameters render their fractional seconds only when non-zero. MonetDB's
+  `parse_interval` advances past the fraction only for a non-zero value, so `INTERVAL '90.000'
+  SECOND` is rejected as trailing input while `INTERVAL '90' SECOND` and `INTERVAL '90.250' SECOND`
+  parse. Whole-second durations are the common case, so before this the prepared-INSERT route could
+  not re-ingest what a fetch of the same column produced. A fetch → append round trip for
+  `INTERVAL SECOND`, `INTERVAL DAY`, and `INTERVAL MONTH` is pinned on both routes.
 - TLS configuration errors are argument-shaped, but handshake and certificate-verification
   failures are I/O failures and map to `OperationalError`.
 - Certificate hashes shorter than 16 hexadecimal digits are rejected deliberately.
@@ -286,6 +292,17 @@ requirements change their premises.
   panics are surfaced before the statement completes; after an ingest error, a worker that has not
   stopped is detached so cleanup cannot block indefinitely. On the 764,331 × 786 time-series
   input, this reduced the large-table ingest query from 8.21 to 6.52 seconds.
+- Append matches stream columns to destination columns by name on every route. The prepared-INSERT
+  route was by-name from the start because it names the columns it inserts, while the COPY route
+  validated positionally with exact arity, so an identical frame succeeded below the routing
+  threshold and failed above it. The contract is now the prepared route's, implemented by naming
+  the destination columns in the COPY statement (`COPY … BINARY INTO t (…) FROM 'c0', …`) in the
+  stream's order: `bincopyfrom` runs the same `rel_inserts` reorder-and-default path as
+  `INSERT … (column list)`, so absent columns take their `DEFAULT` and no client-side projection or
+  null-fill is needed. Tightening the small route to positional exact-arity instead was rejected:
+  it breaks working callers and discards server-side `DEFAULT` handling the small route already
+  provided. Name matching is case-insensitive, so the insert route re-prepares once with the
+  catalog's spelling when the stream's spelling does not resolve.
 - Append-schema reads use `sys._columns`/`sys._tables`, or their `tmp` counterparts when the ADBC
   temporary-table option is set. On the supported 11.55.1 release, a temporary-table preflight
   immediately before the public `sys.columns` view can misbind that view's internal `_columns`
