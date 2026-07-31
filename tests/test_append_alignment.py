@@ -16,7 +16,7 @@ def _stats(cursor: dbapi.Cursor) -> dict[str, object]:
     return json.loads(cursor.adbc_statement.get_option(str(StatementOptions.INGEST_STATS)))
 
 
-def _repeat(rows: int, **columns: pa.Array[Any]) -> pa.Table:
+def _repeat(rows: int, **columns: "pa.Array[Any]") -> pa.Table:
     names = list(columns)
     return pa.Table.from_arrays([pa.chunked_array([columns[name]] * rows) for name in names], names=names)
 
