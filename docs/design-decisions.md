@@ -301,8 +301,9 @@ requirements change their premises.
   `INSERT … (column list)`, so absent columns take their `DEFAULT` and no client-side projection or
   null-fill is needed. Tightening the small route to positional exact-arity instead was rejected:
   it breaks working callers and discards server-side `DEFAULT` handling the small route already
-  provided. Name matching is case-insensitive, so the insert route re-prepares once with the
-  catalog's spelling when the stream's spelling does not resolve.
+  provided. Name matching prefers an exact spelling and then falls back to case-insensitive
+  matching, so quoted destination columns that differ only by case remain distinguishable. The
+  insert route re-prepares once with the catalog's spelling when fallback matching is required.
 - Append-schema reads use `sys._columns`/`sys._tables`, or their `tmp` counterparts when the ADBC
   temporary-table option is set. On the supported 11.55.1 release, a temporary-table preflight
   immediately before the public `sys.columns` view can misbind that view's internal `_columns`

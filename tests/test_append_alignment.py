@@ -75,6 +75,27 @@ def test_append_matches_destination_column_names_case_insensitively(target: str,
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize(("rows", "path"), [(INSERT_ROWS, "insert"), (COPY_ROWS, "copy")])
+def test_append_prefers_exact_names_when_destination_columns_differ_only_by_case(
+    monetdb_uri: str, rows: int, path: str
+) -> None:
+    with dbapi.connect(monetdb_uri, autocommit=True) as connection, connection.cursor() as cursor:
+        cursor.execute("DROP TABLE IF EXISTS append_alignment_exact_case")
+        cursor.execute('CREATE TABLE append_alignment_exact_case("a" REAL, "A" DOUBLE)')
+        exact = _repeat(
+            rows,
+            **{
+                "A": pa.array([2.5], type=pa.float64()),
+                "a": pa.array([1.5], type=pa.float32()),
+            },
+        )
+        assert cursor.adbc_ingest("append_alignment_exact_case", exact, mode="append") == rows
+        assert _stats(cursor)["path"] == path
+        cursor.execute('SELECT DISTINCT "a", "A" FROM append_alignment_exact_case')
+        assert cursor.fetchall() == [(1.5, 2.5)]
+
+
+@pytest.mark.integration
 @pytest.mark.parametrize("rows", [INSERT_ROWS, COPY_ROWS])
 def test_append_rejects_unknown_duplicate_and_mistyped_columns_on_every_route(target: str, rows: int) -> None:
     with dbapi.connect(target, autocommit=True) as connection, connection.cursor() as cursor:

@@ -101,9 +101,10 @@ within 8 MiB; the row threshold adapts upward on measured higher-latency connect
 URI-only consumers.
 
 Appending to an existing table matches stream columns to destination columns by name,
-case-insensitively, on every route and at every stream size. The stream may present its columns in
-any order and may supply a subset of them; a column it omits takes its `DEFAULT`, or `NULL` when it
-has none. Unknown, duplicated, and mistyped stream columns are rejected before any data is sent.
+case-insensitively, on every route and at every stream size. Exact spelling wins when a quoted
+destination has columns that differ only by case. The stream may present its columns in any order
+and may supply a subset of them; a column it omits takes its `DEFAULT`, or `NULL` when it has none.
+Unknown, duplicated, and mistyped stream columns are rejected before any data is sent.
 
 COPY-sized appends to an existing constrained table use an unconstrained staging table. MonetDB
 11.55.7 and newer use a session-local table. Versions 11.55.0–11.55.6 use a uniquely named

@@ -69,6 +69,57 @@ with dbapi.connect("monetdb://user:password@localhost:50000/db") as conn:
     df.to_sql("trades_copy", conn, if_exists="append", index=False)
 ```
 
+### DuckDB
+
+DuckDB's community [`adbc` extension](https://duckdb.org/community_extensions/extensions/adbc)
+can query and attach MonetDB through the standalone driver. Install the platform-specific DBC
+archive as shown under [Installation](#installation) before starting DuckDB. Installing only the
+Python wheel does not register the `monetdb` driver manifest that DuckDB's embedded ADBC driver
+manager discovers.
+
+```sql
+INSTALL adbc FROM community;
+LOAD adbc;
+
+SELECT *
+FROM read_adbc(
+    'monetdb://user:password@localhost:50000/db',
+    'SELECT * FROM trades WHERE trade_date >= DATE ''2026-01-01'''
+);
+
+ATTACH 'monetdb://user:password@localhost:50000/db' AS monet (TYPE adbc);
+SELECT * FROM monet.sys.trades;
+```
+
+Prefer an
+[ADBC connection profile](https://arrow.apache.org/adbc/current/format/connection_profiles.html)
+so credentials stay out of SQL and connection history. Use a profile when selecting this driver
+for a `monetdbs://` TLS URI: a raw URI makes the driver manager search for a driver named
+`monetdbs`, while the standalone package intentionally installs one manifest named `monetdb`.
+For example, save this as `monetdb_local.toml` in an ADBC profile directory:
+
+```toml
+profile_version = 1
+driver = "monetdb"
+
+[Options]
+uri = "monetdbs://localhost:50000/db"
+username = "{{ env_var(MONETDB_USER) }}"
+password = "{{ env_var(MONETDB_PASSWORD) }}"
+```
+
+Then use the profile for either interface:
+
+```sql
+SELECT * FROM read_adbc('profile://monetdb_local', 'SELECT * FROM trades');
+ATTACH 'profile://monetdb_local' AS monet (TYPE adbc);
+```
+
+The DuckDB extension operates in autocommit mode, does not automatically push projections or
+predicates into attached-table queries, and restricts concurrent ADBC operations within one
+process and mixed ADBC reads and writes within one statement. Put filters and projections in the
+SQL passed to `read_adbc` when remote pushdown matters.
+
 ## Credentials and read-only access
 
 SQLAlchemy-style URIs work: userinfo in `monetdb://user:password@localhost:50000/db` is
@@ -185,13 +236,14 @@ timeout. Use `adbc_cancel()` when session destruction is intended, or set
 overlap.
 
 Appending to an existing table matches stream columns to destination columns by name,
-case-insensitively, on every route and at every stream size. The stream may therefore present its
-columns in any order, and it may supply a subset of the table's columns: a column it does not
-supply takes its `DEFAULT`, or `NULL` when it has none — which the server rejects for a `NOT NULL`
-column. A stream column that names no destination column, two stream columns that name the same
-destination column, and a column whose type does not match its destination are all rejected before
-any data is sent. Create, replace, and create-append modes that actually create the table still
-build it from the stream's own schema.
+case-insensitively, on every route and at every stream size. Exact spelling wins when a quoted
+destination has columns that differ only by case. The stream may therefore present its columns in
+any order, and it may supply a subset of the table's columns: a column it does not supply takes its
+`DEFAULT`, or `NULL` when it has none — which the server rejects for a `NOT NULL` column. A stream
+column that names no destination column, two stream columns that name the same destination column,
+and a column whose type does not match its destination are all rejected before any data is sent.
+Create, replace, and create-append modes that actually create the table still build it from the
+stream's own schema.
 
 Ingestion uses a 512 MiB logical encoded-byte window.
 The driver measures every upstream Arrow batch, coalesces small batches, and splits large ones
@@ -444,7 +496,7 @@ close that connection and open another one before issuing more work.
 Client information is sent at login by default. The `client` value in
 [`sys.sessions`](https://www.monetdb.org/documentation-Dec2025/user-guide/sql-catalog/users-roles-privileges-sessions/)
 identifies this driver and its protocol library, for example
-`adbc_driver_monetdb 0.10.3 / monetdb-rust 0.2.2-wlaur.1`. The Python shim uses the basename of
+`adbc_driver_monetdb 0.10.4 / monetdb-rust 0.2.2-wlaur.1`. The Python shim uses the basename of
 `sys.argv[0]` as the default `application`. Hostname and process id are also sent by default, as
 they are by pymonetdb and libmapi; use `client_info=false` if that host metadata should not leave
 the client.

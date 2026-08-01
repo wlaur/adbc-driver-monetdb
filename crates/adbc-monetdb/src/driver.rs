@@ -5367,10 +5367,7 @@ fn align_append_schema(
     let mut matched = vec![false; columns.len()];
     let mut targets = Vec::with_capacity(schema.fields().len());
     for field in schema.fields() {
-        let Some(index) = columns
-            .iter()
-            .position(|column| append_column_names_match(field.name(), &column.name))
-        else {
+        let Some(index) = append_column_index(field.name(), columns) else {
             return Err(error(
                 format!(
                     "append column {:?} does not exist in the destination table; it has columns {}",
@@ -5461,8 +5458,15 @@ fn append_monet_types_match(source: &MonetType, destination: &MonetType) -> bool
     source == destination || (string_wire(source) && string_wire(destination))
 }
 
-fn append_column_names_match(source: &str, destination: &str) -> bool {
-    source.eq_ignore_ascii_case(destination)
+fn append_column_index(source: &str, columns: &[AppendColumn]) -> Option<usize> {
+    columns
+        .iter()
+        .position(|column| source == column.name)
+        .or_else(|| {
+            columns
+                .iter()
+                .position(|column| source.eq_ignore_ascii_case(&column.name))
+        })
 }
 
 #[derive(Clone)]
@@ -6716,6 +6720,7 @@ fn table_constraint_state(
 
 /// Whether a temporary table exists whose lifetime ends with the transaction.
 ///
+/// MonetDB source: [`ca_t`](https://github.com/MonetDB/MonetDB/blob/Dec2025_7/sql/include/sql_catalog.h#L186-L191).
 /// `sys.tables.commit_action` encodes the temporary-table commit action:
 /// 1 = ON COMMIT DELETE ROWS, 2 = ON COMMIT PRESERVE ROWS, 3 = ON COMMIT DROP.
 /// Both 1 and 3 are transaction-scoped: ending the transaction, including
@@ -7616,6 +7621,18 @@ mod tests {
             )
             .unwrap(),
             ["b"]
+        );
+
+        let case_distinct_destination =
+            [column("a", MonetType::Real), column("A", MonetType::Double)];
+        assert_eq!(
+            align_append_schema(
+                &stream(vec![b.clone().with_name("A"), a.clone()]),
+                &case_distinct_destination,
+                Status::InvalidArguments
+            )
+            .unwrap(),
+            ["A", "a"]
         );
 
         let unknown = align_append_schema(
@@ -9096,8 +9113,13 @@ mod tests {
     }
 
     #[test]
-    fn append_column_names_follow_unquoted_identifier_case_folding() {
-        assert!(append_column_names_match("MixedCase", "mixedcase"));
-        assert!(!append_column_names_match("first", "second"));
+    fn append_column_lookup_falls_back_to_unquoted_identifier_case_folding() {
+        let columns = [AppendColumn {
+            name: "mixedcase".to_owned(),
+            data_type: MonetType::Int,
+            nullable: true,
+        }];
+        assert_eq!(append_column_index("MixedCase", &columns), Some(0));
+        assert_eq!(append_column_index("first", &columns), None);
     }
 }
