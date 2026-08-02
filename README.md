@@ -224,12 +224,14 @@ cursor; it has no `engine="adbc"` parameter. Polars calls `connection.cursor()` 
 and a dictionary for named `:name` values.
 `adbc_stmt_kwargs` is not an execute option. Polars' `batch_size` does not configure the driver,
 and `DataFrame.write_database(..., engine_options=...)` supplies ingestion arguments rather than
-connection or timeout options. Result windows target 64 MiB on local connections and 128 MiB when
-the measured round trip is at least 5 ms, capped by available host or cgroup memory. The estimate
-adapts to observed variable-width data. Set `adbc.monetdb.read_window_bytes` to choose another byte
-target, or use `adbc.monetdb.read_batch_rows` as a diagnostic exact-row override that disables byte
-adaptation. Both are available on connections and statements; `read_window_bytes` is also accepted
-in a URI.
+connection or timeout options. Result windows start at 64 MiB on local connections and 128 MiB
+when the measured round trip is at least 5 ms, capped by available host or cgroup memory. A
+fixed-width result may use a larger guarded budget for one complete export granule; variable-width
+estimates adapt from observed data. Set `adbc.monetdb.read_window_bytes` to choose another byte
+target, or use `adbc.monetdb.read_batch_rows` as a diagnostic row override that disables byte
+adaptation. Non-zero row overrides are rounded to a preferred export boundary with a warning, and
+the effective value is returned by `get_option`. Both options are available on connections and
+statements; `read_window_bytes` is also accepted in a URI.
 
 Read prefetch is enabled by default and can hold up to about three byte-bounded windows at once:
 one decoding, one buffered, and one in flight. Abandoning a stream can therefore waste up to two
@@ -459,7 +461,7 @@ measurement; statement scope is preferable when one operation is exceptional.
 | Option | Default | Scope | Tune when |
 |---|---:|---|---|
 | `read_window_bytes` | `0` (64 MiB local, 128 MiB at ≥5 ms) | database, connection, statement, URI | Set another result byte target for a measured memory/network constraint |
-| `read_batch_rows` | `0` (disabled) | connection, statement | Diagnostic exact-row override; it disables byte adaptation |
+| `read_batch_rows` | `0` (disabled) | connection, statement | Diagnostic row override; it is normalized to an export boundary and disables byte adaptation |
 | `read_prefetch` | `true` | connection, statement | Disable when promptly returning a connection to a pool matters more than fetch/decode overlap |
 | `write_window_bytes` | `0` (adaptive) | database, connection, statement, URI | Set a byte budget only for measured memory/network constraints; it changes all write budgets together |
 | `write_batch_rows` | `0` (disabled) | connection, statement | Diagnostic exact-row override; it disables byte adaptation and is not a normal production setting |
@@ -512,7 +514,7 @@ close that connection and open another one before issuing more work.
 Client information is sent at login by default. The `client` value in
 [`sys.sessions`](https://www.monetdb.org/documentation-Dec2025/user-guide/sql-catalog/users-roles-privileges-sessions/)
 identifies this driver and its protocol library, for example
-`adbc_driver_monetdb 0.11.0 / monetdb-rust 0.2.2-wlaur.1`. The Python shim uses the basename of
+`adbc_driver_monetdb 0.11.1 / monetdb-rust 0.2.2-wlaur.1`. The Python shim uses the basename of
 `sys.argv[0]` as the default `application`. Hostname and process id are also sent by default, as
 they are by pymonetdb and libmapi; use `client_info=false` if that host metadata should not leave
 the client.

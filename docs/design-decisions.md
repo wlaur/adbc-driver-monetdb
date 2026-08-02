@@ -59,11 +59,15 @@ requirements change their premises.
 
 ## Result scheduling and memory
 
-- Automatic reads target 64 MiB below a measured 5 ms round trip and 128 MiB at or above it,
-  capped at one eighth of the lower host/cgroup memory limit. Fixed-width schemas provide an exact
-  initial row-width estimate. Variable-width schemas start with a conservative allowance, update
-  it from returned frames, and grow at most fourfold per window. `read_batch_rows` is an exact-row
-  diagnostic override; zero selects byte scheduling. Copy-decoded frames reuse a small buffer pool,
+- Automatic reads start at 64 MiB below a measured 5 ms round trip and 128 MiB at or above it,
+  capped at one eighth of the lower host/cgroup memory limit. When a fixed-width schema's exact
+  estimate shows that one 131,072-row export granule fits within that memory guard and a 512 MiB
+  ceiling, the automatic budget expands to that granule. Adaptive window endpoints use complete
+  export granules when possible and power-of-two sub-granules otherwise. Variable-width schemas
+  start with a conservative allowance, update it from returned frames, and grow at most fourfold
+  per window. `read_batch_rows` is a diagnostic row override; non-zero values are normalized to
+  the nearest export granule or sub-granule and the effective value remains exact. Zero selects
+  byte scheduling. Copy-decoded frames reuse a small buffer pool,
   while adopted fixed-width frames shed capacity slack above one eighth before Arrow owns them.
   `read_stats` exposes the budget, estimates, observed windows, adoption, prefetch, and recycling.
   On a public ClickBench Parquet subset, the old 131,072-row scan took 19.569 seconds and 4,323.7
@@ -72,6 +76,17 @@ requirements change their premises.
   measured repeats. On a TPC-H Parquet subset, 32 MiB changed a lineitem scan from 1.564
   seconds/917.0 MiB to 1.542 seconds/320.8 MiB. These are scheduler calibrations, not authoritative
   workload scores.
+- Server-aware follow-up measurements retained the granule scheduling for repeatable client and
+  latency results, not as a server-memory mitigation. On a self-contained 218,880 by 787
+  fixed-width probe, reducing eleven round trips to two improved warm-cache latency by 23–28% and
+  reduced peak client RSS by about 5.5 MiB. On one-million-row synthetic ClickBench and TPC-H
+  schemas, the trade was respectively 28.4% lower client RSS for 4.2% higher latency, and 7.8%
+  lower latency for 0.6% higher client RSS; peak server memory and disk were effectively flat.
+  Fresh-container controls also showed that an apparent roughly 695 MiB aligned-versus-unaligned
+  cgroup-memory difference was named-volume page-cache attribution: the MonetDB process mapped the
+  same pages under both schedules, and identical schedules changed cgroup charge across fresh
+  containers. Consequently server cgroup memory must be measured and reported, but must not be
+  used as evidence for an alignment-specific memory win without controlling page ownership.
 - Write scheduling separates a 512 MiB logical encoded-byte target from physical retained storage.
   Below a measured 5 ms round trip, ordinary schemas have
   a 128 MiB physical limit and incompressible windows close at 64 MiB. Schemas with at least 512

@@ -117,12 +117,12 @@ def test_json_functions_remain_stable_across_small_result_windows(monetdb_uri: s
     """
     with (
         dbapi.connect(monetdb_uri, autocommit=True) as connection,
-        connection.cursor(adbc_stmt_kwargs={StatementOptions.READ_BATCH_ROWS: "7"}) as cursor,
+        connection.cursor(adbc_stmt_kwargs={StatementOptions.READ_BATCH_ROWS: "8"}) as cursor,
     ):
         cursor.execute(query)
         batches = list(cursor.fetch_record_batch())
 
-    assert len(batches) == 43
+    assert len(batches) == 38
     assert sum(batch.num_rows for batch in batches) == 299
     assert all(batch.schema == batches[0].schema for batch in batches)
     assert batches[0].schema.types == [pa.json_()] * 7

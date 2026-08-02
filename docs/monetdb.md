@@ -54,14 +54,16 @@ may interrupt whichever statement currently owns the connection.
 
 ## Result reads
 
-Server-resident results use adaptive byte-sized windows. The automatic target is 64 MiB below a
-5 ms measured round trip and 128 MiB at or above it, capped by available host or cgroup memory.
+Server-resident results use adaptive byte-sized windows. The automatic target starts at 64 MiB
+below a 5 ms measured round trip and 128 MiB at or above it, capped by available host or cgroup
+memory. A fixed-width result may use a larger guarded budget for one complete export granule.
 The connection and statement option `adbc.monetdb.read_window_bytes` selects another byte target;
 `read_window_bytes` is also accepted in the URI. The diagnostic
-`adbc.monetdb.read_batch_rows` option instead forces an exact row count and disables byte
-adaptation. Prefetch remains enabled by default and can retain about three bounded windows. The
-read-only statement option `adbc.monetdb.read_stats` reports the effective budget, per-window row
-and byte counts, observed widths, prefetch use, and buffer reuse as JSON.
+`adbc.monetdb.read_batch_rows` option instead selects a row count and disables byte adaptation.
+Non-zero row counts are rounded to a preferred export boundary with a warning; `get_option`
+returns the effective value. Prefetch remains enabled by default and can retain about three
+bounded windows. The read-only statement option `adbc.monetdb.read_stats` reports the effective
+budget, per-window row and byte counts, observed widths, prefetch use, and buffer reuse as JSON.
 
 ## Bulk ingestion
 
