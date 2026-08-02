@@ -131,8 +131,15 @@ class _BlackHoleServer:
                 query = _read_message(stream)
                 self.query_received.set()
                 if self._behavior == "blackhole":
-                    while stream.recv(1):
-                        pass
+                    stream.settimeout(0.1)
+                    while not self._release.is_set():
+                        try:
+                            if not stream.recv(1):
+                                return
+                        except TimeoutError:
+                            continue
+                        except OSError:
+                            return
                     return
                 if self._behavior == "slow_drip":
                     stream.sendall(((64 << 1) | 1).to_bytes(2, "little"))
