@@ -21,8 +21,9 @@ mod wire;
 
 pub use decode::{
     DecodeError, data_type_for_monet_type, decode_column, decode_frame, decode_frame_owned,
-    decode_frame_owned_with_schema, decode_frame_with_schema, decode_inline_rows, field_for_column,
-    field_for_monet_type, owned_frame_capacity, prefers_owned_frame,
+    decode_frame_owned_with_schema, decode_frame_with_schema, decode_inline_rows,
+    estimated_frame_bytes_per_row, field_for_column, field_for_monet_type, owned_frame_capacity,
+    prefers_owned_frame,
 };
 pub use encode::{
     ChunkedEncodeError, EncodeError, encode_column, encode_column_chunks, estimated_encoded_size,

@@ -52,6 +52,17 @@ without matching message text. A server SQLSTATE timeout or cancellation has no 
 and remains reusable when MonetDB keeps the session open. Cancellation is connection-scoped and
 may interrupt whichever statement currently owns the connection.
 
+## Result reads
+
+Server-resident results use adaptive byte-sized windows. The automatic target is 64 MiB below a
+5 ms measured round trip and 128 MiB at or above it, capped by available host or cgroup memory.
+The connection and statement option `adbc.monetdb.read_window_bytes` selects another byte target;
+`read_window_bytes` is also accepted in the URI. The diagnostic
+`adbc.monetdb.read_batch_rows` option instead forces an exact row count and disables byte
+adaptation. Prefetch remains enabled by default and can retain about three bounded windows. The
+read-only statement option `adbc.monetdb.read_stats` reports the effective budget, per-window row
+and byte counts, observed widths, prefetch use, and buffer reuse as JSON.
+
 ## Bulk ingestion
 
 The driver measures and coalesces producer batches into COPY windows using a 512 MiB logical
@@ -96,7 +107,8 @@ per-window decision observable.
 A complete single-batch ingest of at most 100 rows uses the cached prepared INSERT path when its
 encoded input passes a conservative expansion-aware gate and its incrementally rendered SQL stays
 within 8 MiB; the row threshold adapts upward on measured higher-latency connections. Set
-`adbc.monetdb.ingest_insert_rows=0` to force COPY. The URI accepts `write_window_bytes`,
+`adbc.monetdb.ingest_insert_rows=0` to force COPY. The URI accepts `read_window_bytes`,
+`write_window_bytes`,
 `ingest_insert_rows`, `prepared_cache_capacity`, `wire_compression`, and `constrained_append` for
 URI-only consumers.
 
@@ -117,6 +129,12 @@ creation is unavailable. Unconstrained targets and tiny prepared INSERTs remain 
 `adbc.monetdb.constrained_append=auto` is suitable for general workloads; set it to `direct` only
 for a measured server/workload exception or a diagnostic comparison. Ingest stats distinguish
 `staging_copy_count`, `target_copy_count`, and `final_move_count`.
+
+Staging holds incoming rows separately until the final move, so server memory and disk peaks can
+grow with the append. `constrained_append=direct` removes that duplication but may be substantially
+slower because constraints are maintained for every COPY window. Create and replace ingests inside
+a caller-managed transaction also retain an operation savepoint; use an independent autocommit
+load when preserving unrelated work in the same transaction is unnecessary.
 
 In a caller-managed transaction, a client-side failure after completed direct target COPY windows
 makes commit fail until rollback, including through raw transaction SQL, so a partial append is

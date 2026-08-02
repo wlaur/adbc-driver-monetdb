@@ -1,4 +1,9 @@
+import json
+import os
+import subprocess
+import sys
 from decimal import Decimal
+from pathlib import Path
 from typing import cast
 from urllib.parse import parse_qs, urlsplit
 
@@ -7,6 +12,8 @@ import polars as pl
 import pytest
 
 from adbc_driver_monetdb import ConnectionOptions, DatabaseOptions, StatementOptions, dbapi
+
+POST_INGEST_RSS_BOUND = 256 * 1024 * 1024
 
 
 @pytest.mark.integration
@@ -22,6 +29,28 @@ def test_connection_context_exit_rolls_back_uncommitted_work(monetdb_uri: str) -
     finally:
         with dbapi.connect(monetdb_uri, autocommit=True) as cleanup:
             cleanup.execute("DROP TABLE IF EXISTS review_close_rollback")
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(sys.platform != "linux", reason="uses Linux process RSS accounting")
+def test_post_ingest_memory_returns_near_the_process_baseline(monetdb_uri: str) -> None:
+    environment = os.environ.copy()
+    environment["MONETDB_MEMORY_PROBE_URI"] = monetdb_uri
+    worker = Path(__file__).with_name("post_ingest_memory_worker.py")
+    result = subprocess.run(
+        [sys.executable, str(worker)],
+        capture_output=True,
+        check=True,
+        env=environment,
+        text=True,
+        timeout=180,
+    )
+    measurements = json.loads(result.stdout.splitlines()[-1])
+
+    assert measurements["affected"] == measurements["expected"]
+    assert measurements["arrow_allocated"] == 0
+    assert measurements["after_cursor"] - measurements["before"] <= POST_INGEST_RSS_BOUND
+    assert measurements["after_connection"] - measurements["before"] <= POST_INGEST_RSS_BOUND
 
 
 @pytest.mark.integration
@@ -262,7 +291,8 @@ def test_connection_read_prefetch_false_is_inherited_by_statements(monetdb_uri: 
         conn_kwargs={ConnectionOptions.READ_PREFETCH: "false"},
     ) as connection:
         assert connection.adbc_connection.get_option(str(ConnectionOptions.READ_PREFETCH)) == "false"
-        assert connection.adbc_connection.get_option(str(ConnectionOptions.READ_BATCH_ROWS)) == "131072"
+        assert connection.adbc_connection.get_option(str(ConnectionOptions.READ_BATCH_ROWS)) == "0"
+        assert connection.adbc_connection.get_option(str(ConnectionOptions.READ_WINDOW_BYTES)) == "0"
         assert connection.adbc_connection.get_option(str(ConnectionOptions.WRITE_BATCH_ROWS)) == "0"
         assert connection.adbc_connection.get_option(str(ConnectionOptions.WRITE_WINDOW_BYTES)) == "0"
         assert connection.adbc_connection.get_option(str(ConnectionOptions.INGEST_PARTIAL)) == "block"
@@ -270,12 +300,79 @@ def test_connection_read_prefetch_false_is_inherited_by_statements(monetdb_uri: 
         assert connection.adbc_connection.get_option(str(ConnectionOptions.CONSTRAINED_APPEND)) == "auto"
         with connection.cursor() as cursor:
             assert cursor.adbc_statement.get_option(str(StatementOptions.READ_PREFETCH)) == "false"
-            assert cursor.adbc_statement.get_option(str(StatementOptions.READ_BATCH_ROWS)) == "131072"
+            assert cursor.adbc_statement.get_option(str(StatementOptions.READ_BATCH_ROWS)) == "0"
+            assert cursor.adbc_statement.get_option(str(StatementOptions.READ_WINDOW_BYTES)) == "0"
             assert cursor.adbc_statement.get_option(str(StatementOptions.WRITE_BATCH_ROWS)) == "0"
             assert cursor.adbc_statement.get_option(str(StatementOptions.WRITE_WINDOW_BYTES)) == "0"
             assert cursor.adbc_statement.get_option(str(StatementOptions.INGEST_PARTIAL)) == "block"
             assert cursor.adbc_statement.get_option(str(StatementOptions.INGEST_ATOMICITY)) == "transaction"
             assert cursor.adbc_statement.get_option(str(StatementOptions.CONSTRAINED_APPEND)) == "auto"
+
+
+@pytest.mark.integration
+def test_read_window_uses_a_byte_budget_and_reports_scheduling(monetdb_uri: str) -> None:
+    with (
+        dbapi.connect(monetdb_uri) as connection,
+        connection.cursor(
+            adbc_stmt_kwargs={
+                StatementOptions.READ_WINDOW_BYTES: 1024 * 1024,
+                StatementOptions.READ_PREFETCH: "true",
+            }
+        ) as cursor,
+    ):
+        cursor.execute("SELECT value, CAST(value AS DOUBLE) AS d FROM sys.generate_series(1, 300001)")
+        batches = list(cursor.fetch_record_batch())
+        stats = json.loads(cursor.adbc_statement.get_option(str(StatementOptions.READ_STATS)))
+
+    assert sum(batch.num_rows for batch in batches) == 300_000
+    assert len(batches) == stats["windows_fetched"]
+    assert stats["window_budget_bytes"] == 1024 * 1024
+    assert stats["exact_batch_rows"] == 0
+    assert stats["prefetch_engaged"] is True
+    assert stats["window_rows"] == [batch.num_rows for batch in batches]
+    assert len(stats["observed_bytes_per_row"]) == len(batches)
+
+
+@pytest.mark.integration
+def test_variable_width_read_windows_converge_to_the_byte_budget(monetdb_uri: str) -> None:
+    budget = 1024 * 1024
+    with (
+        dbapi.connect(monetdb_uri) as connection,
+        connection.cursor(
+            adbc_stmt_kwargs={
+                StatementOptions.READ_WINDOW_BYTES: budget,
+                StatementOptions.READ_PREFETCH: "true",
+            }
+        ) as cursor,
+    ):
+        cursor.execute("SELECT CAST(value AS STRING) || repeat('x', 1024) AS value FROM sys.generate_series(1, 10001)")
+        rows = sum(batch.num_rows for batch in cursor.fetch_record_batch())
+        stats = json.loads(cursor.adbc_statement.get_option(str(StatementOptions.READ_STATS)))
+
+    assert rows == 10_000
+    assert stats["windows_fetched"] > 1
+    assert max(stats["window_bytes"]) <= 2 * budget
+    assert max(stats["window_capacity_bytes"]) <= 2 * budget
+    assert stats["recycled_buffers"] > 0
+
+
+@pytest.mark.integration
+def test_read_batch_rows_remains_an_exact_override(monetdb_uri: str) -> None:
+    with (
+        dbapi.connect(monetdb_uri) as connection,
+        connection.cursor(
+            adbc_stmt_kwargs={
+                StatementOptions.READ_BATCH_ROWS: 10_000,
+                StatementOptions.READ_WINDOW_BYTES: 1024 * 1024,
+            }
+        ) as cursor,
+    ):
+        cursor.execute("SELECT value FROM sys.generate_series(1, 30002)")
+        batches = list(cursor.fetch_record_batch())
+        stats = json.loads(cursor.adbc_statement.get_option(str(StatementOptions.READ_STATS)))
+
+    assert [batch.num_rows for batch in batches] == [10_000, 10_000, 10_000, 1]
+    assert stats["exact_batch_rows"] == 10_000
 
 
 @pytest.mark.integration

@@ -59,8 +59,21 @@ requirements change their premises.
 
 ## Result scheduling and memory
 
-- The read default remains 131,072 rows. Write scheduling separates a 512 MiB logical encoded-byte
-  target from physical retained storage. Below a measured 5 ms round trip, ordinary schemas have
+- Automatic reads target 64 MiB below a measured 5 ms round trip and 128 MiB at or above it,
+  capped at one eighth of the lower host/cgroup memory limit. Fixed-width schemas provide an exact
+  initial row-width estimate. Variable-width schemas start with a conservative allowance, update
+  it from returned frames, and grow at most fourfold per window. `read_batch_rows` is an exact-row
+  diagnostic override; zero selects byte scheduling. Copy-decoded frames reuse a small buffer pool,
+  while adopted fixed-width frames shed capacity slack above one eighth before Arrow owns them.
+  `read_stats` exposes the budget, estimates, observed windows, adoption, prefetch, and recycling.
+  On a public ClickBench Parquet subset, the old 131,072-row scan took 19.569 seconds and 4,323.7
+  MiB peak client RSS. A 32 MiB target took 19.901 seconds and 428.3 MiB; the selected 64 MiB target
+  with the final variable-width guard took a 19.744-second median and at most 741.4 MiB across three
+  measured repeats. On a TPC-H Parquet subset, 32 MiB changed a lineitem scan from 1.564
+  seconds/917.0 MiB to 1.542 seconds/320.8 MiB. These are scheduler calibrations, not authoritative
+  workload scores.
+- Write scheduling separates a 512 MiB logical encoded-byte target from physical retained storage.
+  Below a measured 5 ms round trip, ordinary schemas have
   a 128 MiB physical limit and incompressible windows close at 64 MiB. Schemas with at least 512
   columns use 48 MiB for both local limits; above 5 ms, both physical limits rise to the logical
   target. Logical targets are capped at one eighth of the lower of host physical memory and a
@@ -157,10 +170,27 @@ requirements change their premises.
   direct path. Autocommit wraps the complete stream in an internal transaction; create and replace
   modes retain their operation savepoint because their DDL must be recovered without discarding
   unrelated caller work.
+- Constrained staging is intentionally a speed/server-storage trade. On a generic BIGINT-primary-key
+  plus 512-byte-BLOB stream at 100,000, 400,000, and 1,600,000 rows, staged caller-transaction server
+  RSS peaked at 186.0, 564.4, and 2,884.5 MiB, versus 145.4, 255.0, and 883.6 MiB for direct COPY.
+  At 1,600,000 rows, staged peak disk was 3,043.3 MiB versus 1,088.0 MiB direct, while ingest was
+  2.422 versus 1.749 seconds. Autocommit did not remove the staged duplication. Moving and
+  truncating 512 MiB generations inside the same atomic transaction was rejected: it measured
+  2,934.8 MiB RSS, 3,027.5 MiB disk, and 2.548 seconds because MonetDB retains rollback state until
+  commit. `constrained_append=direct` remains the honest memory escape hatch; create/replace in a
+  caller transaction retains its savepoint to preserve earlier work.
+- Post-ingest RSS is not live driver or Arrow state in the measured macOS case. Arrow accounting
+  returned to zero, while the retained pages appeared as empty large malloc regions and were
+  released gradually by the platform allocator. A PyArrow-only replay retained the same class of
+  pages. In a fresh Linux process, a 1 GiB synthetic ingest returned to 28.6 MiB above its baseline
+  after cursor close, with zero Arrow-allocated bytes and a 92.1 MiB measured driver prefetch peak.
+  The Linux integration suite gates the post-close delta at 256 MiB. Allocator replacement and
+  explicit trimming remain rejected because they would treat platform policy as live driver state.
 - The prefetch worker fetches complete raw `Xexportbin` frames while the caller decodes the
   previous frame. A worker that both fetches and decodes would serialize those phases and lose the
   overlap.
-- Prefetch can hold about three windows: one decoding, one buffered, and one in flight. Early
+- Prefetch can hold about three byte-budgeted windows: one decoding, one buffered, and one in
+  flight. Copy-decoded response allocations are returned to the fetch worker for reuse. Early
   abandonment can therefore waste up to two fetched windows. A detached final fetch temporarily
   retains the connection's protocol operation lock; the next statement waits for that bounded
   server response or the configured read/operation timeout.
@@ -179,6 +209,14 @@ requirements change their premises.
   images only for the x86_64 wheel job and the 11.55.1 minimum-server gate: an ARM64-only image
   cannot run those architecture/version checks, and no 11.55.1 tag exists in the ARM64 image
   repository.
+- Savepoint-scoped temporary-table ingest needs both the target's commit action and whether any
+  transaction-scoped temporary table exists. One catalog query returns both facts and is reused by
+  atomic-scope selection, avoiding a duplicate round trip without weakening temporary-table
+  preservation.
+- A reduced deterministic SQLsmith corpus generated with seed 52217 is committed as an integration
+  fixture. CI replays ordinary, nested, very long, and expected-server-error query strings through
+  ADBC and verifies connection recovery. SQLsmith is not built in CI; generation is an offline way
+  to refresh the bounded fixture, not a second database execution harness.
 - MonetDB `JSON` maps to the canonical Arrow `arrow.json` extension backed by UTF-8, never to an
   Arrow `Struct`. MonetDB defines JSON as a validated string subtype, and a column may contain
   objects, arrays, scalars, and JSON `null` with different shapes in different rows. Functions
@@ -352,6 +390,8 @@ be reviewed and reproduced.
 | Asynchronous COPY double-buffering | Rejected for the sequential ON CLIENT protocol; synchronous bounded encode/send already holds at most one scratch and one framed chunk. |
 | A worker that fetches and decodes | Rejected because it cannot overlap the two phases. |
 | Performance-only protocol-fork primitives | Rejected unless a genuinely generic MAPI operation is missing. |
+| Mid-transaction staged move plus `TRUNCATE` generations | Rejected; MonetDB retained rollback state, leaving RSS/disk unchanged while latency regressed about 5%. |
+| Allocator swaps or explicit post-ingest trimming | Rejected; measured retained macOS pages were empty allocator regions, while Linux returned to 28.6 MiB above baseline without intervention. |
 
 The dominant remaining read costs are server execution, serialization, and transfer; writes are
 even more server-bound. Unix-domain sockets are already available through `sock=` for colocated

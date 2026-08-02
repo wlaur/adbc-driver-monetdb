@@ -44,7 +44,12 @@ use parameters::{
     unbound_statements,
 };
 
-const DEFAULT_READ_BATCH_ROWS: usize = 131_072;
+const DEFAULT_READ_WINDOW_BYTES: usize = 64 * 1024 * 1024;
+const REMOTE_READ_WINDOW_BYTES: usize = 128 * 1024 * 1024;
+const MIN_READ_WINDOW_BYTES: usize = 1024 * 1024;
+const VARIABLE_READ_COLUMN_BYTES: usize = 1024;
+const INITIAL_VARIABLE_READ_ROWS: usize = 65_536;
+const MAX_READ_WINDOW_GROWTH: usize = 4;
 const DEFAULT_WRITE_WINDOW_BYTES: usize = 512 * 1024 * 1024;
 const LOCAL_PHYSICAL_WINDOW_BYTES: usize = 128 * 1024 * 1024;
 const WIDE_LOCAL_PHYSICAL_WINDOW_BYTES: usize = 48 * 1024 * 1024;
@@ -67,8 +72,10 @@ const COPY_FILE_EXCHANGES_PER_COLUMN: u128 = 2;
 const MAX_ADAPTIVE_INSERT_ROWS: usize = 10_000;
 const PREFETCH_DROP_GRACE: Duration = Duration::from_millis(250);
 const METADATA_REPLY_ROWS: usize = 1024;
+const METADATA_READ_BATCH_ROWS: usize = 131_072;
 const INLINE_REPLY_ROWS: i64 = 100;
 const READ_BATCH_ROWS_OPTION: &str = "adbc.monetdb.read_batch_rows";
+const READ_WINDOW_BYTES_OPTION: &str = "adbc.monetdb.read_window_bytes";
 const READ_PREFETCH_OPTION: &str = "adbc.monetdb.read_prefetch";
 const WRITE_BATCH_ROWS_OPTION: &str = "adbc.monetdb.write_batch_rows";
 const WRITE_WINDOW_BYTES_OPTION: &str = "adbc.monetdb.write_window_bytes";
@@ -79,6 +86,7 @@ const INGEST_PARTIAL_OPTION: &str = "adbc.monetdb.ingest_partial";
 const INGEST_ATOMICITY_OPTION: &str = "adbc.monetdb.ingest_atomicity";
 const CONSTRAINED_APPEND_OPTION: &str = "adbc.monetdb.constrained_append";
 const INGEST_STATS_OPTION: &str = "adbc.monetdb.ingest_stats";
+const READ_STATS_OPTION: &str = "adbc.monetdb.read_stats";
 const BIND_BY_NAME_OPTION: &str = "adbc.monetdb.bind_by_name";
 const DRIVER_MANAGER_BIND_BY_NAME_OPTION: &str = "adbc.statement.bind_by_name";
 const CONNECT_TIMEOUT_OPTION: &str = "adbc.monetdb.connect_timeout_seconds";
@@ -116,6 +124,7 @@ const URI_QUERY_KEYS: &[&str] = &[
     "client_application",
     "client_remark",
     "max_response_size",
+    "read_window_bytes",
     "write_window_bytes",
     "ingest_insert_rows",
     "prepared_cache_capacity",
@@ -125,6 +134,7 @@ const URI_QUERY_KEYS: &[&str] = &[
 
 fn tuning_option_from_uri_key(key: &str) -> Option<&'static str> {
     match key {
+        "read_window_bytes" => Some(READ_WINDOW_BYTES_OPTION),
         "write_window_bytes" => Some(WRITE_WINDOW_BYTES_OPTION),
         "ingest_insert_rows" => Some(INGEST_INSERT_ROWS_OPTION),
         "prepared_cache_capacity" => Some(PREPARED_CACHE_CAPACITY_OPTION),
@@ -136,6 +146,7 @@ fn tuning_option_from_uri_key(key: &str) -> Option<&'static str> {
 
 fn tuning_uri_key(option: &str) -> Option<&'static str> {
     match option {
+        READ_WINDOW_BYTES_OPTION => Some("read_window_bytes"),
         WRITE_WINDOW_BYTES_OPTION => Some("write_window_bytes"),
         INGEST_INSERT_ROWS_OPTION => Some("ingest_insert_rows"),
         PREPARED_CACHE_CAPACITY_OPTION => Some("prepared_cache_capacity"),
@@ -147,6 +158,9 @@ fn tuning_uri_key(option: &str) -> Option<&'static str> {
 
 fn validate_tuning_option(key: &str, value: &OptionValue) -> Result<()> {
     match key {
+        READ_WINDOW_BYTES_OPTION => {
+            read_window_bytes_option(value)?;
+        }
         WRITE_WINDOW_BYTES_OPTION => {
             write_window_bytes_option(value)?;
         }
@@ -311,12 +325,28 @@ fn integer_option(key: &str, value: &OptionValue) -> Result<i64> {
 
 fn read_batch_rows_option(value: &OptionValue) -> Result<usize> {
     let rows = integer_option(READ_BATCH_ROWS_OPTION, value)?;
-    usize::try_from(rows)
+    usize::try_from(rows).map_err(|_| {
+        error(
+            format!("option '{READ_BATCH_ROWS_OPTION}' must be non-negative"),
+            Status::InvalidArguments,
+        )
+    })
+}
+
+fn read_window_bytes_option(value: &OptionValue) -> Result<Option<usize>> {
+    let bytes = integer_option(READ_WINDOW_BYTES_OPTION, value)?;
+    if bytes == 0 {
+        return Ok(None);
+    }
+    usize::try_from(bytes)
         .ok()
-        .filter(|rows| *rows > 0)
+        .filter(|bytes| *bytes >= MIN_READ_WINDOW_BYTES)
+        .map(Some)
         .ok_or_else(|| {
             error(
-                format!("option '{READ_BATCH_ROWS_OPTION}' must be positive"),
+                format!(
+                    "option '{READ_WINDOW_BYTES_OPTION}' must be 0 or at least {MIN_READ_WINDOW_BYTES}"
+                ),
                 Status::InvalidArguments,
             )
         })
@@ -946,6 +976,7 @@ impl Optionable for MonetdbDatabase {
             }
             if tuning.is_some() {
                 return Ok(match name.as_str() {
+                    READ_WINDOW_BYTES_OPTION => "0",
                     WRITE_WINDOW_BYTES_OPTION => "0",
                     INGEST_INSERT_ROWS_OPTION => "100",
                     PREPARED_CACHE_CAPACITY_OPTION => {
@@ -1194,7 +1225,8 @@ impl Database for MonetdbDatabase {
             ))),
             cancel,
             timeouts,
-            read_batch_rows: DEFAULT_READ_BATCH_ROWS,
+            read_batch_rows: 0,
+            read_window_bytes: None,
             read_prefetch: true,
             write_batch_rows: None,
             write_window_bytes: None,
@@ -1212,6 +1244,7 @@ impl Database for MonetdbDatabase {
             result.set_option(key, value)?;
         }
         for key in [
+            READ_WINDOW_BYTES_OPTION,
             WRITE_WINDOW_BYTES_OPTION,
             INGEST_INSERT_ROWS_OPTION,
             PREPARED_CACHE_CAPACITY_OPTION,
@@ -1297,6 +1330,7 @@ pub struct MonetdbConnection {
     cancel: CancelHandle,
     timeouts: Timeouts,
     read_batch_rows: usize,
+    read_window_bytes: Option<usize>,
     read_prefetch: bool,
     write_batch_rows: Option<usize>,
     write_window_bytes: Option<usize>,
@@ -1465,6 +1499,11 @@ impl Optionable for MonetdbConnection {
             self.options.set(key, value);
             return Ok(());
         }
+        if key.as_ref() == READ_WINDOW_BYTES_OPTION {
+            self.read_window_bytes = read_window_bytes_option(&value)?;
+            self.options.set(key, value);
+            return Ok(());
+        }
         if key.as_ref() == READ_PREFETCH_OPTION {
             self.read_prefetch = option_bool(&value)?;
             self.options.set(key, self.read_prefetch.to_string().into());
@@ -1598,6 +1637,9 @@ impl Optionable for MonetdbConnection {
         if key.as_ref() == READ_BATCH_ROWS_OPTION {
             return Ok(self.read_batch_rows.to_string());
         }
+        if key.as_ref() == READ_WINDOW_BYTES_OPTION {
+            return Ok(self.read_window_bytes.unwrap_or(0).to_string());
+        }
         if key.as_ref() == WRITE_BATCH_ROWS_OPTION {
             return Ok(self.write_batch_rows.unwrap_or(0).to_string());
         }
@@ -1638,6 +1680,14 @@ impl Optionable for MonetdbConnection {
         if key.as_ref() == READ_BATCH_ROWS_OPTION {
             return i64::try_from(self.read_batch_rows)
                 .map_err(|_| error("read_batch_rows exceeds i64", Status::Internal));
+        }
+        if key.as_ref() == READ_WINDOW_BYTES_OPTION {
+            return self
+                .read_window_bytes
+                .map(i64::try_from)
+                .transpose()
+                .map_err(|_| error("read_window_bytes exceeds i64", Status::Internal))
+                .map(|bytes| bytes.unwrap_or(0));
         }
         if key.as_ref() == WRITE_BATCH_ROWS_OPTION {
             return self
@@ -1690,6 +1740,7 @@ impl Connection for MonetdbConnection {
             options,
             query: None,
             read_batch_rows: self.read_batch_rows,
+            read_window_bytes: self.read_window_bytes,
             read_prefetch: self.read_prefetch,
             write_batch_rows: self.write_batch_rows,
             write_window_bytes: self.write_window_bytes,
@@ -1701,6 +1752,7 @@ impl Connection for MonetdbConnection {
             constrained_append: self.constrained_append,
             server_version: self.version,
             ingest_stats: None,
+            read_stats: None,
             bound: None,
             prepared: false,
             prepared_entry: None,
@@ -1861,6 +1913,7 @@ pub struct MonetdbStatement {
     options: Options,
     query: Option<String>,
     read_batch_rows: usize,
+    read_window_bytes: Option<usize>,
     read_prefetch: bool,
     write_batch_rows: Option<usize>,
     write_window_bytes: Option<usize>,
@@ -1872,6 +1925,7 @@ pub struct MonetdbStatement {
     constrained_append: ConstrainedAppend,
     server_version: (u16, u16, u16),
     ingest_stats: Option<String>,
+    read_stats: Option<SharedReadStats>,
     bound: Option<Box<dyn RecordBatchReader + Send>>,
     prepared: bool,
     prepared_entry: Option<PreparedSlot>,
@@ -1891,6 +1945,11 @@ impl Optionable for MonetdbStatement {
         }
         if key.as_ref() == READ_BATCH_ROWS_OPTION {
             self.read_batch_rows = read_batch_rows_option(&value)?;
+            self.options.set(key, value);
+            return Ok(());
+        }
+        if key.as_ref() == READ_WINDOW_BYTES_OPTION {
+            self.read_window_bytes = read_window_bytes_option(&value)?;
             self.options.set(key, value);
             return Ok(());
         }
@@ -1935,9 +1994,9 @@ impl Optionable for MonetdbStatement {
                 .set(key, self.constrained_append.as_str().into());
             return Ok(());
         }
-        if key.as_ref() == INGEST_STATS_OPTION {
+        if matches!(key.as_ref(), INGEST_STATS_OPTION | READ_STATS_OPTION) {
             return Err(error(
-                format!("option '{INGEST_STATS_OPTION}' is read-only"),
+                format!("option '{}' is read-only", key.as_ref()),
                 Status::InvalidArguments,
             ));
         }
@@ -2018,6 +2077,9 @@ impl Optionable for MonetdbStatement {
         if key.as_ref() == READ_BATCH_ROWS_OPTION {
             return Ok(self.read_batch_rows.to_string());
         }
+        if key.as_ref() == READ_WINDOW_BYTES_OPTION {
+            return Ok(self.read_window_bytes.unwrap_or(0).to_string());
+        }
         if key.as_ref() == WRITE_BATCH_ROWS_OPTION {
             return Ok(self.write_batch_rows.unwrap_or(0).to_string());
         }
@@ -2045,6 +2107,19 @@ impl Optionable for MonetdbStatement {
                 .clone()
                 .ok_or_else(|| unknown_option(INGEST_STATS_OPTION));
         }
+        if key.as_ref() == READ_STATS_OPTION {
+            return self
+                .read_stats
+                .as_ref()
+                .and_then(|stats| {
+                    stats
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .as_ref()
+                        .map(ReadStats::to_json)
+                })
+                .ok_or_else(|| unknown_option(READ_STATS_OPTION));
+        }
         if key == OptionStatement::IngestMode {
             return Ok(self
                 .options
@@ -2070,6 +2145,14 @@ impl Optionable for MonetdbStatement {
         if key.as_ref() == READ_BATCH_ROWS_OPTION {
             return i64::try_from(self.read_batch_rows)
                 .map_err(|_| error("read_batch_rows exceeds i64", Status::Internal));
+        }
+        if key.as_ref() == READ_WINDOW_BYTES_OPTION {
+            return self
+                .read_window_bytes
+                .map(i64::try_from)
+                .transpose()
+                .map_err(|_| error("read_window_bytes exceeds i64", Status::Internal))
+                .map(|bytes| bytes.unwrap_or(0));
         }
         if key.as_ref() == WRITE_BATCH_ROWS_OPTION {
             return self
@@ -2123,6 +2206,7 @@ impl Statement for MonetdbStatement {
     }
 
     fn execute_with_rows_affected(&mut self) -> Result<StatementResult> {
+        self.read_stats = None;
         if self.bound.is_some() {
             if self
                 .options
@@ -2179,12 +2263,19 @@ impl Statement for MonetdbStatement {
                 }
                 self.prepared_result_schema = Some(schema);
             }
+            let read_stats = Arc::new(Mutex::new(None));
+            self.read_stats = Some(Arc::clone(&read_stats));
             return Ok(StatementResult {
                 reader: parameter_query_reader(
                     &self.connection,
                     queries,
-                    self.read_batch_rows,
-                    self.read_prefetch,
+                    ReadExecutionOptions {
+                        batch_rows: self.read_batch_rows,
+                        window_bytes: self.read_window_bytes,
+                        prefetch: self.read_prefetch,
+                        measured_round_trip: self.measured_round_trip,
+                        stats: Some(read_stats),
+                    },
                     self.timeouts,
                 )?,
                 rows_affected: None,
@@ -2199,13 +2290,20 @@ impl Statement for MonetdbStatement {
         if invalidates_cache {
             invalidate_prepared_cache(&self.connection, &self.prepared_cache);
         }
+        let read_stats = Arc::new(Mutex::new(None));
         let result = query_result_with_timeouts(
             &self.connection,
             query,
-            self.read_batch_rows,
-            self.read_prefetch,
+            ReadExecutionOptions {
+                batch_rows: self.read_batch_rows,
+                window_bytes: self.read_window_bytes,
+                prefetch: self.read_prefetch,
+                measured_round_trip: self.measured_round_trip,
+                stats: Some(Arc::clone(&read_stats)),
+            },
             self.timeouts,
         );
+        self.read_stats = Some(read_stats);
         if invalidates_cache && result.is_ok() {
             invalidate_prepared_cache(&self.connection, &self.prepared_cache);
         }
@@ -2579,12 +2677,20 @@ impl MonetdbStatement {
         let (reader, insert_candidate) = route_ingest_reader(reader, &schema, insert_rows)?;
 
         let connection = lock_connection(&self.connection)?;
-        if temporary
+        let temporary_state = if temporary
             && matches!(
                 mode,
                 "adbc.ingest.mode.append" | "adbc.ingest.mode.create_append"
-            )
-            && transaction_scoped_temporary_table_exists(&connection, Some(table), self.timeouts)?
+            ) {
+            Some(transaction_scoped_temporary_table_state(
+                &connection,
+                Some(table),
+                self.timeouts,
+            )?)
+        } else {
+            None
+        };
+        if temporary_state.is_some_and(|state| state.target == Some(true))
             && connection
                 .server_info()
                 .map_err(map_cursor_error)?
@@ -2629,8 +2735,13 @@ impl MonetdbStatement {
         } else {
             CallerTransactionScope::Savepoint
         };
-        let (mut cursor, atomic_scope) =
-            begin_atomic(&connection, "ingest", caller_scope, self.timeouts)?;
+        let (mut cursor, atomic_scope) = begin_atomic(
+            &connection,
+            "ingest",
+            caller_scope,
+            temporary_state.map(|state| state.any),
+            self.timeouts,
+        )?;
         if staged_constrained_append {
             invalidate_prepared_cache(&self.connection, &self.prepared_cache);
         }
@@ -3990,14 +4101,19 @@ impl EncodedColumn {
             return Ok(());
         }
         let force_compression = self.wire_compression == WireCompression::Lz4;
-        let format = if self.wire_compression == WireCompression::None {
-            CompressionFormat::Block
-        } else {
+        let probe_format = if self.wire_compression == WireCompression::Lz4 {
             CompressionFormat::Frame
+        } else {
+            CompressionFormat::Block
         };
         let compressed = COMPRESSION_WORKSPACE.with(
             |workspace| -> std::result::Result<
-                Option<(CompressedData, usize, CompressionTransform)>,
+                Option<(
+                    CompressedData,
+                    usize,
+                    CompressionTransform,
+                    CompressionFormat,
+                )>,
                 CursorError,
             > {
                 let mut workspace = workspace.borrow_mut();
@@ -4010,7 +4126,7 @@ impl EncodedColumn {
                                 input,
                                 self.fixed_width,
                                 self.wire_compression != WireCompression::Lz4,
-                                format,
+                                probe_format,
                                 &mut workspace,
                             )?
                             else {
@@ -4024,6 +4140,13 @@ impl EncodedColumn {
                         unreachable!("disabled compression returned above")
                     }
                 };
+                let format = if self.wire_compression != WireCompression::None
+                    && transform == CompressionTransform::Plain
+                {
+                    CompressionFormat::Frame
+                } else {
+                    CompressionFormat::Block
+                };
                 let compressed_len = compress_bytes(input, transform, format, &mut workspace)?;
                 if !force_compression
                     && compressed_len.saturating_mul(8) > input.len().saturating_mul(7)
@@ -4031,10 +4154,10 @@ impl EncodedColumn {
                     return Ok(None);
                 }
                 let data = compressed_arena.store(&workspace.compressed[..compressed_len])?;
-                Ok(Some((data, compressed_len, transform)))
+                Ok(Some((data, compressed_len, transform, format)))
             },
         )?;
-        if let Some((data, compressed_len, transform)) = compressed {
+        if let Some((data, compressed_len, transform, format)) = compressed {
             self.compression = CompressionMode::Enabled(transform);
             self.chunks.push(EncodedChunk::Lz4 {
                 data,
@@ -5188,6 +5311,24 @@ fn automatic_write_window_bytes() -> usize {
     automatic_write_window_bytes_for_memory(system_memory_limit_bytes())
 }
 
+fn automatic_read_window_bytes(measured_round_trip: Duration) -> usize {
+    automatic_read_window_bytes_for_memory(system_memory_limit_bytes(), measured_round_trip)
+}
+
+fn automatic_read_window_bytes_for_memory(
+    memory_limit: Option<usize>,
+    measured_round_trip: Duration,
+) -> usize {
+    let target = if measured_round_trip >= REMOTE_WRITE_WINDOW_RTT {
+        REMOTE_READ_WINDOW_BYTES
+    } else {
+        DEFAULT_READ_WINDOW_BYTES
+    };
+    memory_limit.map_or(target, |limit| {
+        target.min((limit / 8).max(MIN_READ_WINDOW_BYTES))
+    })
+}
+
 fn automatic_write_window_bytes_for_memory(memory_limit: Option<usize>) -> usize {
     let target = DEFAULT_WRITE_WINDOW_BYTES;
     let divisor = 8;
@@ -6171,22 +6312,39 @@ fn prepared_parameter_arrow_field(name: String, data_type: &MonetType) -> Result
     prepared_arrow_field(name, data_type)
 }
 
+#[derive(Clone)]
+struct ReadExecutionOptions {
+    batch_rows: usize,
+    window_bytes: Option<usize>,
+    prefetch: bool,
+    measured_round_trip: Duration,
+    stats: Option<SharedReadStats>,
+}
+
+fn metadata_read_options() -> ReadExecutionOptions {
+    ReadExecutionOptions {
+        batch_rows: METADATA_READ_BATCH_ROWS,
+        window_bytes: None,
+        prefetch: false,
+        measured_round_trip: Duration::ZERO,
+        stats: None,
+    }
+}
+
 fn query_reader_with_timeouts(
     connection: &SharedConnection,
     query: &str,
-    batch_rows: usize,
-    read_prefetch: bool,
+    read_options: ReadExecutionOptions,
     timeouts: Timeouts,
 ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
-    query_result_with_timeouts(connection, query, batch_rows, read_prefetch, timeouts)
+    query_result_with_timeouts(connection, query, read_options, timeouts)
         .map(|result| result.reader)
 }
 
 fn query_result_with_timeouts(
     connection: &SharedConnection,
     query: &str,
-    batch_rows: usize,
-    read_prefetch: bool,
+    read_options: ReadExecutionOptions,
     timeouts: Timeouts,
 ) -> Result<StatementResult> {
     if is_prepare_statement(query) {
@@ -6223,6 +6381,18 @@ fn query_result_with_timeouts(
         ));
     }
     if !result.is_server_resident() {
+        if let Some(stats) = &read_options.stats {
+            let scheduler = ReadWindowScheduler::new(
+                &result.columns,
+                read_options.batch_rows,
+                read_options.window_bytes,
+                read_options.measured_round_trip,
+            );
+            *stats
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(ReadStats::new(&scheduler, false));
+        }
         let rows = usize::try_from(total_rows).map_err(|_| {
             error(
                 "inline result row count exceeds this platform",
@@ -6237,21 +6407,46 @@ fn query_result_with_timeouts(
         }
         let batch = monetdb_arrow::decode_inline_rows(&mut cursor, &result.columns, rows)
             .map_err(|value| map_display(value, Status::InvalidData))?;
+        let batch_rows = if read_options.batch_rows == 0 {
+            batch.num_rows()
+        } else {
+            read_options.batch_rows
+        };
         return Ok(StatementResult {
             reader: Box::new(SlicedBatchReader::new(batch, batch_rows)),
             rows_affected,
         });
     }
     let schema = schema_for_columns(&result.columns)?;
+    let adopt_frame = monetdb_arrow::prefers_owned_frame(&result.columns);
+    let mut scheduler = ReadWindowScheduler::new(
+        &result.columns,
+        read_options.batch_rows,
+        read_options.window_bytes,
+        read_options.measured_round_trip,
+    );
     if total_rows == 0 {
+        if let Some(stats) = &read_options.stats {
+            *stats
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(ReadStats::new(&scheduler, false));
+        }
         return Ok(StatementResult {
             reader: Box::new(EmptyReader::new(schema)),
             rows_affected,
         });
     }
-    let adopt_frame = monetdb_arrow::prefers_owned_frame(&result.columns);
+    let first_window_rows = scheduler.next_rows(total_rows);
+    let prefetch_engaged = read_options.prefetch && total_rows > first_window_rows as u64;
+    if let Some(stats) = &read_options.stats {
+        *stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(ReadStats::new(&scheduler, prefetch_engaged));
+    }
     drop(connection_guard);
-    if read_prefetch && total_rows > batch_rows as u64 {
+    if prefetch_engaged {
         return Ok(StatementResult {
             reader: Box::new(PrefetchedBinaryReader::new(
                 cursor,
@@ -6260,8 +6455,9 @@ fn query_result_with_timeouts(
                     columns: result.columns,
                     schema,
                     total_rows,
-                    batch_rows,
+                    scheduler,
                     adopt_frame,
+                    stats: read_options.stats,
                 },
             )?),
             rows_affected,
@@ -6275,9 +6471,10 @@ fn query_result_with_timeouts(
             schema,
             next_row: 0,
             total_rows,
-            batch_rows,
+            scheduler,
             response: Vec::new(),
             adopt_frame,
+            stats: read_options.stats,
             finished: false,
         }),
         rows_affected,
@@ -6426,8 +6623,7 @@ fn validate_unbound_query(query: &str) -> Result<()> {
 fn parameter_query_reader(
     connection: &SharedConnection,
     mut queries: BoundQueryStream,
-    batch_rows: usize,
-    read_prefetch: bool,
+    read_options: ReadExecutionOptions,
     timeouts: Timeouts,
 ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
     let first = queries
@@ -6435,15 +6631,14 @@ fn parameter_query_reader(
         .transpose()?
         .ok_or_else(|| error("no parameter rows to execute", Status::InvalidArguments))?;
     let current =
-        bound_query_reader_with_retry(connection, &first, batch_rows, read_prefetch, timeouts)?;
+        bound_query_reader_with_retry(connection, &first, read_options.clone(), timeouts)?;
     let schema = current.schema();
     Ok(Box::new(ParameterQueryReader {
         connection: Arc::clone(connection),
         queries,
         current: Some(current),
         schema,
-        batch_rows,
-        read_prefetch,
+        read_options,
         timeouts,
         finished: false,
     }))
@@ -6452,12 +6647,11 @@ fn parameter_query_reader(
 fn bound_query_reader_with_retry(
     connection: &SharedConnection,
     query: &BoundQuery,
-    batch_rows: usize,
-    read_prefetch: bool,
+    read_options: ReadExecutionOptions,
     timeouts: Timeouts,
 ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
     let query = current_bound_query(connection, query, timeouts)?;
-    match query_reader_with_timeouts(connection, &query.sql, batch_rows, read_prefetch, timeouts) {
+    match query_reader_with_timeouts(connection, &query.sql, read_options.clone(), timeouts) {
         Err(value) if query.prepared.is_some() && prepared_statement_missing(&value) => {
             if !lock_connection(connection)?
                 .server_info()
@@ -6467,14 +6661,25 @@ fn bound_query_reader_with_retry(
                 return Err(value);
             }
             let retry = retry_bound_query(connection, &query, timeouts)?;
-            query_reader_with_timeouts(connection, &retry.sql, batch_rows, read_prefetch, timeouts)
+            query_reader_with_timeouts(connection, &retry.sql, read_options, timeouts)
         }
         result => result,
     }
 }
 
 fn scalar_string(connection: &SharedConnection, query: &str, timeouts: Timeouts) -> Result<String> {
-    let mut reader = query_reader_with_timeouts(connection, query, 1, false, timeouts)?;
+    let mut reader = query_reader_with_timeouts(
+        connection,
+        query,
+        ReadExecutionOptions {
+            batch_rows: 1,
+            window_bytes: None,
+            prefetch: false,
+            measured_round_trip: Duration::ZERO,
+            stats: None,
+        },
+        timeouts,
+    )?;
     let batch = reader
         .next()
         .transpose()
@@ -6587,6 +6792,7 @@ fn begin_atomic(
     connection: &monetdb::Connection,
     purpose: &str,
     caller_scope: CallerTransactionScope,
+    transaction_scoped_temporary_exists: Option<bool>,
     timeouts: Timeouts,
 ) -> Result<(monetdb::Cursor, AtomicScope)> {
     let originally_autocommit = connection
@@ -6606,8 +6812,10 @@ fn begin_atomic(
     if matches!(caller_scope, CallerTransactionScope::Direct) {
         return Ok((cursor, AtomicScope::CallerTransaction));
     }
-    let retain_until_transaction_end =
-        transaction_scoped_temporary_table_exists(connection, None, timeouts)?;
+    let retain_until_transaction_end = match transaction_scoped_temporary_exists {
+        Some(exists) => exists,
+        None => transaction_scoped_temporary_table_state(connection, None, timeouts)?.any,
+    };
     let savepoint = savepoint_name(purpose);
     cursor
         .execute(&format!("SAVEPOINT {savepoint}"))
@@ -6725,14 +6933,22 @@ fn table_constraint_state(
 /// 1 = ON COMMIT DELETE ROWS, 2 = ON COMMIT PRESERVE ROWS, 3 = ON COMMIT DROP.
 /// Both 1 and 3 are transaction-scoped: ending the transaction, including
 /// releasing a savepoint taken inside it, empties or destroys the table.
-fn transaction_scoped_temporary_table_exists(
+#[derive(Clone, Copy)]
+struct TransactionScopedTemporaryTableState {
+    any: bool,
+    target: Option<bool>,
+}
+
+fn transaction_scoped_temporary_table_state(
     connection: &monetdb::Connection,
     table_name: Option<&str>,
     timeouts: Timeouts,
-) -> Result<bool> {
-    let table_filter = table_name
+) -> Result<TransactionScopedTemporaryTableState> {
+    let target_count = table_name
         .map(|table| {
-            metadata::raw_string_literal(table).map(|table| format!(" AND t.name = {table}"))
+            metadata::raw_string_literal(table).map(|table| {
+                format!(", CAST(COUNT(CASE WHEN t.name = {table} THEN 1 END) AS VARCHAR(32))")
+            })
         })
         .transpose()?
         .unwrap_or_default();
@@ -6740,13 +6956,36 @@ fn transaction_scoped_temporary_table_exists(
     cursor.set_timeouts(timeouts);
     cursor
         .execute(&format!(
-            "SELECT CAST(COUNT(*) AS VARCHAR(32)) \
+            "SELECT CAST(COUNT(*) AS VARCHAR(32)){target_count} \
              FROM sys.tables AS t \
              JOIN sys.schemas AS s ON s.id = t.schema_id \
-             WHERE s.name = 'tmp' AND t.commit_action IN (1, 3){table_filter}"
+             WHERE s.name = 'tmp' AND t.commit_action IN (1, 3)"
         ))
         .map_err(map_cursor_error)?;
-    count_query_result(&mut cursor, "temporary table")
+    if !cursor.next_row().map_err(map_cursor_error)? {
+        return Err(error(
+            "temporary table metadata query returned no row",
+            Status::InvalidData,
+        ));
+    }
+    let parse_count = |index| -> Result<bool> {
+        cursor
+            .get_str(index)
+            .map_err(map_cursor_error)?
+            .ok_or_else(|| error("temporary table count is NULL", Status::InvalidData))?
+            .parse::<u64>()
+            .map(|count| count != 0)
+            .map_err(|value| {
+                error(
+                    format!("invalid temporary table count: {value}"),
+                    Status::InvalidData,
+                )
+            })
+    };
+    Ok(TransactionScopedTemporaryTableState {
+        any: parse_count(0)?,
+        target: table_name.map(|_| parse_count(1)).transpose()?,
+    })
 }
 
 fn count_query_result(cursor: &mut monetdb::Cursor, object: &str) -> Result<bool> {
@@ -6909,6 +7148,7 @@ fn execute_updates_atomic_from_first(
         &connection_guard,
         "parameter_batch",
         CallerTransactionScope::Savepoint,
+        None,
         timeouts,
     )?;
     if let Err(root) = cursor.execute(&first.sql).map_err(map_cursor_error) {
@@ -7025,6 +7265,163 @@ fn schema_for_columns(columns: &[ResultColumn]) -> Result<SchemaRef> {
     Ok(Arc::new(Schema::new(fields)))
 }
 
+type SharedReadStats = Arc<Mutex<Option<ReadStats>>>;
+
+#[derive(Debug)]
+struct ReadStats {
+    window_budget_bytes: usize,
+    exact_batch_rows: usize,
+    initial_estimated_bytes_per_row: usize,
+    observed_bytes_per_row: Vec<usize>,
+    window_rows: Vec<usize>,
+    window_bytes: Vec<usize>,
+    window_capacity_bytes: Vec<usize>,
+    window_adopted: Vec<bool>,
+    prefetch_engaged: bool,
+    recycled_buffers: usize,
+}
+
+impl ReadStats {
+    fn new(scheduler: &ReadWindowScheduler, prefetch_engaged: bool) -> Self {
+        Self {
+            window_budget_bytes: scheduler.window_budget_bytes,
+            exact_batch_rows: scheduler.exact_batch_rows.unwrap_or(0),
+            initial_estimated_bytes_per_row: scheduler.estimated_bytes_per_row,
+            observed_bytes_per_row: Vec::new(),
+            window_rows: Vec::new(),
+            window_bytes: Vec::new(),
+            window_capacity_bytes: Vec::new(),
+            window_adopted: Vec::new(),
+            prefetch_engaged,
+            recycled_buffers: 0,
+        }
+    }
+
+    fn record_window(&mut self, rows: usize, bytes: usize, capacity: usize, adopted: bool) {
+        self.window_rows.push(rows);
+        self.window_bytes.push(bytes);
+        self.window_capacity_bytes.push(capacity);
+        self.window_adopted.push(adopted);
+        if let Some(observed) = bytes
+            .saturating_add(rows.saturating_sub(1))
+            .checked_div(rows)
+        {
+            self.observed_bytes_per_row.push(observed);
+        }
+    }
+
+    fn to_json(&self) -> String {
+        fn usize_array(values: &[usize]) -> String {
+            values
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+        fn bool_array(values: &[bool]) -> String {
+            values
+                .iter()
+                .map(bool::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+        format!(
+            concat!(
+                "{{\"windows_fetched\":{},\"window_budget_bytes\":{},",
+                "\"exact_batch_rows\":{},\"initial_estimated_bytes_per_row\":{},",
+                "\"observed_bytes_per_row\":[{}],\"window_rows\":[{}],",
+                "\"window_bytes\":[{}],\"window_capacity_bytes\":[{}],",
+                "\"window_adopted\":[{}],\"prefetch_engaged\":{},",
+                "\"recycled_buffers\":{}}}"
+            ),
+            self.window_rows.len(),
+            self.window_budget_bytes,
+            self.exact_batch_rows,
+            self.initial_estimated_bytes_per_row,
+            usize_array(&self.observed_bytes_per_row),
+            usize_array(&self.window_rows),
+            usize_array(&self.window_bytes),
+            usize_array(&self.window_capacity_bytes),
+            bool_array(&self.window_adopted),
+            self.prefetch_engaged,
+            self.recycled_buffers,
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ReadWindowScheduler {
+    exact_batch_rows: Option<usize>,
+    window_budget_bytes: usize,
+    estimated_bytes_per_row: usize,
+    initial_rows_limit: Option<usize>,
+    previous_rows: Option<usize>,
+}
+
+impl ReadWindowScheduler {
+    fn new(
+        columns: &[ResultColumn],
+        batch_rows: usize,
+        configured_window_bytes: Option<usize>,
+        measured_round_trip: Duration,
+    ) -> Self {
+        Self {
+            exact_batch_rows: (batch_rows > 0).then_some(batch_rows),
+            window_budget_bytes: configured_window_bytes
+                .unwrap_or_else(|| automatic_read_window_bytes(measured_round_trip)),
+            estimated_bytes_per_row: monetdb_arrow::estimated_frame_bytes_per_row(
+                columns,
+                VARIABLE_READ_COLUMN_BYTES,
+            )
+            .max(1),
+            initial_rows_limit: monetdb_arrow::owned_frame_capacity(columns, 1)
+                .is_none()
+                .then_some(INITIAL_VARIABLE_READ_ROWS),
+            previous_rows: None,
+        }
+    }
+
+    fn next_rows(&mut self, remaining: u64) -> usize {
+        let remaining = usize::try_from(remaining).unwrap_or(usize::MAX);
+        let rows = if let Some(exact) = self.exact_batch_rows {
+            exact.min(remaining)
+        } else {
+            let target = (self.window_budget_bytes / self.estimated_bytes_per_row).max(1);
+            self.previous_rows
+                .map_or_else(
+                    || target.min(self.initial_rows_limit.unwrap_or(usize::MAX)),
+                    |previous| target.min(previous.saturating_mul(MAX_READ_WINDOW_GROWTH)),
+                )
+                .min(remaining)
+        };
+        self.previous_rows = Some(rows);
+        rows
+    }
+
+    fn observe(&mut self, bytes: usize, rows: usize) {
+        if self.exact_batch_rows.is_none() && rows > 0 {
+            self.estimated_bytes_per_row = bytes.saturating_add(rows - 1) / rows;
+            self.estimated_bytes_per_row = self.estimated_bytes_per_row.max(1);
+        }
+    }
+
+    fn response_capacity(&self, requested_rows: usize, adopt_frame: bool) -> usize {
+        if adopt_frame {
+            return 0;
+        }
+        self.estimated_bytes_per_row
+            .saturating_mul(requested_rows)
+            .saturating_add(4096)
+    }
+}
+
+fn shrink_owned_response(response: &mut Vec<u8>) {
+    let retained_limit = response.len().saturating_add(response.len() / 8);
+    if response.capacity() > retained_limit {
+        response.shrink_to_fit();
+    }
+}
+
 struct BinaryFrame {
     start_row: u64,
     requested_rows: usize,
@@ -7038,8 +7435,9 @@ struct PrefetchPlan {
     columns: Vec<ResultColumn>,
     schema: SchemaRef,
     total_rows: u64,
-    batch_rows: usize,
+    scheduler: ReadWindowScheduler,
     adopt_frame: bool,
+    stats: Option<SharedReadStats>,
 }
 
 struct PrefetchedBinaryReader {
@@ -7049,6 +7447,7 @@ struct PrefetchedBinaryReader {
     total_rows: u64,
     decoded_rows: u64,
     adopt_frame: bool,
+    recycle_sender: std::sync::mpsc::SyncSender<Vec<u8>>,
     receiver: Option<std::sync::mpsc::Receiver<BinaryFrameResult>>,
     completion: std::sync::mpsc::Receiver<()>,
     worker: Option<std::thread::JoinHandle<()>>,
@@ -7062,22 +7461,26 @@ impl PrefetchedBinaryReader {
         let worker_columns = plan.columns.clone();
         let result_id = plan.result_id;
         let total_rows = plan.total_rows;
-        let batch_rows = plan.batch_rows;
+        let scheduler = plan.scheduler;
         let adopt_frame = plan.adopt_frame;
+        let worker_stats = plan.stats;
+        let (recycle_sender, recycle_receiver) = std::sync::mpsc::sync_channel(2);
         let worker = std::thread::Builder::new()
             .name("adbc-monetdb-prefetch".into())
             .spawn(move || {
                 let panic_sender = sender.clone();
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    fetch_binary_frames(
+                    fetch_binary_frames(BinaryFetchTask {
                         cursor,
                         result_id,
-                        &worker_columns,
+                        columns: worker_columns,
                         total_rows,
-                        batch_rows,
+                        scheduler,
                         adopt_frame,
+                        recycle_receiver,
+                        stats: worker_stats,
                         sender,
-                    );
+                    });
                 }));
                 if result.is_err() {
                     let _ = panic_sender.send(Err(ArrowError::ParseError(
@@ -7094,6 +7497,7 @@ impl PrefetchedBinaryReader {
             total_rows,
             decoded_rows: 0,
             adopt_frame,
+            recycle_sender,
             receiver: Some(receiver),
             completion,
             worker: Some(worker),
@@ -7130,24 +7534,33 @@ impl PrefetchedBinaryReader {
                 )));
             }
         };
+        let BinaryFrame {
+            start_row,
+            requested_rows,
+            mut response,
+        } = frame;
         let result = if self.adopt_frame {
+            shrink_owned_response(&mut response);
             monetdb_arrow::decode_frame_owned_with_schema(
-                frame.response,
+                response,
                 &self.columns,
                 self.result_id,
-                frame.start_row,
-                frame.requested_rows,
+                start_row,
+                requested_rows,
                 Arc::clone(&self.schema),
             )
         } else {
-            monetdb_arrow::decode_frame_with_schema(
-                &frame.response,
+            let result = monetdb_arrow::decode_frame_with_schema(
+                &response,
                 &self.columns,
                 self.result_id,
-                frame.start_row,
-                frame.requested_rows,
+                start_row,
+                requested_rows,
                 Arc::clone(&self.schema),
-            )
+            );
+            response.clear();
+            let _ = self.recycle_sender.try_send(response);
+            result
         }
         .map_err(|value| ArrowError::ExternalError(Box::new(value)));
         match &result {
@@ -7202,25 +7615,66 @@ impl Drop for PrefetchedBinaryReader {
     }
 }
 
-fn fetch_binary_frames(
-    mut cursor: monetdb::Cursor,
+struct BinaryFetchTask {
+    cursor: monetdb::Cursor,
     result_id: u64,
-    columns: &[ResultColumn],
+    columns: Vec<ResultColumn>,
     total_rows: u64,
-    batch_rows: usize,
+    scheduler: ReadWindowScheduler,
     adopt_frame: bool,
+    recycle_receiver: std::sync::mpsc::Receiver<Vec<u8>>,
+    stats: Option<SharedReadStats>,
     sender: std::sync::mpsc::SyncSender<BinaryFrameResult>,
-) {
+}
+
+fn fetch_binary_frames(task: BinaryFetchTask) {
+    let BinaryFetchTask {
+        mut cursor,
+        result_id,
+        columns,
+        total_rows,
+        mut scheduler,
+        adopt_frame,
+        recycle_receiver,
+        stats,
+        sender,
+    } = task;
     let mut next_row = 0u64;
     while next_row < total_rows {
         let remaining = total_rows - next_row;
-        let requested_rows = batch_rows.min(usize::try_from(remaining).unwrap_or(usize::MAX));
+        let requested_rows = scheduler.next_rows(remaining);
         let capacity = if adopt_frame {
-            monetdb_arrow::owned_frame_capacity(columns, requested_rows).unwrap_or(0)
+            monetdb_arrow::owned_frame_capacity(&columns, requested_rows).unwrap_or(0)
         } else {
-            0
+            scheduler.response_capacity(requested_rows, false)
         };
-        let mut response = Vec::with_capacity(capacity);
+        let (mut response, recycled) = if adopt_frame {
+            (Vec::new(), false)
+        } else {
+            match recycle_receiver.try_recv() {
+                Ok(response)
+                    if scheduler.exact_batch_rows.is_some()
+                        || response.capacity()
+                            <= scheduler.window_budget_bytes.saturating_mul(2) =>
+                {
+                    (response, true)
+                }
+                _ => (Vec::new(), false),
+            }
+        };
+        if recycled
+            && let Some(stats) = &stats
+            && let Some(stats) = stats
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_mut()
+        {
+            stats.recycled_buffers += 1;
+        }
+        response.clear();
+        if response.capacity() < capacity {
+            response.reserve_exact(capacity);
+        }
         if let Err(value) = cursor.fetch_binary_into(next_row, requested_rows, &mut response) {
             let _ = sender.send(Err(ArrowError::ExternalError(Box::new(value))));
             return;
@@ -7268,6 +7722,20 @@ fn fetch_binary_frames(
                 return;
             }
         };
+        scheduler.observe(response.len(), actual_rows);
+        if let Some(stats) = &stats
+            && let Some(stats) = stats
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_mut()
+        {
+            stats.record_window(
+                actual_rows,
+                response.len(),
+                response.capacity(),
+                adopt_frame,
+            );
+        }
         if sender
             .send(Ok(BinaryFrame {
                 start_row: next_row,
@@ -7292,9 +7760,10 @@ struct BinaryReader {
     schema: SchemaRef,
     next_row: u64,
     total_rows: u64,
-    batch_rows: usize,
+    scheduler: ReadWindowScheduler,
     response: Vec<u8>,
     adopt_frame: bool,
+    stats: Option<SharedReadStats>,
     finished: bool,
 }
 
@@ -7321,9 +7790,7 @@ impl BinaryReader {
             return None;
         }
         let remaining = self.total_rows - self.next_row;
-        let count = self
-            .batch_rows
-            .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+        let count = self.scheduler.next_rows(remaining);
         let result = if self.adopt_frame {
             let capacity = monetdb_arrow::owned_frame_capacity(&self.columns, count).unwrap_or(0);
             let mut response = Vec::with_capacity(capacity);
@@ -7331,6 +7798,16 @@ impl BinaryReader {
                 .fetch_binary_into(self.next_row, count, &mut response)
                 .map_err(|value| ArrowError::ExternalError(Box::new(value)))
                 .and_then(|()| {
+                    self.scheduler.observe(response.len(), count);
+                    shrink_owned_response(&mut response);
+                    if let Some(stats) = &self.stats
+                        && let Some(stats) = stats
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .as_mut()
+                    {
+                        stats.record_window(count, response.len(), response.capacity(), true);
+                    }
                     monetdb_arrow::decode_frame_owned_with_schema(
                         response,
                         &self.columns,
@@ -7342,10 +7819,28 @@ impl BinaryReader {
                     .map_err(|value| ArrowError::ExternalError(Box::new(value)))
                 })
         } else {
+            let capacity = self.scheduler.response_capacity(count, false);
+            if self.response.capacity() < capacity {
+                self.response.reserve_exact(capacity);
+            }
             self.cursor
                 .fetch_binary_into(self.next_row, count, &mut self.response)
                 .map_err(|value| ArrowError::ExternalError(Box::new(value)))
                 .and_then(|()| {
+                    self.scheduler.observe(self.response.len(), count);
+                    if let Some(stats) = &self.stats
+                        && let Some(stats) = stats
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .as_mut()
+                    {
+                        stats.record_window(
+                            count,
+                            self.response.len(),
+                            self.response.capacity(),
+                            false,
+                        );
+                    }
                     monetdb_arrow::decode_frame_with_schema(
                         &self.response,
                         &self.columns,
@@ -7384,8 +7879,7 @@ struct ParameterQueryReader {
     queries: BoundQueryStream,
     current: Option<Box<dyn RecordBatchReader + Send + 'static>>,
     schema: SchemaRef,
-    batch_rows: usize,
-    read_prefetch: bool,
+    read_options: ReadExecutionOptions,
     timeouts: Timeouts,
     finished: bool,
 }
@@ -7425,8 +7919,7 @@ impl ParameterQueryReader {
             match bound_query_reader_with_retry(
                 &self.connection,
                 &query,
-                self.batch_rows,
-                self.read_prefetch,
+                self.read_options.clone(),
                 self.timeouts,
             ) {
                 Ok(reader) if reader.schema() == self.schema => self.current = Some(reader),
@@ -7904,16 +8397,24 @@ mod tests {
     fn validates_ingest_scheduling_and_failure_options() {
         assert_eq!(
             read_batch_rows_option(&OptionValue::String("131072".into())).unwrap(),
-            DEFAULT_READ_BATCH_ROWS
+            131_072
         );
+        assert_eq!(read_batch_rows_option(&OptionValue::Int(0)).unwrap(), 0);
         assert_eq!(write_batch_rows_option(&OptionValue::Int(0)).unwrap(), None);
         assert_eq!(
             write_batch_rows_option(&OptionValue::Int(100_000)).unwrap(),
             Some(100_000)
         );
-        for value in [OptionValue::Int(0), OptionValue::Int(-1)] {
-            assert!(read_batch_rows_option(&value).is_err());
-        }
+        assert!(read_batch_rows_option(&OptionValue::Int(-1)).is_err());
+        assert_eq!(
+            read_window_bytes_option(&OptionValue::Int(0)).unwrap(),
+            None
+        );
+        assert_eq!(
+            read_window_bytes_option(&OptionValue::Int(DEFAULT_READ_WINDOW_BYTES as i64)).unwrap(),
+            Some(DEFAULT_READ_WINDOW_BYTES)
+        );
+        assert!(read_window_bytes_option(&OptionValue::Int(1)).is_err());
         assert!(write_batch_rows_option(&OptionValue::Int(-1)).is_err());
         assert!(write_batch_rows_option(&OptionValue::Double(1.0)).is_err());
         assert_eq!(
@@ -8027,6 +8528,59 @@ mod tests {
             ),
             MIN_WRITE_WINDOW_BYTES
         );
+    }
+
+    #[test]
+    fn automatic_read_windows_follow_memory_and_network_budgets() {
+        assert_eq!(
+            automatic_read_window_bytes_for_memory(None, Duration::ZERO),
+            DEFAULT_READ_WINDOW_BYTES
+        );
+        assert_eq!(
+            automatic_read_window_bytes_for_memory(None, REMOTE_WRITE_WINDOW_RTT),
+            REMOTE_READ_WINDOW_BYTES
+        );
+        assert_eq!(
+            automatic_read_window_bytes_for_memory(Some(64 * 1024 * 1024), Duration::ZERO),
+            8 * 1024 * 1024
+        );
+        assert_eq!(
+            automatic_read_window_bytes_for_memory(Some(1024), Duration::ZERO),
+            MIN_READ_WINDOW_BYTES
+        );
+    }
+
+    #[test]
+    fn read_window_scheduler_adapts_without_unbounded_growth() {
+        let mut scheduler = ReadWindowScheduler {
+            exact_batch_rows: None,
+            window_budget_bytes: 100,
+            estimated_bytes_per_row: 1000,
+            initial_rows_limit: Some(INITIAL_VARIABLE_READ_ROWS),
+            previous_rows: None,
+        };
+        assert_eq!(scheduler.next_rows(1000), 1);
+        scheduler.observe(1, 1);
+        assert_eq!(scheduler.next_rows(1000), MAX_READ_WINDOW_GROWTH);
+        scheduler.observe(4, 4);
+        assert_eq!(scheduler.next_rows(1000), MAX_READ_WINDOW_GROWTH.pow(2));
+
+        scheduler.observe(1_600, 16);
+        assert_eq!(scheduler.next_rows(3), 1);
+    }
+
+    #[test]
+    fn exact_read_batch_rows_override_the_byte_scheduler() {
+        let mut scheduler = ReadWindowScheduler {
+            exact_batch_rows: Some(17),
+            window_budget_bytes: 1,
+            estimated_bytes_per_row: usize::MAX,
+            initial_rows_limit: None,
+            previous_rows: None,
+        };
+        assert_eq!(scheduler.next_rows(100), 17);
+        scheduler.observe(usize::MAX, 17);
+        assert_eq!(scheduler.next_rows(9), 9);
     }
 
     #[test]
@@ -8528,6 +9082,13 @@ mod tests {
         assert!(matches!(
             window.columns[0].compression,
             CompressionMode::Enabled(CompressionTransform::Shuffle(_))
+        ));
+        assert!(matches!(
+            window.columns[0].chunks.first(),
+            Some(EncodedChunk::Lz4 {
+                format: CompressionFormat::Block,
+                ..
+            })
         ));
         assert!(!window.uses_wire_lz4());
     }

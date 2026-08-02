@@ -92,7 +92,7 @@ def test_polars_uri_resolution_and_streaming_batches(monetdb_uri: str) -> None:
                 iter_batches=True,
             )
         )
-    assert [batch.height for batch in batches] == [131_072, 131_072, 37_856]
+    assert [batch.height for batch in batches] == [300_000]
 
     with dbapi.connect(monetdb_uri, db_kwargs={"uri": "not-the-positional-uri"}) as conn:
         assert conn.execute("SELECT 1").fetchone() == (1,)
@@ -1572,7 +1572,10 @@ def test_polars_future_unknown_extension_behavior(monetdb_uri: str) -> None:
 
 @pytest.mark.integration
 def test_variable_width_types_cross_batch_boundary(monetdb_uri: str) -> None:
-    with dbapi.connect(monetdb_uri) as conn:
+    with dbapi.connect(
+        monetdb_uri,
+        conn_kwargs={str(ConnectionOptions.READ_BATCH_ROWS): "131072"},
+    ) as conn:
         batches = list(
             pl.read_database(
                 "SELECT CAST(value AS STRING) AS text, "

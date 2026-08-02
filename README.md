@@ -222,18 +222,24 @@ cursor; it has no `engine="adbc"` parameter. Polars calls `connection.cursor()` 
 `adbc_stmt_kwargs`, so use a preconfigured cursor for statement-specific settings. Its
 `execute_options` are forwarded to `Cursor.execute`: use a sequence for positional `?` values
 and a dictionary for named `:name` values.
-`adbc_stmt_kwargs` is not an execute option. Polars' `batch_size` does not configure
-`adbc.monetdb.read_batch_rows`, and `DataFrame.write_database(..., engine_options=...)` supplies
-ingestion arguments rather than connection or timeout options. The read batch default is 131,072
-rows, matching PyArrow Dataset Scanner's default. Read prefetch is enabled by default and can hold
-up to about three windows at once: one decoding, one buffered, and one in flight. Abandoning a
-stream can therefore waste up to two fetched windows; increasing `read_batch_rows` also increases
-this memory bound. Closing a reader waits briefly for its worker and then detaches a fetch that is
+`adbc_stmt_kwargs` is not an execute option. Polars' `batch_size` does not configure the driver,
+and `DataFrame.write_database(..., engine_options=...)` supplies ingestion arguments rather than
+connection or timeout options. Result windows target 64 MiB on local connections and 128 MiB when
+the measured round trip is at least 5 ms, capped by available host or cgroup memory. The estimate
+adapts to observed variable-width data. Set `adbc.monetdb.read_window_bytes` to choose another byte
+target, or use `adbc.monetdb.read_batch_rows` as a diagnostic exact-row override that disables byte
+adaptation. Both are available on connections and statements; `read_window_bytes` is also accepted
+in a URI.
+
+Read prefetch is enabled by default and can hold up to about three byte-bounded windows at once:
+one decoding, one buffered, and one in flight. Abandoning a stream can therefore waste up to two
+fetched windows. Closing a reader waits briefly for its worker and then detaches a fetch that is
 still in flight; it does not implicitly cancel and permanently close the session. The next
 statement on that connection may wait for the detached fetch or its configured read/operation
 timeout. Use `adbc_cancel()` when session destruction is intended, or set
 `adbc.monetdb.read_prefetch` to `"false"` when prompt pool reuse matters more than fetch/decode
-overlap.
+overlap. After a read, the read-only statement option `adbc.monetdb.read_stats` reports the chosen
+budget, row and byte counts per window, observed row widths, prefetch use, and buffer reuse as JSON.
 
 Appending to an existing table matches stream columns to destination columns by name,
 case-insensitively, on every route and at every stream size. Exact spelling wins when a quoted
@@ -317,6 +323,11 @@ available. Unconstrained targets and the small prepared-INSERT route remain dire
 measurements show that repeated target COPYs are preferable; `auto` is the general-purpose
 default. The option is accepted at database, connection, and statement scope and as
 `constrained_append` in a URI.
+
+Staging temporarily materializes the incoming rows separately from the target, so its server
+memory and disk peak can grow with the append. The `direct` setting avoids that duplicate state but
+may spend substantially longer maintaining target constraints for every COPY window. Choose it
+only from measurements on the intended server and workload.
 
 `adbc.monetdb.write_window_bytes` changes the logical, physical, and incompressible-data budgets
 together; zero selects the automatic defaults. `adbc.monetdb.write_batch_rows` remains a
@@ -412,6 +423,10 @@ earlier caller work. Server errors retain their DB-API exception and SQLSTATE. A
 ingestion wraps the complete stream in an internal transaction, rolls it back on error, and
 restores the connection.
 
+Create and replace ingests inside a caller-managed transaction retain an operation savepoint so a
+failure can preserve earlier caller work. MonetDB may retain more server storage for that safety;
+use autocommit for an independent bulk load when it does not need to share the caller's transaction.
+
 Two advanced statement or connection options change that contract. Setting
 `adbc.monetdb.ingest_atomicity` to `"savepoint"` preserves earlier caller work and rolls back only
 the failed ingest, but MonetDB Dec2025 may write an extra full copy of a sub-million-row append to
@@ -443,7 +458,8 @@ measurement; statement scope is preferable when one operation is exceptional.
 
 | Option | Default | Scope | Tune when |
 |---|---:|---|---|
-| `read_batch_rows` | 131,072 | connection, statement | Lower to cap result-buffer memory; raise only when larger Arrow batches measurably improve scans |
+| `read_window_bytes` | `0` (64 MiB local, 128 MiB at ≥5 ms) | database, connection, statement, URI | Set another result byte target for a measured memory/network constraint |
+| `read_batch_rows` | `0` (disabled) | connection, statement | Diagnostic exact-row override; it disables byte adaptation |
 | `read_prefetch` | `true` | connection, statement | Disable when promptly returning a connection to a pool matters more than fetch/decode overlap |
 | `write_window_bytes` | `0` (adaptive) | database, connection, statement, URI | Set a byte budget only for measured memory/network constraints; it changes all write budgets together |
 | `write_batch_rows` | `0` (disabled) | connection, statement | Diagnostic exact-row override; it disables byte adaptation and is not a normal production setting |

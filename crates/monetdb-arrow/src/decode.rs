@@ -215,6 +215,23 @@ pub fn owned_frame_capacity(columns: &[ResultColumn], rows: usize) -> Option<usi
         .checked_add(8)
 }
 
+/// Estimate one row of `Xexportbin` payload using an observed/default allowance
+/// for each variable-width value.
+pub fn estimated_frame_bytes_per_row(
+    columns: &[ResultColumn],
+    variable_value_bytes: usize,
+) -> usize {
+    columns.iter().fold(0usize, |total, column| {
+        let width = crate::wire::fixed_wire_width(*column.sql_type()).unwrap_or_else(|| {
+            variable_value_bytes.saturating_add(match column.sql_type() {
+                MonetType::Blob => 8,
+                _ => 1,
+            })
+        });
+        total.saturating_add(width)
+    })
+}
+
 fn prefers_owned_types(types: impl IntoIterator<Item = MonetType>) -> bool {
     let mut adoptable_bytes = 0usize;
     let mut frame_bytes = 0usize;
@@ -585,7 +602,7 @@ pub fn decode_inline_rows(
             });
         }
         for (index, column) in columns.iter().enumerate() {
-            buffers[index].extend(inline_wire_value(cursor, index, column.sql_type())?);
+            append_inline_wire_value(cursor, index, column.sql_type(), &mut buffers[index])?;
         }
         rows += 1;
     }
@@ -603,24 +620,36 @@ pub fn decode_inline_rows(
     Ok(RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)?)
 }
 
-fn inline_wire_value(
+fn append_inline_wire_value(
     cursor: &Cursor,
     index: usize,
     data_type: &MonetType,
-) -> Result<Vec<u8>, DecodeError> {
+    output: &mut Vec<u8>,
+) -> Result<(), DecodeError> {
     if cursor.get_str(index)?.is_none() {
-        return null_wire_value(data_type);
+        append_null_wire_value(data_type, output)?;
+        return Ok(());
     }
-    Ok(match *data_type {
-        MonetType::Bool => vec![u8::from(required(cursor.get_bool(index)?)?)],
-        MonetType::TinyInt => required(cursor.get_i8(index)?)?.to_le_bytes().to_vec(),
-        MonetType::SmallInt => required(cursor.get_i16(index)?)?.to_le_bytes().to_vec(),
-        MonetType::Int => required(cursor.get_i32(index)?)?.to_le_bytes().to_vec(),
-        MonetType::BigInt => required(cursor.get_i64(index)?)?.to_le_bytes().to_vec(),
-        MonetType::HugeInt => required(cursor.get_i128(index)?)?.to_le_bytes().to_vec(),
+    match *data_type {
+        MonetType::Bool => output.push(u8::from(required(cursor.get_bool(index)?)?)),
+        MonetType::TinyInt => {
+            output.extend_from_slice(&required(cursor.get_i8(index)?)?.to_le_bytes())
+        }
+        MonetType::SmallInt => {
+            output.extend_from_slice(&required(cursor.get_i16(index)?)?.to_le_bytes())
+        }
+        MonetType::Int => {
+            output.extend_from_slice(&required(cursor.get_i32(index)?)?.to_le_bytes())
+        }
+        MonetType::BigInt => {
+            output.extend_from_slice(&required(cursor.get_i64(index)?)?.to_le_bytes())
+        }
+        MonetType::HugeInt => {
+            output.extend_from_slice(&required(cursor.get_i128(index)?)?.to_le_bytes())
+        }
         MonetType::Oid => {
             let rendered = required(cursor.get_str(index)?)?;
-            parse_inline_oid(rendered)?.to_le_bytes().to_vec()
+            output.extend_from_slice(&parse_inline_oid(rendered)?.to_le_bytes());
         }
         MonetType::Decimal(precision, scale) => {
             let decimal = required(cursor.get::<RawDecimal<i128>>(index)?)?;
@@ -628,42 +657,44 @@ fn inline_wire_value(
                 row: 0,
                 message: "decimal text has more fractional digits than its declared scale",
             })?;
-            decimal_wire_value(value, precision)?
+            append_decimal_wire_value(value, precision, output)?;
         }
         MonetType::Varchar(_) | MonetType::Url | MonetType::Json => {
             let value = required(cursor.get_str(index)?)?;
-            let mut bytes = value.as_bytes().to_vec();
-            bytes.push(0);
-            bytes
+            output.extend_from_slice(value.as_bytes());
+            output.push(0);
         }
-        MonetType::Real => required(cursor.get_f32(index)?)?.to_le_bytes().to_vec(),
-        MonetType::Double => required(cursor.get_f64(index)?)?.to_le_bytes().to_vec(),
-        MonetType::MonthInterval => required(cursor.get_i32(index)?)?.to_le_bytes().to_vec(),
+        MonetType::Real => {
+            output.extend_from_slice(&required(cursor.get_f32(index)?)?.to_le_bytes())
+        }
+        MonetType::Double => {
+            output.extend_from_slice(&required(cursor.get_f64(index)?)?.to_le_bytes())
+        }
+        MonetType::MonthInterval => {
+            output.extend_from_slice(&required(cursor.get_i32(index)?)?.to_le_bytes())
+        }
         MonetType::DayInterval | MonetType::SecInterval => {
             let decimal = required(cursor.get::<RawDecimal<i64>>(index)?)?;
-            decimal
-                .at_scale(3)
-                .ok_or(DecodeError::InvalidValue {
-                    row: 0,
-                    message: "interval text is not representable in milliseconds",
-                })?
-                .to_le_bytes()
-                .to_vec()
+            let value = decimal.at_scale(3).ok_or(DecodeError::InvalidValue {
+                row: 0,
+                message: "interval text is not representable in milliseconds",
+            })?;
+            output.extend_from_slice(&value.to_le_bytes());
         }
-        MonetType::Time => time_wire(required(cursor.get::<RawTime>(index)?)?),
+        MonetType::Time => append_time_wire(required(cursor.get::<RawTime>(index)?)?, output),
         MonetType::TimeTz => {
             let value = required(cursor.get::<RawTimeTz>(index)?)?;
-            time_wire(normalize_time(value.time, value.tz.seconds_east)?)
+            append_time_wire(normalize_time(value.time, value.tz.seconds_east)?, output);
         }
-        MonetType::Date => date_wire(required(cursor.get::<RawDate>(index)?)?),
+        MonetType::Date => append_date_wire(required(cursor.get::<RawDate>(index)?)?, output),
         MonetType::Timestamp => {
             let value = required(cursor.get::<RawTimestamp>(index)?)?;
-            timestamp_wire(value.date, value.time)
+            append_timestamp_wire(value.date, value.time, output);
         }
         MonetType::TimestampTz => {
             let value = required(cursor.get::<RawTimestampTz>(index)?)?;
             let (date, time) = normalize_timestamp(value.date, value.time, value.tz.seconds_east)?;
-            timestamp_wire(date, time)
+            append_timestamp_wire(date, time, output);
         }
         MonetType::Blob => {
             let value = required(cursor.get::<Vec<u8>>(index)?)?;
@@ -671,38 +702,41 @@ fn inline_wire_value(
                 row: 0,
                 message: "BLOB length does not fit on the wire",
             })?;
-            let mut bytes = length.to_le_bytes().to_vec();
-            bytes.extend_from_slice(&value);
-            bytes
+            output.extend_from_slice(&length.to_le_bytes());
+            output.extend_from_slice(&value);
         }
-        MonetType::Uuid => uuid::Uuid::parse_str(required(cursor.get_str(index)?)?)
-            .map_err(|_| DecodeError::InvalidValue {
-                row: 0,
-                message: "invalid UUID text",
-            })?
-            .into_bytes()
-            .to_vec(),
+        MonetType::Uuid => output.extend_from_slice(
+            &uuid::Uuid::parse_str(required(cursor.get_str(index)?)?)
+                .map_err(|_| DecodeError::InvalidValue {
+                    row: 0,
+                    message: "invalid UUID text",
+                })?
+                .into_bytes(),
+        ),
         MonetType::Inet => return Err(DecodeError::Unsupported(*data_type)),
-        MonetType::Inet4 => required(cursor.get_str(index)?)?
-            .parse::<std::net::Ipv4Addr>()
-            .map_err(|_| DecodeError::InvalidValue {
-                row: 0,
-                message: "invalid INET4 address",
-            })?
-            .octets()
-            .to_vec(),
-        MonetType::Inet6 => required(cursor.get_str(index)?)?
-            .parse::<std::net::Ipv6Addr>()
-            .map_err(|_| DecodeError::InvalidValue {
-                row: 0,
-                message: "invalid INET6 address",
-            })?
-            .octets()
-            .to_vec(),
+        MonetType::Inet4 => output.extend_from_slice(
+            &required(cursor.get_str(index)?)?
+                .parse::<std::net::Ipv4Addr>()
+                .map_err(|_| DecodeError::InvalidValue {
+                    row: 0,
+                    message: "invalid INET4 address",
+                })?
+                .octets(),
+        ),
+        MonetType::Inet6 => output.extend_from_slice(
+            &required(cursor.get_str(index)?)?
+                .parse::<std::net::Ipv6Addr>()
+                .map_err(|_| DecodeError::InvalidValue {
+                    row: 0,
+                    message: "invalid INET6 address",
+                })?
+                .octets(),
+        ),
         MonetType::Geometry | MonetType::Xml => {
             return Err(DecodeError::Unsupported(*data_type));
         }
-    })
+    }
+    Ok(())
 }
 
 fn required<T>(value: Option<T>) -> Result<T, DecodeError> {
@@ -723,46 +757,55 @@ fn parse_inline_oid(rendered: &str) -> Result<u64, DecodeError> {
         })
 }
 
-fn null_wire_value(data_type: &MonetType) -> Result<Vec<u8>, DecodeError> {
-    Ok(match *data_type {
-        MonetType::Bool => vec![0x80],
-        MonetType::TinyInt => i8::MIN.to_le_bytes().to_vec(),
-        MonetType::SmallInt => i16::MIN.to_le_bytes().to_vec(),
-        MonetType::Int | MonetType::MonthInterval => i32::MIN.to_le_bytes().to_vec(),
-        MonetType::BigInt | MonetType::DayInterval | MonetType::SecInterval => {
-            i64::MIN.to_le_bytes().to_vec()
+fn append_null_wire_value(data_type: &MonetType, output: &mut Vec<u8>) -> Result<(), DecodeError> {
+    match *data_type {
+        MonetType::Bool => output.push(0x80),
+        MonetType::TinyInt => output.extend_from_slice(&i8::MIN.to_le_bytes()),
+        MonetType::SmallInt => output.extend_from_slice(&i16::MIN.to_le_bytes()),
+        MonetType::Int | MonetType::MonthInterval => {
+            output.extend_from_slice(&i32::MIN.to_le_bytes())
         }
-        MonetType::HugeInt => i128::MIN.to_le_bytes().to_vec(),
-        MonetType::Oid => (1u64 << 63).to_le_bytes().to_vec(),
+        MonetType::BigInt | MonetType::DayInterval | MonetType::SecInterval => {
+            output.extend_from_slice(&i64::MIN.to_le_bytes())
+        }
+        MonetType::HugeInt => output.extend_from_slice(&i128::MIN.to_le_bytes()),
+        MonetType::Oid => output.extend_from_slice(&(1u64 << 63).to_le_bytes()),
         MonetType::Decimal(precision, _) => match precision {
-            1..=2 => i8::MIN.to_le_bytes().to_vec(),
-            3..=4 => i16::MIN.to_le_bytes().to_vec(),
-            5..=9 => i32::MIN.to_le_bytes().to_vec(),
-            10..=18 => i64::MIN.to_le_bytes().to_vec(),
-            19..=38 => i128::MIN.to_le_bytes().to_vec(),
+            1..=2 => output.extend_from_slice(&i8::MIN.to_le_bytes()),
+            3..=4 => output.extend_from_slice(&i16::MIN.to_le_bytes()),
+            5..=9 => output.extend_from_slice(&i32::MIN.to_le_bytes()),
+            10..=18 => output.extend_from_slice(&i64::MIN.to_le_bytes()),
+            19..=38 => output.extend_from_slice(&i128::MIN.to_le_bytes()),
             _ => {
                 return Err(DecodeError::InvalidColumn {
                     message: "decimal precision must be between 1 and 38",
                 });
             }
         },
-        MonetType::Varchar(_) | MonetType::Url | MonetType::Json => vec![0x80, 0],
-        MonetType::Real => f32::NAN.to_le_bytes().to_vec(),
-        MonetType::Double => f64::NAN.to_le_bytes().to_vec(),
-        MonetType::Time | MonetType::TimeTz => vec![0xff; 8],
-        MonetType::Date => vec![0xff; 4],
-        MonetType::Timestamp | MonetType::TimestampTz => vec![0xff; 12],
-        MonetType::Blob => (-1i64).to_le_bytes().to_vec(),
-        MonetType::Uuid => vec![0; 16],
-        MonetType::Inet4 => vec![0; 4],
-        MonetType::Inet6 => vec![0; 16],
+        MonetType::Varchar(_) | MonetType::Url | MonetType::Json => {
+            output.extend_from_slice(&[0x80, 0])
+        }
+        MonetType::Real => output.extend_from_slice(&f32::NAN.to_le_bytes()),
+        MonetType::Double => output.extend_from_slice(&f64::NAN.to_le_bytes()),
+        MonetType::Time | MonetType::TimeTz => output.extend_from_slice(&[0xff; 8]),
+        MonetType::Date => output.extend_from_slice(&[0xff; 4]),
+        MonetType::Timestamp | MonetType::TimestampTz => output.extend_from_slice(&[0xff; 12]),
+        MonetType::Blob => output.extend_from_slice(&(-1i64).to_le_bytes()),
+        MonetType::Uuid => output.extend_from_slice(&[0; 16]),
+        MonetType::Inet4 => output.extend_from_slice(&[0; 4]),
+        MonetType::Inet6 => output.extend_from_slice(&[0; 16]),
         MonetType::Geometry | MonetType::Inet | MonetType::Xml => {
             return Err(DecodeError::Unsupported(*data_type));
         }
-    })
+    }
+    Ok(())
 }
 
-fn decimal_wire_value(value: i128, precision: u8) -> Result<Vec<u8>, DecodeError> {
+fn append_decimal_wire_value(
+    value: i128,
+    precision: u8,
+    output: &mut Vec<u8>,
+) -> Result<(), DecodeError> {
     macro_rules! narrow {
         ($type:ty) => {{
             let narrowed = <$type>::try_from(value).map_err(|_| DecodeError::InvalidValue {
@@ -775,10 +818,10 @@ fn decimal_wire_value(value: i128, precision: u8) -> Result<Vec<u8>, DecodeError
                     message: "decimal value collides with the wire NULL sentinel",
                 });
             }
-            narrowed.to_le_bytes().to_vec()
+            output.extend_from_slice(&narrowed.to_le_bytes());
         }};
     }
-    Ok(match precision {
+    match precision {
         1..=2 => narrow!(i8),
         3..=4 => narrow!(i16),
         5..=9 => narrow!(i32),
@@ -790,32 +833,30 @@ fn decimal_wire_value(value: i128, precision: u8) -> Result<Vec<u8>, DecodeError
                     message: "decimal value collides with the wire NULL sentinel",
                 });
             }
-            value.to_le_bytes().to_vec()
+            output.extend_from_slice(&value.to_le_bytes());
         }
         _ => {
             return Err(DecodeError::InvalidColumn {
                 message: "decimal precision must be between 1 and 38",
             });
         }
-    })
+    }
+    Ok(())
 }
 
-fn time_wire(value: RawTime) -> Vec<u8> {
-    let mut bytes = value.microseconds.to_le_bytes().to_vec();
-    bytes.extend_from_slice(&[value.seconds, value.minutes, value.hours, 0]);
-    bytes
+fn append_time_wire(value: RawTime, output: &mut Vec<u8>) {
+    output.extend_from_slice(&value.microseconds.to_le_bytes());
+    output.extend_from_slice(&[value.seconds, value.minutes, value.hours, 0]);
 }
 
-fn date_wire(value: RawDate) -> Vec<u8> {
-    let mut bytes = vec![value.day, value.month];
-    bytes.extend_from_slice(&value.year.to_le_bytes());
-    bytes
+fn append_date_wire(value: RawDate, output: &mut Vec<u8>) {
+    output.extend_from_slice(&[value.day, value.month]);
+    output.extend_from_slice(&value.year.to_le_bytes());
 }
 
-fn timestamp_wire(date: RawDate, time: RawTime) -> Vec<u8> {
-    let mut bytes = time_wire(time);
-    bytes.extend_from_slice(&date_wire(date));
-    bytes
+fn append_timestamp_wire(date: RawDate, time: RawTime, output: &mut Vec<u8>) {
+    append_time_wire(time, output);
+    append_date_wire(date, output);
 }
 
 fn normalize_time(value: RawTime, seconds_east: i32) -> Result<RawTime, DecodeError> {
@@ -2132,7 +2173,7 @@ mod tests {
             (i128::from(i64::MIN), 18),
             (i128::MIN, 38),
         ] {
-            let error = decimal_wire_value(value, precision).unwrap_err();
+            let error = append_decimal_wire_value(value, precision, &mut Vec::new()).unwrap_err();
             assert!(error.to_string().contains("NULL sentinel"));
         }
     }
