@@ -40,6 +40,7 @@ class DatabaseOptions(StrEnum):
     CLIENT_APPLICATION = "adbc.monetdb.client_application"
     CLIENT_REMARK = "adbc.monetdb.client_remark"
     CLIENT_INFO = "adbc.monetdb.client_info"
+    READ_WINDOW_BYTES = "adbc.monetdb.read_window_bytes"
     WRITE_WINDOW_BYTES = "adbc.monetdb.write_window_bytes"
     INGEST_INSERT_ROWS = "adbc.monetdb.ingest_insert_rows"
     PREPARED_CACHE_CAPACITY = "adbc.monetdb.prepared_cache_capacity"
@@ -52,6 +53,7 @@ class ConnectionOptions(StrEnum):
     WRITE_TIMEOUT = "adbc.monetdb.write_timeout_seconds"
     OPERATION_TIMEOUT = "adbc.monetdb.operation_timeout_seconds"
     READ_BATCH_ROWS = "adbc.monetdb.read_batch_rows"
+    READ_WINDOW_BYTES = "adbc.monetdb.read_window_bytes"
     READ_PREFETCH = "adbc.monetdb.read_prefetch"
     WRITE_BATCH_ROWS = "adbc.monetdb.write_batch_rows"
     WRITE_WINDOW_BYTES = "adbc.monetdb.write_window_bytes"
@@ -68,6 +70,7 @@ class StatementOptions(StrEnum):
     WRITE_TIMEOUT = "adbc.monetdb.write_timeout_seconds"
     OPERATION_TIMEOUT = "adbc.monetdb.operation_timeout_seconds"
     READ_BATCH_ROWS = "adbc.monetdb.read_batch_rows"
+    READ_WINDOW_BYTES = "adbc.monetdb.read_window_bytes"
     READ_PREFETCH = "adbc.monetdb.read_prefetch"
     WRITE_BATCH_ROWS = "adbc.monetdb.write_batch_rows"
     WRITE_WINDOW_BYTES = "adbc.monetdb.write_window_bytes"
@@ -77,6 +80,7 @@ class StatementOptions(StrEnum):
     INGEST_ATOMICITY = "adbc.monetdb.ingest_atomicity"
     CONSTRAINED_APPEND = "adbc.monetdb.constrained_append"
     INGEST_STATS = "adbc.monetdb.ingest_stats"
+    READ_STATS = "adbc.monetdb.read_stats"
     BIND_BY_NAME = "adbc.monetdb.bind_by_name"
 
 
@@ -92,6 +96,7 @@ DatabaseOptionValues = TypedDict(
         "adbc.monetdb.client_application": str,
         "adbc.monetdb.client_remark": str,
         "adbc.monetdb.client_info": str | bool,
+        "adbc.monetdb.read_window_bytes": str | int,
         "adbc.monetdb.write_window_bytes": str | int,
         "adbc.monetdb.ingest_insert_rows": str | int,
         "adbc.monetdb.prepared_cache_capacity": str | int,
@@ -107,6 +112,7 @@ ConnectionOptionValues = TypedDict(
         "adbc.monetdb.write_timeout_seconds": str | int,
         "adbc.monetdb.operation_timeout_seconds": str | int,
         "adbc.monetdb.read_batch_rows": str | int,
+        "adbc.monetdb.read_window_bytes": str | int,
         "adbc.monetdb.read_prefetch": str | bool,
         "adbc.monetdb.write_batch_rows": str | int,
         "adbc.monetdb.write_window_bytes": str | int,
@@ -126,6 +132,7 @@ StatementOptionValues = TypedDict(
         "adbc.monetdb.write_timeout_seconds": str | int,
         "adbc.monetdb.operation_timeout_seconds": str | int,
         "adbc.monetdb.read_batch_rows": str | int,
+        "adbc.monetdb.read_window_bytes": str | int,
         "adbc.monetdb.read_prefetch": str | bool,
         "adbc.monetdb.write_batch_rows": str | int,
         "adbc.monetdb.write_window_bytes": str | int,

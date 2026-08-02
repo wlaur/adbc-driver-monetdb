@@ -91,12 +91,13 @@ def test_uri_tuning_and_prepared_cache_observability(monetdb_uri: str) -> None:
     separator = "&" if "?" in monetdb_uri else "?"
     uri = (
         f"{monetdb_uri}{separator}ingest_insert_rows=2&prepared_cache_capacity=1&"
-        "write_window_bytes=8388608&constrained_append=direct"
+        "read_window_bytes=4194304&write_window_bytes=8388608&constrained_append=direct"
     )
     batch = pa.record_batch({"value": pa.array([1], type=pa.int32())})
     with dbapi.connect(uri) as connection:
         assert connection.adbc_connection.get_option_int(str(ConnectionOptions.INGEST_INSERT_ROWS)) == 2
         assert connection.adbc_connection.get_option_int(str(ConnectionOptions.PREPARED_CACHE_CAPACITY)) == 1
+        assert connection.adbc_connection.get_option_int(str(ConnectionOptions.READ_WINDOW_BYTES)) == 4_194_304
         assert connection.adbc_connection.get_option_int(str(ConnectionOptions.WRITE_WINDOW_BYTES)) == 8_388_608
         assert connection.adbc_connection.get_option(str(ConnectionOptions.CONSTRAINED_APPEND)) == "direct"
         with connection.cursor() as cursor:
