@@ -47,6 +47,8 @@ use parameters::{
 const DEFAULT_READ_WINDOW_BYTES: usize = 64 * 1024 * 1024;
 const REMOTE_READ_WINDOW_BYTES: usize = 128 * 1024 * 1024;
 const MIN_READ_WINDOW_BYTES: usize = 1024 * 1024;
+const MAX_AUTOMATIC_READ_GRANULE_BYTES: usize = 512 * 1024 * 1024;
+const EXPORT_GRANULE_ROWS: usize = 131_072;
 const VARIABLE_READ_COLUMN_BYTES: usize = 1024;
 const INITIAL_VARIABLE_READ_ROWS: usize = 65_536;
 const MAX_READ_WINDOW_GROWTH: usize = 4;
@@ -325,12 +327,47 @@ fn integer_option(key: &str, value: &OptionValue) -> Result<i64> {
 
 fn read_batch_rows_option(value: &OptionValue) -> Result<usize> {
     let rows = integer_option(READ_BATCH_ROWS_OPTION, value)?;
-    usize::try_from(rows).map_err(|_| {
+    let rows = usize::try_from(rows).map_err(|_| {
         error(
             format!("option '{READ_BATCH_ROWS_OPTION}' must be non-negative"),
             Status::InvalidArguments,
         )
-    })
+    })?;
+    let rounded = round_read_batch_rows(rows);
+    if rounded != rows {
+        eprintln!(
+            "warning: option '{READ_BATCH_ROWS_OPTION}' was rounded from {rows} to {rounded}; \
+             reads prefer {EXPORT_GRANULE_ROWS}-row export boundaries or power-of-two divisors"
+        );
+    }
+    Ok(rounded)
+}
+
+fn round_read_batch_rows(rows: usize) -> usize {
+    if rows.is_multiple_of(EXPORT_GRANULE_ROWS) {
+        return rows;
+    }
+    if rows < EXPORT_GRANULE_ROWS {
+        let lower = export_alignment_rows(rows);
+        if lower == rows {
+            return rows;
+        }
+        let upper = lower.saturating_mul(2).min(EXPORT_GRANULE_ROWS);
+        return if rows - lower >= upper - rows {
+            upper
+        } else {
+            lower
+        };
+    }
+    let lower = rows / EXPORT_GRANULE_ROWS * EXPORT_GRANULE_ROWS;
+    let upper = lower.checked_add(EXPORT_GRANULE_ROWS);
+    if lower == 0 || rows - lower >= EXPORT_GRANULE_ROWS / 2 {
+        upper
+            .filter(|upper| i64::try_from(*upper).is_ok())
+            .unwrap_or(lower)
+    } else {
+        lower
+    }
 }
 
 fn read_window_bytes_option(value: &OptionValue) -> Result<Option<usize>> {
@@ -5315,6 +5352,32 @@ fn automatic_read_window_bytes(measured_round_trip: Duration) -> usize {
     automatic_read_window_bytes_for_memory(system_memory_limit_bytes(), measured_round_trip)
 }
 
+fn effective_read_window_bytes(
+    configured_window_bytes: Option<usize>,
+    measured_round_trip: Duration,
+    fixed_granule_capacity: Option<usize>,
+) -> usize {
+    let base =
+        configured_window_bytes.unwrap_or_else(|| automatic_read_window_bytes(measured_round_trip));
+    if configured_window_bytes.is_some() {
+        return base;
+    }
+    effective_automatic_read_window_bytes(base, fixed_granule_capacity, system_memory_limit_bytes())
+}
+
+fn effective_automatic_read_window_bytes(
+    base: usize,
+    fixed_granule_capacity: Option<usize>,
+    memory_limit: Option<usize>,
+) -> usize {
+    let maximum = memory_limit.map_or(MAX_AUTOMATIC_READ_GRANULE_BYTES, |limit| {
+        MAX_AUTOMATIC_READ_GRANULE_BYTES.min((limit / 8).max(MIN_READ_WINDOW_BYTES))
+    });
+    fixed_granule_capacity
+        .filter(|capacity| *capacity <= maximum)
+        .map_or(base, |capacity| base.max(capacity))
+}
+
 fn automatic_read_window_bytes_for_memory(
     memory_limit: Option<usize>,
     measured_round_trip: Duration,
@@ -7353,9 +7416,11 @@ impl ReadStats {
 struct ReadWindowScheduler {
     exact_batch_rows: Option<usize>,
     window_budget_bytes: usize,
+    full_granule_fits: bool,
     estimated_bytes_per_row: usize,
     initial_rows_limit: Option<usize>,
     previous_rows: Option<usize>,
+    observed_rows: usize,
 }
 
 impl ReadWindowScheduler {
@@ -7365,10 +7430,18 @@ impl ReadWindowScheduler {
         configured_window_bytes: Option<usize>,
         measured_round_trip: Duration,
     ) -> Self {
+        let fixed_granule_capacity =
+            monetdb_arrow::owned_frame_capacity(columns, EXPORT_GRANULE_ROWS);
+        let window_budget_bytes = effective_read_window_bytes(
+            configured_window_bytes,
+            measured_round_trip,
+            fixed_granule_capacity,
+        );
         Self {
             exact_batch_rows: (batch_rows > 0).then_some(batch_rows),
-            window_budget_bytes: configured_window_bytes
-                .unwrap_or_else(|| automatic_read_window_bytes(measured_round_trip)),
+            window_budget_bytes,
+            full_granule_fits: fixed_granule_capacity
+                .is_some_and(|capacity| capacity <= window_budget_bytes),
             estimated_bytes_per_row: monetdb_arrow::estimated_frame_bytes_per_row(
                 columns,
                 VARIABLE_READ_COLUMN_BYTES,
@@ -7378,6 +7451,7 @@ impl ReadWindowScheduler {
                 .is_none()
                 .then_some(INITIAL_VARIABLE_READ_ROWS),
             previous_rows: None,
+            observed_rows: 0,
         }
     }
 
@@ -7386,12 +7460,28 @@ impl ReadWindowScheduler {
         let rows = if let Some(exact) = self.exact_batch_rows {
             exact.min(remaining)
         } else {
-            let target = (self.window_budget_bytes / self.estimated_bytes_per_row).max(1);
-            self.previous_rows
-                .map_or_else(
-                    || target.min(self.initial_rows_limit.unwrap_or(usize::MAX)),
-                    |previous| target.min(previous.saturating_mul(MAX_READ_WINDOW_GROWTH)),
-                )
+            let target = (self.window_budget_bytes / self.estimated_bytes_per_row)
+                .max(1)
+                .max(if self.full_granule_fits {
+                    EXPORT_GRANULE_ROWS
+                } else {
+                    1
+                });
+            let target = self.previous_rows.map_or_else(
+                || target.min(self.initial_rows_limit.unwrap_or(usize::MAX)),
+                |previous| target.min(previous.saturating_mul(MAX_READ_WINDOW_GROWTH)),
+            );
+            // MonetDB's Dec2025 sql_result.c::mvc_export_bin_chunk forwards each
+            // Xexportbin range to sql_bincopy.c::dump_binary_column without a wire-
+            // level alignment restriction. Driver-selected boundaries use the
+            // measured 131,072-row export granule; sub-granule powers of two
+            // preserve the byte budget when a complete granule is too large.
+            let alignment = export_alignment_rows(target);
+            let target_end = self.observed_rows.saturating_add(target);
+            let aligned_end = target_end - target_end % alignment;
+            aligned_end
+                .saturating_sub(self.observed_rows)
+                .max(1)
                 .min(remaining)
         };
         self.previous_rows = Some(rows);
@@ -7399,6 +7489,7 @@ impl ReadWindowScheduler {
     }
 
     fn observe(&mut self, bytes: usize, rows: usize) {
+        self.observed_rows = self.observed_rows.saturating_add(rows);
         if self.exact_batch_rows.is_none() && rows > 0 {
             self.estimated_bytes_per_row = bytes.saturating_add(rows - 1) / rows;
             self.estimated_bytes_per_row = self.estimated_bytes_per_row.max(1);
@@ -7413,6 +7504,11 @@ impl ReadWindowScheduler {
             .saturating_mul(requested_rows)
             .saturating_add(4096)
     }
+}
+
+fn export_alignment_rows(target: usize) -> usize {
+    let target = target.clamp(1, EXPORT_GRANULE_ROWS);
+    1usize << (usize::BITS - 1 - target.leading_zeros())
 }
 
 fn shrink_owned_response(response: &mut Vec<u8>) {
@@ -8400,6 +8496,22 @@ mod tests {
             131_072
         );
         assert_eq!(read_batch_rows_option(&OptionValue::Int(0)).unwrap(), 0);
+        assert_eq!(
+            read_batch_rows_option(&OptionValue::Int(10_000)).unwrap(),
+            8_192
+        );
+        assert_eq!(
+            read_batch_rows_option(&OptionValue::Int(32_768)).unwrap(),
+            32_768
+        );
+        assert_eq!(
+            read_batch_rows_option(&OptionValue::Int(196_608)).unwrap(),
+            262_144
+        );
+        assert_eq!(
+            read_batch_rows_option(&OptionValue::Int(300_000)).unwrap(),
+            262_144
+        );
         assert_eq!(write_batch_rows_option(&OptionValue::Int(0)).unwrap(), None);
         assert_eq!(
             write_batch_rows_option(&OptionValue::Int(100_000)).unwrap(),
@@ -8548,6 +8660,40 @@ mod tests {
             automatic_read_window_bytes_for_memory(Some(1024), Duration::ZERO),
             MIN_READ_WINDOW_BYTES
         );
+        assert_eq!(
+            effective_automatic_read_window_bytes(
+                DEFAULT_READ_WINDOW_BYTES,
+                Some(412 * 1024 * 1024),
+                None,
+            ),
+            412 * 1024 * 1024
+        );
+        assert_eq!(
+            effective_automatic_read_window_bytes(
+                DEFAULT_READ_WINDOW_BYTES,
+                Some(412 * 1024 * 1024),
+                Some(2 * 1024 * 1024 * 1024),
+            ),
+            DEFAULT_READ_WINDOW_BYTES
+        );
+        assert_eq!(
+            effective_automatic_read_window_bytes(
+                DEFAULT_READ_WINDOW_BYTES,
+                Some(513 * 1024 * 1024),
+                None,
+            ),
+            DEFAULT_READ_WINDOW_BYTES
+        );
+    }
+
+    #[test]
+    fn read_window_alignment_uses_server_granules_and_power_of_two_divisors() {
+        assert_eq!(export_alignment_rows(1), 1);
+        assert_eq!(export_alignment_rows(21_311), 16_384);
+        assert_eq!(export_alignment_rows(65_536), 65_536);
+        assert_eq!(export_alignment_rows(131_071), 65_536);
+        assert_eq!(export_alignment_rows(131_072), 131_072);
+        assert_eq!(export_alignment_rows(usize::MAX), 131_072);
     }
 
     #[test]
@@ -8555,18 +8701,39 @@ mod tests {
         let mut scheduler = ReadWindowScheduler {
             exact_batch_rows: None,
             window_budget_bytes: 100,
+            full_granule_fits: false,
             estimated_bytes_per_row: 1000,
             initial_rows_limit: Some(INITIAL_VARIABLE_READ_ROWS),
             previous_rows: None,
+            observed_rows: 0,
         };
         assert_eq!(scheduler.next_rows(1000), 1);
         scheduler.observe(1, 1);
-        assert_eq!(scheduler.next_rows(1000), MAX_READ_WINDOW_GROWTH);
-        scheduler.observe(4, 4);
-        assert_eq!(scheduler.next_rows(1000), MAX_READ_WINDOW_GROWTH.pow(2));
+        assert_eq!(scheduler.next_rows(1000), 3);
+        scheduler.observe(3, 3);
+        assert_eq!(scheduler.next_rows(1000), 12);
 
-        scheduler.observe(1_600, 16);
+        scheduler.observe(1_200, 12);
         assert_eq!(scheduler.next_rows(3), 1);
+    }
+
+    #[test]
+    fn fixed_width_granule_fit_survives_observed_width_rounding() {
+        let mut scheduler = ReadWindowScheduler {
+            exact_batch_rows: None,
+            window_budget_bytes: 412_651_812,
+            full_granule_fits: true,
+            estimated_bytes_per_row: 3_148,
+            initial_rows_limit: None,
+            previous_rows: None,
+            observed_rows: 0,
+        };
+        assert_eq!(scheduler.next_rows(300_000), EXPORT_GRANULE_ROWS);
+        scheduler.observe(412_627_288, EXPORT_GRANULE_ROWS);
+        assert_eq!(scheduler.estimated_bytes_per_row, 3_149);
+        assert_eq!(scheduler.next_rows(168_928), EXPORT_GRANULE_ROWS);
+        scheduler.observe(412_627_288, EXPORT_GRANULE_ROWS);
+        assert_eq!(scheduler.next_rows(37_856), 37_856);
     }
 
     #[test]
@@ -8574,9 +8741,11 @@ mod tests {
         let mut scheduler = ReadWindowScheduler {
             exact_batch_rows: Some(17),
             window_budget_bytes: 1,
+            full_granule_fits: false,
             estimated_bytes_per_row: usize::MAX,
             initial_rows_limit: None,
             previous_rows: None,
+            observed_rows: 0,
         };
         assert_eq!(scheduler.next_rows(100), 17);
         scheduler.observe(usize::MAX, 17);

@@ -239,7 +239,7 @@ def test_partially_consumed_stream_can_resume_around_a_second_query(
         dbapi.connect(monetdb_uri) as connection,
         connection.cursor(
             adbc_stmt_kwargs={
-                StatementOptions.READ_BATCH_ROWS: "100000",
+                StatementOptions.READ_BATCH_ROWS: "65536",
                 StatementOptions.READ_PREFETCH: read_prefetch,
             }
         ) as first_cursor,
@@ -259,10 +259,10 @@ def test_partially_consumed_stream_can_resume_around_a_second_query(
             resumed = reader.read_next_batch()
         reader.close()
 
-    assert first.num_rows == 100_000
+    assert first.num_rows == 65_536
     assert first.column(0)[0].as_py() == 1  # pyright: ignore[reportUnknownMemberType]
-    assert resumed.num_rows == 100_000
-    assert resumed.column(0)[0].as_py() == 100_001  # pyright: ignore[reportUnknownMemberType]
+    assert resumed.num_rows == 65_536
+    assert resumed.column(0)[0].as_py() == 65_537  # pyright: ignore[reportUnknownMemberType]
     assert second == (42,)
 
 
@@ -273,13 +273,13 @@ def test_prefetched_reader_can_be_closed_early_and_connection_reused(monetdb_uri
         for _ in range(25):
             with connection.cursor(
                 adbc_stmt_kwargs={
-                    StatementOptions.READ_BATCH_ROWS: "10000",
+                    StatementOptions.READ_BATCH_ROWS: "8192",
                     StatementOptions.READ_PREFETCH: "true",
                 }
             ) as cursor:
                 cursor.execute("SELECT value FROM sys.generate_series(1, 100001)")
                 reader = cursor.fetch_record_batch()
-                assert reader.read_next_batch().num_rows == 10_000
+                assert reader.read_next_batch().num_rows == 8_192
                 reader.close()
             assert connection.execute("SELECT 42").fetchone() == (42,)
 
@@ -357,22 +357,41 @@ def test_variable_width_read_windows_converge_to_the_byte_budget(monetdb_uri: st
 
 
 @pytest.mark.integration
-def test_read_batch_rows_remains_an_exact_override(monetdb_uri: str) -> None:
+def test_read_batch_rows_rounds_to_the_server_export_granule(
+    monetdb_uri: str, capfd: pytest.CaptureFixture[str]
+) -> None:
     with (
-        dbapi.connect(monetdb_uri) as connection,
+        dbapi.connect(
+            monetdb_uri,
+            conn_kwargs={str(ConnectionOptions.READ_BATCH_ROWS): "130876"},
+        ) as connection,
         connection.cursor(
             adbc_stmt_kwargs={
-                StatementOptions.READ_BATCH_ROWS: 10_000,
                 StatementOptions.READ_WINDOW_BYTES: 1024 * 1024,
             }
         ) as cursor,
     ):
-        cursor.execute("SELECT value FROM sys.generate_series(1, 30002)")
+        assert connection.adbc_connection.get_option(str(ConnectionOptions.READ_BATCH_ROWS)) == "131072"
+        assert cursor.adbc_statement.get_option(str(StatementOptions.READ_BATCH_ROWS)) == "131072"
+        cursor.execute("SELECT value FROM sys.generate_series(1, 300002)")
         batches = list(cursor.fetch_record_batch())
         stats = json.loads(cursor.adbc_statement.get_option(str(StatementOptions.READ_STATS)))
 
-    assert [batch.num_rows for batch in batches] == [10_000, 10_000, 10_000, 1]
-    assert stats["exact_batch_rows"] == 10_000
+    assert [batch.num_rows for batch in batches] == [131_072, 131_072, 37_857]
+    assert stats["exact_batch_rows"] == 131_072
+    assert "rounded from 130876 to 131072" in capfd.readouterr().err
+
+
+@pytest.mark.integration
+def test_automatic_read_windows_align_to_server_export_granules(monetdb_uri: str) -> None:
+    columns = ", ".join(f"CAST(value AS REAL) AS c{index}" for index in range(64))
+    with dbapi.connect(monetdb_uri) as connection, connection.cursor() as cursor:
+        cursor.execute(f"SELECT value, {columns} FROM sys.generate_series(1, 300002)")
+        batches = list(cursor.fetch_record_batch())
+        stats = json.loads(cursor.adbc_statement.get_option(str(StatementOptions.READ_STATS)))
+
+    assert [batch.num_rows for batch in batches] == [131_072, 131_072, 37_857]
+    assert stats["exact_batch_rows"] == 0
 
 
 @pytest.mark.integration
