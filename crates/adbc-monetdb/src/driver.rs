@@ -2544,7 +2544,8 @@ fn requires_literal_parameter_fallback(value: &Error) -> bool {
             .contains("Could not determine type for argument number")
             || value
                 .message
-                .contains("parameters not allowed as arguments to")))
+                .contains("parameters not allowed as arguments to")
+            || value.message.contains("Result type missing")))
         || value.message == "unknown MonetDB prepared type 'any'"
 }
 
