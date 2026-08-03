@@ -283,12 +283,13 @@ requirements change their premises.
   deliberately left at the `PREPARE` type instead of guessing. Exact restoration in that case
   would require server metadata or a SQL parser, and the catalog lookup is the necessary extra
   round trip for accurate unambiguous declarations.
-- MonetDB rejects parameters used as aggregate or window-function arguments and cannot always
-  infer the result type of parameterized conditional expressions during `PREPARE`. The driver
-  treats these general parameter and result-type diagnostics like an indeterminate parameter type
-  and uses its existing typed literal renderer for that statement. Recognizing diagnostics instead
-  of individual SQL constructs keeps the fallback independent of query generators, and a server
-  version that accepts the prepared form automatically returns to the cached path.
+- MonetDB's `PREPARE` implementation has one family of parameter-position and type-propagation
+  limitations. Its server source reports these as an unknown argument or result type, a parameter
+  in a disallowed position, or a parameter type that cannot be propagated through a set relation.
+  The driver classifies that source-defined family and uses its existing typed literal renderer for
+  the statement. Unrelated `42000` diagnostics still fail during preparation. This keeps the
+  fallback independent of query generators, and a server version that accepts a prepared form
+  automatically returns to the cached path.
 - On the documented 200-query workload, new-cursor execution fell from 1.944 to 0.342 ms per
   statement. Cache lookup, LRU maintenance, and invalidation bookkeeping added about 0.010 ms over
   the cache-only path and kept the result below the 0.50 ms acceptance threshold.

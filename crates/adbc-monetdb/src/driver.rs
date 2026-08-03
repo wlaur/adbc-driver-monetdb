@@ -2537,16 +2537,22 @@ impl Statement for MonetdbStatement {
 }
 
 fn requires_literal_parameter_fallback(value: &Error) -> bool {
-    let parameter_sqlstate = value.sqlstate.map(|value| value as u8) == *b"42000";
-    (parameter_sqlstate
-        && (value
-            .message
-            .contains("Could not determine type for argument number")
-            || value
-                .message
-                .contains("parameters not allowed as arguments to")
-            || value.message.contains("Result type missing")))
-        || value.message == "unknown MonetDB prepared type 'any'"
+    if value.message == "unknown MonetDB prepared type 'any'" {
+        return true;
+    }
+    if value.sqlstate.map(|value| value as u8) != *b"42000" {
+        return false;
+    }
+
+    let message = value.message.to_ascii_lowercase();
+    message.contains("could not determine type for argument")
+        || message.contains("result type missing")
+        || message.contains("cannot have a parameter (?)")
+        || message.contains("parameter not allowed")
+        || message.contains("parameters not allowed")
+        || message.contains("cannot set parameter types")
+        || (message.contains("query projection")
+            && message.contains("parameter with known sql type"))
 }
 
 impl MonetdbStatement {
@@ -8166,6 +8172,51 @@ fn qualified_name(schema: Option<&str>, table: &str) -> Result<String> {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn classifies_only_monetdb_parameter_prepare_limitations_for_literal_fallback() {
+        let prepare_error = |message: &str, sqlstate: &str| {
+            let mut value = error(message, Status::InvalidArguments);
+            value.sqlstate = parse_sqlstate(sqlstate).unwrap();
+            value
+        };
+
+        for message in [
+            "Could not determine type for argument number 1",
+            "Result type missing",
+            "Cannot have a parameter (?) on both sides of an expression",
+            "Cannot have a parameter (?) for IS NOT NULL operator",
+            "SELECT: parameter not allowed on left hand side of LIKE operator",
+            "LISTAGG: parameters not allowed as arguments to window functions",
+            "SELECT: parameters not allowed at PARTITION BY clause from window functions",
+            "Cannot set parameter types under set relations at the moment",
+            "Query projection must have at least one parameter with known SQL type",
+        ] {
+            assert!(requires_literal_parameter_fallback(&prepare_error(
+                message, "42000"
+            )));
+        }
+
+        for message in [
+            "syntax error, unexpected end of input",
+            "EXEC called with wrong number of arguments: expected 2, got 1",
+            "CREATE FUNCTION: procedures cannot have return parameters",
+            "SELECT: with DISTINCT ORDER BY expressions must appear in select list",
+        ] {
+            assert!(!requires_literal_parameter_fallback(&prepare_error(
+                message, "42000"
+            )));
+        }
+
+        assert!(!requires_literal_parameter_fallback(&prepare_error(
+            "Cannot have a parameter (?) on both sides of an expression",
+            "22000"
+        )));
+        assert!(requires_literal_parameter_fallback(&error(
+            "unknown MonetDB prepared type 'any'",
+            Status::InvalidData
+        )));
+    }
 
     #[test]
     fn aligns_append_streams_to_destination_columns_by_name() {
