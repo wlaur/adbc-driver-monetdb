@@ -481,6 +481,45 @@ def test_prepare_type_inference_rejection_falls_back_to_literals(
             [2, 1, 0],
             [(Decimal(2),)],
         ),
+        (
+            (
+                "SELECT prefix, value FROM ("
+                "SELECT ? AS prefix, value FROM (VALUES (1)) AS measurement(value) "
+                "UNION ALL "
+                "SELECT ? AS prefix, value FROM (VALUES (2)) AS calculation(value)"
+                ") AS entities ORDER BY value"
+            ),
+            ["measurement", "calculation"],
+            [("measurement", 1), ("calculation", 2)],
+        ),
+        (
+            "SELECT ? = ?",
+            [2, 2],
+            [(True,)],
+        ),
+        (
+            "SELECT ? IS NOT NULL",
+            ["value"],
+            [(True,)],
+        ),
+        (
+            (
+                "SELECT value, ROW_NUMBER() OVER (PARTITION BY ? ORDER BY value) AS row_number "
+                "FROM (VALUES (2), (1)) AS data(value) ORDER BY value"
+            ),
+            ["all"],
+            [(1, 1), (2, 2)],
+        ),
+        (
+            "SELECT ? LIKE 'a%'",
+            ["abc"],
+            [(True,)],
+        ),
+        (
+            "WITH parameter_value(value) AS (SELECT ?) SELECT value FROM parameter_value",
+            [42],
+            [(42,)],
+        ),
     ]
 
     with dbapi.connect(monetdb_uri) as conn, conn.cursor() as cursor:
