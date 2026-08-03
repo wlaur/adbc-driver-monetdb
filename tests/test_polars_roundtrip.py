@@ -435,7 +435,7 @@ def test_untyped_parameter_fallback_is_eager_and_metadata_only(
 
 
 @pytest.mark.integration
-def test_function_parameter_prepare_rejection_falls_back_to_literals(
+def test_prepare_type_inference_rejection_falls_back_to_literals(
     monetdb_uri: str,
 ) -> None:
     cases = [
@@ -467,6 +467,19 @@ def test_function_parameter_prepare_rejection_falls_back_to_literals(
             ),
             [1],
             [(1, None), (2, 1), (3, 2)],
+        ),
+        (
+            (
+                "SELECT value, CASE WHEN value = ? THEN ? ELSE ? END "
+                "FROM (VALUES (1), (2), (3)) AS data(value) ORDER BY value"
+            ),
+            [2, "matched", "other"],
+            [(1, "other"), (2, "matched"), (3, "other")],
+        ),
+        (
+            ("SELECT SUM(CASE WHEN value >= ? THEN ? ELSE ? END) FROM (VALUES (1), (2), (3)) AS data(value)"),
+            [2, 1, 0],
+            [(Decimal(2),)],
         ),
     ]
 

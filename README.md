@@ -449,9 +449,10 @@ retried once when MonetDB can recover without rolling back user work. MonetDB ab
 transaction when `EXECUTE` reports a missing prepared plan, so a stale plan in that state follows
 the normal database-error contract: roll back before retrying. One-row bound DML executes directly;
 multi-row bound DML retains a savepoint so the whole parameter batch remains atomic.
-When MonetDB rejects parameters in a function argument during `PREPARE`, the driver uses its typed
-literal-binding path for that statement. The fallback applies to the server diagnostic rather than
-to particular SQL functions, and safely quotes values according to their Arrow types.
+When MonetDB cannot infer parameter or result types during `PREPARE`, including parameters in
+function arguments and conditional result expressions, the driver uses its typed literal-binding
+path for that statement. The fallback applies to server diagnostics rather than particular SQL
+functions, and safely quotes values according to their Arrow types.
 
 `dbapi.Binary` accepts bytes-like values (`bytes`, `bytearray`, and `memoryview`) and returns
 `bytes`. Text is rejected with `TypeError`; encode text explicitly before binding it as binary.
@@ -517,7 +518,7 @@ close that connection and open another one before issuing more work.
 Client information is sent at login by default. The `client` value in
 [`sys.sessions`](https://www.monetdb.org/documentation-Dec2025/user-guide/sql-catalog/users-roles-privileges-sessions/)
 identifies this driver and its protocol library, for example
-`adbc_driver_monetdb 0.11.2 / monetdb-rust 0.2.2-wlaur.1`. The Python shim uses the basename of
+`adbc_driver_monetdb 0.11.3 / monetdb-rust 0.2.2-wlaur.1`. The Python shim uses the basename of
 `sys.argv[0]` as the default `application`. Hostname and process id are also sent by default, as
 they are by pymonetdb and libmapi; use `client_info=false` if that host metadata should not leave
 the client.
