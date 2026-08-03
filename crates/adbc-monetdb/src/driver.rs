@@ -2409,7 +2409,7 @@ impl Statement for MonetdbStatement {
         } else {
             match prepare_query(&self.connection, query, layout.count(), self.timeouts) {
                 Ok(metadata) => metadata,
-                Err(value) if could_not_determine_parameter_type(&value) => {
+                Err(value) if requires_literal_parameter_fallback(&value) => {
                     let query = render_null_parameters(query)?;
                     prepare_query_allowing_any(&self.connection, &query, 0, self.timeouts)?
                 }
@@ -2499,7 +2499,7 @@ impl Statement for MonetdbStatement {
                 self.prepared_result_schema = Some(entry.result.clone());
                 self.prepared_entry = Some(Arc::new(Mutex::new(entry)));
             }
-            Err(value) if could_not_determine_parameter_type(&value) => {
+            Err(value) if requires_literal_parameter_fallback(&value) => {
                 self.prepared_parameter_schema = Some(Schema::new(
                     (0..parameter_count)
                         .map(|index| Field::new(index.to_string(), DataType::Null, true))
@@ -2536,12 +2536,15 @@ impl Statement for MonetdbStatement {
     }
 }
 
-fn could_not_determine_parameter_type(value: &Error) -> bool {
-    let indeterminate_sqlstate = value.sqlstate.map(|value| value as u8) == *b"42000";
-    (indeterminate_sqlstate
-        && value
+fn requires_literal_parameter_fallback(value: &Error) -> bool {
+    let parameter_sqlstate = value.sqlstate.map(|value| value as u8) == *b"42000";
+    (parameter_sqlstate
+        && (value
             .message
-            .contains("Could not determine type for argument number"))
+            .contains("Could not determine type for argument number")
+            || value
+                .message
+                .contains("parameters not allowed as arguments to")))
         || value.message == "unknown MonetDB prepared type 'any'"
 }
 

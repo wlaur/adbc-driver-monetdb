@@ -435,6 +435,49 @@ def test_untyped_parameter_fallback_is_eager_and_metadata_only(
 
 
 @pytest.mark.integration
+def test_function_parameter_prepare_rejection_falls_back_to_literals(
+    monetdb_uri: str,
+) -> None:
+    cases = [
+        (
+            (
+                "SELECT LISTAGG(value, ?) "
+                "FROM (SELECT value FROM (VALUES ('b'), ('a')) AS data(value) ORDER BY value) AS source_rows"
+            ),
+            ["'|"],
+            [("a'|b",)],
+        ),
+        (
+            "SELECT SUM(?) FROM (VALUES (1), (2), (3)) AS data(value)",
+            [7],
+            [(Decimal(21),)],
+        ),
+        (
+            (
+                "SELECT value, LISTAGG(value, ?) OVER (PARTITION BY group_id ORDER BY value) "
+                "FROM (VALUES (1, 'b'), (1, 'a')) AS data(group_id, value) ORDER BY value"
+            ),
+            ["'|"],
+            [("a", "a"), ("b", "a'|b")],
+        ),
+        (
+            (
+                "SELECT value, LAG(value, ?) OVER (ORDER BY value) "
+                "FROM (VALUES (1), (2), (3)) AS data(value) ORDER BY value"
+            ),
+            [1],
+            [(1, None), (2, 1), (3, 2)],
+        ),
+    ]
+
+    with dbapi.connect(monetdb_uri) as conn, conn.cursor() as cursor:
+        for query, parameters, expected in cases:
+            assert cursor.adbc_prepare(query) is not None
+            cursor.execute(query, parameters)
+            assert cursor.fetchall() == expected
+
+
+@pytest.mark.integration
 def test_get_objects_with_columns_constraints_and_filters(monetdb_uri: str) -> None:
     with dbapi.connect(monetdb_uri) as conn, conn.cursor() as cursor:
         try:
