@@ -44,6 +44,7 @@ class DatabaseOptions(StrEnum):
     WRITE_WINDOW_BYTES = "adbc.monetdb.write_window_bytes"
     INGEST_INSERT_ROWS = "adbc.monetdb.ingest_insert_rows"
     PREPARED_CACHE_CAPACITY = "adbc.monetdb.prepared_cache_capacity"
+    PREPARE_THRESHOLD = "adbc.monetdb.prepare_threshold"
     WIRE_COMPRESSION = "adbc.monetdb.wire_compression"
     CONSTRAINED_APPEND = "adbc.monetdb.constrained_append"
 
@@ -59,6 +60,7 @@ class ConnectionOptions(StrEnum):
     WRITE_WINDOW_BYTES = "adbc.monetdb.write_window_bytes"
     INGEST_INSERT_ROWS = "adbc.monetdb.ingest_insert_rows"
     PREPARED_CACHE_CAPACITY = "adbc.monetdb.prepared_cache_capacity"
+    PREPARE_THRESHOLD = "adbc.monetdb.prepare_threshold"
     WIRE_COMPRESSION = "adbc.monetdb.wire_compression"
     INGEST_PARTIAL = "adbc.monetdb.ingest_partial"
     INGEST_ATOMICITY = "adbc.monetdb.ingest_atomicity"
@@ -75,12 +77,14 @@ class StatementOptions(StrEnum):
     WRITE_BATCH_ROWS = "adbc.monetdb.write_batch_rows"
     WRITE_WINDOW_BYTES = "adbc.monetdb.write_window_bytes"
     INGEST_INSERT_ROWS = "adbc.monetdb.ingest_insert_rows"
+    PREPARE_THRESHOLD = "adbc.monetdb.prepare_threshold"
     WIRE_COMPRESSION = "adbc.monetdb.wire_compression"
     INGEST_PARTIAL = "adbc.monetdb.ingest_partial"
     INGEST_ATOMICITY = "adbc.monetdb.ingest_atomicity"
     CONSTRAINED_APPEND = "adbc.monetdb.constrained_append"
     INGEST_STATS = "adbc.monetdb.ingest_stats"
     READ_STATS = "adbc.monetdb.read_stats"
+    PREPARE_STATUS = "adbc.monetdb.prepare_status"
     BIND_BY_NAME = "adbc.monetdb.bind_by_name"
 
 
@@ -100,6 +104,7 @@ DatabaseOptionValues = TypedDict(
         "adbc.monetdb.write_window_bytes": str | int,
         "adbc.monetdb.ingest_insert_rows": str | int,
         "adbc.monetdb.prepared_cache_capacity": str | int,
+        "adbc.monetdb.prepare_threshold": str | int,
         "adbc.monetdb.wire_compression": Literal["none", "auto", "lz4"],
         "adbc.monetdb.constrained_append": Literal["auto", "direct"],
     },
@@ -118,6 +123,7 @@ ConnectionOptionValues = TypedDict(
         "adbc.monetdb.write_window_bytes": str | int,
         "adbc.monetdb.ingest_insert_rows": str | int,
         "adbc.monetdb.prepared_cache_capacity": str | int,
+        "adbc.monetdb.prepare_threshold": str | int,
         "adbc.monetdb.wire_compression": Literal["none", "auto", "lz4"],
         "adbc.monetdb.ingest_partial": Literal["block", "allow"],
         "adbc.monetdb.ingest_atomicity": Literal["transaction", "savepoint"],
@@ -137,6 +143,7 @@ StatementOptionValues = TypedDict(
         "adbc.monetdb.write_batch_rows": str | int,
         "adbc.monetdb.write_window_bytes": str | int,
         "adbc.monetdb.ingest_insert_rows": str | int,
+        "adbc.monetdb.prepare_threshold": str | int,
         "adbc.monetdb.wire_compression": Literal["none", "auto", "lz4"],
         "adbc.monetdb.ingest_partial": Literal["block", "allow"],
         "adbc.monetdb.ingest_atomicity": Literal["transaction", "savepoint"],

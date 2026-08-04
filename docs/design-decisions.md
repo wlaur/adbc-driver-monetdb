@@ -283,13 +283,34 @@ requirements change their premises.
   deliberately left at the `PREPARE` type instead of guessing. Exact restoration in that case
   would require server metadata or a SQL parser, and the catalog lookup is the necessary extra
   round trip for accurate unambiguous declarations.
-- MonetDB's `PREPARE` implementation has one family of parameter-position and type-propagation
-  limitations. Its server source reports these as an unknown argument or result type, a parameter
-  in a disallowed position, or a parameter type that cannot be propagated through a set relation.
-  The driver classifies that source-defined family and uses its existing typed literal renderer for
-  the statement. Unrelated `42000` diagnostics still fail during preparation. This keeps the
-  fallback independent of query generators, and a server version that accepts a prepared form
-  automatically returns to the cached path.
+- MonetDB's `PREPARE` implementation rejects valid parameterized SQL in several parameter
+  positions and can add or change diagnostics as its type propagator evolves. Diagnostic text is
+  therefore not a stable capability boundary. Any completed server SQL diagnostic from `PREPARE`
+  selects the typed-literal path; transport, timeout, and cancellation failures remain terminal.
+  An invalid statement still fails when the rendered SQL is prepared or executed. If a NULL-only
+  schema probe cannot establish that distinction, the original `PREPARE` diagnostic is returned;
+  if concrete execution fails, its diagnostic remains primary and the prepare diagnostic is
+  attached as `adbc.monetdb.prepare_error` detail.
+- The connection's single bounded LRU stores deferred templates, accepted prepared handles, and
+  rejected literal templates. The default prepare threshold is two executions: a one-row
+  parameterized statement executes once as a typed literal, the second execution probes PREPARE,
+  and later executions reuse an accepted plan. Threshold zero stays literal and threshold one
+  preserves eager prepare;
+  explicit schema introspection and multi-row updates force preparation. Reuse count is the only
+  heuristic because SQL length does not predict future reuse. A rejected SQL shape pays the server
+  probe once, including across new statements, and a server version that later accepts the shape
+  returns to the prepared path after normal cache invalidation. `adbc.monetdb.prepare_status`
+  exposes the selected path, original diagnostic, and negative-cache hit without making the
+  diagnostic classifier part of the public contract.
+- Literal-template rendering casts Arrow `Int8`, `Int16`, `Int32`, `Int64`, and `Float32` values to
+  the SQL type supplied by the shared Arrow-to-MonetDB mapping. This preserves the bound Arrow
+  schema when the concrete value or a NULL would otherwise let MonetDB choose a wider or unknown
+  result type. Prepared `EXECUTE` arguments stay uncast because the server already has their
+  declared parameter types.
+- PREPARE metadata is split using MonetDB's structural marker: parameter rows have SQL NULL in the
+  column-name field and follow result rows. The SQL lexer count is retained only in diagnostics for
+  malformed server metadata, not used as the split boundary. This follows MonetDB's
+  `sql/backends/monet5/sql_result.c` producer and `clients/odbc/driver/SQLPrepare.c` consumer.
 - On the documented 200-query workload, new-cursor execution fell from 1.944 to 0.342 ms per
   statement. Cache lookup, LRU maintenance, and invalidation bookkeeping added about 0.010 ms over
   the cache-only path and kept the result below the 0.50 ms acceptance threshold.

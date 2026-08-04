@@ -243,6 +243,12 @@ timeout. Use `adbc_cancel()` when session destruction is intended, or set
 overlap. After a read, the read-only statement option `adbc.monetdb.read_stats` reports the chosen
 budget, row and byte counts per window, observed row widths, prefetch use, and buffer reuse as JSON.
 
+Arrow consumers retain about one result-sized set of buffers through `fetch_arrow_table` or
+`fetch_record_batch`. Converting a multi-chunk table to Polars with its default `rechunk=True`
+adds a full-size transient copy, so the fetch-then-convert path can briefly hold about twice the
+result size. `pl.from_arrow(table, rechunk=False)` avoids that copy for numeric columns; string
+conversion may still allocate. Rechunking is Polars behavior, not a driver option.
+
 Appending to an existing table matches stream columns to destination columns by name,
 case-insensitively, on every route and at every stream size. Exact spelling wins when a quoted
 destination has columns that differ only by case. The stream may therefore present its columns in
@@ -436,25 +442,39 @@ its WAL. The default `"transaction"` scope avoids that amplification and blocks 
 partial client-side failure. Setting `adbc.monetdb.ingest_partial` to `"allow"` permits committing
 completed windows after such a failure; the default `"block"` is the safe behavior.
 
-Positional prepared statements are cached per connection by exact SQL text, so consumers such as
-SQLAlchemy can create a fresh cursor for each execution without making MonetDB compile the same
-plan again. The least-recently-used cache holds 512 plans by default; set
+Positional statement outcomes are cached per connection by normalized SQL text, so consumers such as
+SQLAlchemy can create a fresh cursor for each execution without losing reuse information. A
+one-row parameterized statement executes once through the typed-literal path; the second execution
+attempts PREPARE and later executions reuse the plan. This avoids the extra PREPARE round trip for one-off
+queries while retaining almost all of the benefit for loops. Set `adbc.monetdb.prepare_threshold`
+to `1` to prepare immediately or `0` to keep using typed literals. Explicit parameter/result
+schema introspection and multi-row updates prepare immediately. The least-recently-used cache
+holds 512 outcomes by default; set
 `adbc.monetdb.prepared_cache_capacity` as a database/connection option or
 `prepared_cache_capacity` in the URI when a workload needs a different positive bound. Eviction
 queues server-side deallocation, and closing the connection releases the session and every
 remaining plan.
-Whitespace variants are intentionally different keys. Schema-changing statements issued through
+Internal whitespace variants are intentionally different keys; outer whitespace and a trailing
+semicolon are normalized. Schema-changing statements issued through
 the connection invalidate the cache, and externally invalidated plans are prepared again and
 retried once when MonetDB can recover without rolling back user work. MonetDB aborts an explicit
 transaction when `EXECUTE` reports a missing prepared plan, so a stale plan in that state follows
 the normal database-error contract: roll back before retrying. One-row bound DML executes directly;
 multi-row bound DML retains a savepoint so the whole parameter batch remains atomic.
-When MonetDB cannot infer parameter or result types during `PREPARE`, the driver uses its typed
-literal-binding path for that statement. This includes the server's general diagnostics for
-untyped arguments and results, disallowed parameter positions, and parameters whose types cannot
-be propagated through set relations. The fallback applies to the diagnostic family defined by
-MonetDB rather than particular SQL constructs, and safely quotes values according to their Arrow
-types.
+When a statement reaches its threshold and MonetDB refuses to `PREPARE` it with a server SQL
+diagnostic, the driver keeps using
+its typed literal-binding path for that statement. The decision depends on the PREPARE outcome,
+not diagnostic wording; transport, timeout, and cancellation errors never fall back. The first
+refusal and the compiled placeholder template share the connection's LRU with successful plans,
+so later executions skip the doomed PREPARE. Schema-changing SQL clears both outcomes. Integer and
+`Float32` literals are cast to the canonical MonetDB type derived from the bound Arrow field, which
+keeps fallback result schemas independent of values. Values are still quoted and encoded by type,
+not interpolated as user text.
+
+The read-only statement option `adbc.monetdb.prepare_status` returns JSON with `path`
+(`prepared` or `literal`), `original_diagnostic`, and `negative_cache_hit`. If literal execution
+fails, its server error remains primary and the original PREPARE diagnostic is attached as the
+binary error detail `adbc.monetdb.prepare_error`.
 
 `dbapi.Binary` accepts bytes-like values (`bytes`, `bytearray`, and `memoryview`) and returns
 `bytes`. Text is rejected with `TypeError`; encode text explicitly before binding it as binary.
@@ -477,15 +497,16 @@ measurement; statement scope is preferable when one operation is exceptional.
 | `ingest_atomicity` | `transaction` | connection, statement | Use `savepoint` for direct unconstrained appends when preserving prior caller work outweighs MonetDB WAL amplification |
 | `ingest_partial` | `block` | connection, statement | Use `allow` only when committing completed direct target windows after a producer failure is intentional |
 | `prepared_cache_capacity` | 512 | database, connection, URI | Adjust for a measured working set of distinct prepared SQL statements |
+| `prepare_threshold` | 2 | database, connection, statement, URI | Use `1` for known-reused SQL or `0` to keep all parameter execution on typed literals |
 | `bind_by_name` | `false` | statement | Enable for Arrow parameters whose fields map to named `:parameter` slots; DB-API dictionaries do this automatically |
 
 ## Performance expectations
 
 The Arrow-native path is designed for columnar reads and bulk ingestion. A one-row parameterized
-DML execution takes the direct prepared-statement path; parameter batches with two or more rows
-use a savepoint so the complete batch stays atomic. The login keeps MonetDB's normal inline reply
-window, so small result sets are decoded from the initial response instead of forcing another
-fetch.
+DML execution follows the connection's prepare threshold; parameter batches with two or more rows
+prepare immediately and use a savepoint so the complete batch stays atomic. The login keeps
+MonetDB's normal inline reply window, so small result sets are decoded from the initial response
+instead of forcing another fetch.
 
 Very small queries can still be slower than pymonetdb. pymonetdb returns Python tuples directly,
 whereas an ADBC query must build an Arrow schema and buffers across the native boundary before the
@@ -520,7 +541,7 @@ close that connection and open another one before issuing more work.
 Client information is sent at login by default. The `client` value in
 [`sys.sessions`](https://www.monetdb.org/documentation-Dec2025/user-guide/sql-catalog/users-roles-privileges-sessions/)
 identifies this driver and its protocol library, for example
-`adbc_driver_monetdb 0.11.4 / monetdb-rust 0.2.2-wlaur.1`. The Python shim uses the basename of
+`adbc_driver_monetdb 0.12.0 / monetdb-rust 0.2.2-wlaur.1`. The Python shim uses the basename of
 `sys.argv[0]` as the default `application`. Hostname and process id are also sent by default, as
 they are by pymonetdb and libmapi; use `client_info=false` if that host metadata should not leave
 the client.
@@ -616,10 +637,14 @@ conversion error instead of silently changing the public Arrow type. Cast those 
 `VARCHAR` in SQL when their full textual representation is required.
 
 MonetDB `JSON` query results use Arrow's canonical
-[`arrow.json`](https://arrow.apache.org/docs/format/CanonicalExtensions.html#json) extension with
-UTF-8 string storage. Under the supported storage policy, Polars loads it as `pl.String`; the
-driver does not expand it to `pl.Struct` because one JSON column can contain objects, arrays,
-scalars, and JSON `null` with different shapes. Applications that know an object schema can opt in:
+[`arrow.json`](https://arrow.apache.org/docs/format/CanonicalExtensions.html#json) extension. This
+means the Arrow field carries extension metadata identifying JSON while each value remains
+physical UTF-8 text; it does not mean the driver has converted the column to an Arrow `Struct`.
+Arrow-aware consumers can preserve that JSON identity, while consumers that do not interpret the
+extension can use its string storage. Polars 1.x exposes that storage as `pl.String` and may warn
+about the unknown extension unless its extension policy is configured. Keeping string storage is
+necessary because one MonetDB JSON column can contain objects, arrays, scalars, and JSON `null`
+with different shapes. Applications that know an object schema can opt in:
 
 ```python
 decoded = df.with_columns(
