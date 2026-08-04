@@ -260,6 +260,12 @@ def test_failed_authentication_does_not_poison_driver(monetdb_uri: str) -> None:
 @pytest.mark.integration
 def test_non_binary_type_error_recommends_cast(monetdb_uri: str) -> None:
     with dbapi.connect(monetdb_uri) as conn:
+        geometry_functions = conn.execute(
+            "SELECT COUNT(*) FROM sys.functions WHERE lower(name) = 'st_point'"
+        ).fetchone()
+        assert geometry_functions is not None
+        if geometry_functions[0] == 0:
+            pytest.skip("MonetDB geometry module is not available")
         with pytest.raises(
             adbc_driver_manager.DataError,
             match=r"GEOMETRY.*cast the column to VARCHAR",
@@ -609,6 +615,36 @@ def test_prepare_type_inference_rejection_falls_back_to_literals(
             assert cursor.adbc_prepare(query) is not None
             cursor.execute(query, parameters)
             assert cursor.fetchall() == expected
+
+
+@pytest.mark.integration
+def test_literal_fallback_supports_bound_limit_and_offset(monetdb_uri: str) -> None:
+    source = """
+        SELECT source."time", source.total
+        FROM (
+            SELECT TIMESTAMP '2024-03-01 00:00:00' AS "time", ? AS total
+        ) AS source
+        WHERE source."time" <= ? AND source."time" >= ?
+        ORDER BY source.total DESC
+    """
+    queries = [
+        (f'SELECT limited."time", limited.total FROM ({source} LIMIT ? OFFSET ?) AS limited', (1, 0)),
+        (
+            f'SELECT limited."time", limited.total FROM ({source} OFFSET ? ROWS FETCH NEXT ? ROWS ONLY) AS limited',
+            (0, 1),
+        ),
+    ]
+    with dbapi.connect(monetdb_uri) as connection, connection.cursor() as cursor:
+        for query, row_limit_parameters in queries:
+            parameters = (
+                42,
+                datetime(2024, 3, 11, 22),
+                datetime(2024, 2, 10, 22),
+                *row_limit_parameters,
+            )
+            for _ in range(3):
+                cursor.execute(query, parameters)
+                assert cursor.fetchone() == (datetime(2024, 3, 1), 42)
 
 
 @pytest.mark.integration
