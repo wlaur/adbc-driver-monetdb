@@ -447,8 +447,9 @@ SQLAlchemy can create a fresh cursor for each execution without losing reuse inf
 one-row parameterized statement executes once through the typed-literal path; the second execution
 attempts PREPARE and later executions reuse the plan. This avoids the extra PREPARE round trip for one-off
 queries while retaining almost all of the benefit for loops. Set `adbc.monetdb.prepare_threshold`
-to `1` to prepare immediately or `0` to keep using typed literals. Explicit parameter/result
-schema introspection and multi-row updates prepare immediately. The least-recently-used cache
+to `1` to prepare immediately or `0` to keep every execution on typed literals. Explicit
+parameter/result schema introspection and multi-row updates prepare immediately regardless of the
+threshold; a one-row bound update follows it like any other execution. The least-recently-used cache
 holds 512 outcomes by default; set
 `adbc.monetdb.prepared_cache_capacity` as a database/connection option or
 `prepared_cache_capacity` in the URI when a workload needs a different positive bound. Eviction
@@ -464,12 +465,16 @@ multi-row bound DML retains a savepoint so the whole parameter batch remains ato
 When a statement reaches its threshold and MonetDB refuses to `PREPARE` it with a server SQL
 diagnostic, the driver keeps using
 its typed literal-binding path for that statement. The decision depends on the PREPARE outcome,
-not diagnostic wording; transport, timeout, and cancellation errors never fall back. The first
-refusal and the compiled placeholder template share the connection's LRU with successful plans,
-so later executions skip the doomed PREPARE. Schema-changing SQL clears both outcomes. Integer and
-`Float32` literals are cast to the canonical MonetDB type derived from the bound Arrow field, which
-keeps fallback result schemas independent of values. Values are still quoted and encoded by type,
-not interpolated as user text.
+not diagnostic wording; transport, timeout, and cancellation errors never fall back. Neither do
+connection-state diagnostics — an aborted transaction, a serialization conflict, or server resource
+exhaustion fails that execution and leaves nothing cached, so a later execution probes again
+instead of pinning the connection to literals. The first refusal and the compiled placeholder
+template share the connection's LRU with successful plans, so later executions skip the doomed
+PREPARE. Schema-changing SQL clears both outcomes. Numeric literals are cast to the canonical
+MonetDB type derived from the bound Arrow field, which keeps fallback result schemas independent of
+values; a parameter in a row-count position (`LIMIT`, `OFFSET`, `FETCH FIRST`/`NEXT`, `SAMPLE`,
+`SEED`) renders as a bare integer instead, because MonetDB's grammar accepts no expression there.
+Values are still quoted and encoded by type, not interpolated as user text.
 
 The read-only statement option `adbc.monetdb.prepare_status` returns JSON with `path`
 (`prepared` or `literal`), `original_diagnostic`, and `negative_cache_hit`. If literal execution
@@ -497,7 +502,7 @@ measurement; statement scope is preferable when one operation is exceptional.
 | `ingest_atomicity` | `transaction` | connection, statement | Use `savepoint` for direct unconstrained appends when preserving prior caller work outweighs MonetDB WAL amplification |
 | `ingest_partial` | `block` | connection, statement | Use `allow` only when committing completed direct target windows after a producer failure is intentional |
 | `prepared_cache_capacity` | 512 | database, connection, URI | Adjust for a measured working set of distinct prepared SQL statements |
-| `prepare_threshold` | 2 | database, connection, statement, URI | Use `1` for known-reused SQL or `0` to keep all parameter execution on typed literals |
+| `prepare_threshold` | 2 | database, connection, statement, URI | Use `1` for known-reused SQL or `0` to keep every parameter execution on typed literals; explicit schema introspection and multi-row updates still prepare |
 | `bind_by_name` | `false` | statement | Enable for Arrow parameters whose fields map to named `:parameter` slots; DB-API dictionaries do this automatically |
 
 ## Performance expectations
@@ -541,7 +546,7 @@ close that connection and open another one before issuing more work.
 Client information is sent at login by default. The `client` value in
 [`sys.sessions`](https://www.monetdb.org/documentation-Dec2025/user-guide/sql-catalog/users-roles-privileges-sessions/)
 identifies this driver and its protocol library, for example
-`adbc_driver_monetdb 0.12.1 / monetdb-rust 0.2.2-wlaur.1`. The Python shim uses the basename of
+`adbc_driver_monetdb 0.12.2 / monetdb-rust 0.2.2-wlaur.1`. The Python shim uses the basename of
 `sys.argv[0]` as the default `application`. Hostname and process id are also sent by default, as
 they are by pymonetdb and libmapi; use `client_info=false` if that host metadata should not leave
 the client.

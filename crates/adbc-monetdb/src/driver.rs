@@ -24,8 +24,8 @@ use adbc_core::{
     Connection, Database, Driver, Optionable, PartitionedResult, Statement, StatementResult,
 };
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Int64Array, RecordBatch, RecordBatchReader, StringArray,
-    UInt32Array, UnionArray, new_empty_array,
+    Array, ArrayRef, BooleanArray, Int64Array, RecordBatch, RecordBatchIterator, RecordBatchReader,
+    StringArray, UInt32Array, UnionArray, new_empty_array,
 };
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 use arrow_select::concat::concat_batches;
@@ -2033,7 +2033,6 @@ impl Connection for MonetdbConnection {
             prepared_entry: None,
             literal_fallback: None,
             deferred_template: None,
-            unbound_deferred: false,
             prepared_parameter_schema: None,
             prepared_result_schema: None,
             bind_by_name: false,
@@ -2211,7 +2210,6 @@ pub struct MonetdbStatement {
     prepared_entry: Option<PreparedSlot>,
     literal_fallback: Option<Arc<LiteralFallback>>,
     deferred_template: Option<Arc<QueryTemplate>>,
-    unbound_deferred: bool,
     prepared_parameter_schema: Option<Schema>,
     prepared_result_schema: Option<Schema>,
     bind_by_name: bool,
@@ -2568,7 +2566,7 @@ impl Statement for MonetdbStatement {
                 {
                     let read_stats = Arc::new(Mutex::new(None));
                     self.read_stats = Some(Arc::clone(&read_stats));
-                    let result = with_bound_query_diagnostic(
+                    let mut result = with_bound_query_diagnostic(
                         query_result_with_timeouts(
                             &self.connection,
                             &query.sql,
@@ -2583,7 +2581,14 @@ impl Statement for MonetdbStatement {
                         ),
                         &query,
                     )?;
-                    self.prepared_result_schema = Some(result.reader.schema().as_ref().clone());
+                    let schema = result.reader.schema();
+                    if !schema.fields().is_empty() {
+                        // The prepared path cannot report a row count for a row-returning
+                        // statement, so the literal path drops its own count instead of letting
+                        // DB-API rowcount flip between identical executions of one statement.
+                        result.rows_affected = None;
+                    }
+                    self.prepared_result_schema = Some(schema.as_ref().clone());
                     return Ok(result);
                 }
                 if self.prepared_result_schema.is_none() {
@@ -2679,7 +2684,8 @@ impl Statement for MonetdbStatement {
             if !self.prepared {
                 self.prepare()?;
             }
-            self.resolve_deferred_for_execution(true)?;
+            let multi_row = self.bound_batch_exceeds_one_row()?;
+            self.resolve_deferred_for_execution(multi_row)?;
             let mut queries = self.take_bound_queries()?;
             let result = execute_updates_atomic(&self.connection, &mut queries, self.timeouts);
             if invalidates_cache {
@@ -2787,15 +2793,6 @@ impl Statement for MonetdbStatement {
     }
 
     fn get_parameter_schema(&self) -> Result<Schema> {
-        if self.unbound_deferred {
-            let query = self
-                .query
-                .as_deref()
-                .ok_or_else(|| error("SQL query is not set", Status::InvalidState))?;
-            let metadata = prepare_query(&self.connection, query, 0, self.timeouts)?;
-            lock_connection(&self.connection)?.try_deallocate(metadata.id);
-            return Ok(metadata.parameters);
-        }
         if let Some(slot) = &self.prepared_entry {
             let query = self
                 .query
@@ -2878,7 +2875,6 @@ impl Statement for MonetdbStatement {
         if parameter_count == 0 {
             self.prepared_parameter_schema = Some(Schema::empty());
             self.prepare_status = Some(PrepareStatus::literal(None, false));
-            self.unbound_deferred = true;
             self.prepared = true;
             return Ok(());
         }
@@ -2965,11 +2961,41 @@ impl MonetdbStatement {
         self.prepared_entry = None;
         self.literal_fallback = None;
         self.deferred_template = None;
-        self.unbound_deferred = false;
         self.prepared_parameter_schema = None;
         self.prepared_result_schema = None;
         self.prepare_status = None;
         self.prepared = false;
+    }
+
+    // Multi-row parameter batches force preparation: one PREPARE amortizes over every row of the
+    // savepoint-wrapped batch. A one-row batch is an ordinary execution and follows the
+    // connection's prepare threshold, so a one-off parameterized DML statement still costs a
+    // single round trip. Deciding that needs the leading rows, which are pushed back so the bound
+    // stream, its schema check, and its row validation all see them again.
+    fn bound_batch_exceeds_one_row(&mut self) -> Result<bool> {
+        let mut reader = self
+            .bound
+            .take()
+            .ok_or_else(|| error("no Arrow parameters are bound", Status::InvalidState))?;
+        let schema = reader.schema();
+        let mut buffered = Vec::new();
+        let mut rows = 0;
+        while rows < 2 {
+            let Some(batch) = reader.next() else {
+                break;
+            };
+            let failed = batch.is_err();
+            rows += batch.as_ref().map_or(0, RecordBatch::num_rows);
+            buffered.push(batch);
+            if failed {
+                break;
+            }
+        }
+        self.bound = Some(Box::new(RecordBatchIterator::new(
+            buffered.into_iter().chain(reader),
+            schema,
+        )));
+        Ok(rows > 1)
     }
 
     fn resolve_deferred_for_execution(&mut self, force: bool) -> Result<()> {
@@ -6558,6 +6584,7 @@ fn prepare_outcome_cached(
                 .insert(query.to_owned(), candidate);
             Ok((PrepareOutcome::Prepared(entry), false))
         }
+        Err(diagnostic) if transient_prepare_diagnostic(&diagnostic) => Err(diagnostic),
         Err(diagnostic) if permits_literal_parameter_fallback(&diagnostic) => {
             let candidate = Arc::new(LiteralFallback {
                 template,
@@ -6579,6 +6606,17 @@ fn permits_literal_parameter_fallback(value: &Error) -> bool {
         || value
             .message
             .starts_with("invalid structural split in PREPARE metadata")
+}
+
+// A refused probe only proves the statement is unpreparable when MonetDB rejected the statement
+// itself. Invalid transaction state (class 25), transaction rollback (class 40), and resource
+// exhaustion (class HY) describe the connection at that moment: an aborted transaction fails the
+// probe's SAVEPOINT before the server ever parses the PREPARE. Those diagnostics stay terminal for
+// the execution that met them, exactly like a transport failure, instead of recording a verdict
+// that would pin a pooled connection to typed literals until it is closed.
+fn transient_prepare_diagnostic(value: &Error) -> bool {
+    let class = [value.sqlstate[0] as u8, value.sqlstate[1] as u8];
+    matches!(&class, b"25" | b"40" | b"HY")
 }
 
 fn prepare_cached(
@@ -8811,6 +8849,48 @@ mod tests {
         }
         assert!(!permits_literal_parameter_fallback(&error(
             "unknown MonetDB prepared type 'future_type'",
+            Status::InvalidData
+        )));
+    }
+
+    #[test]
+    fn keeps_connection_state_diagnostics_out_of_the_negative_cache() {
+        let prepare_error = |message: &str, sqlstate: &str| {
+            let mut value = error(message, Status::InvalidArguments);
+            value.sqlstate = parse_sqlstate(sqlstate).unwrap();
+            value
+        };
+
+        for (message, sqlstate) in [
+            (
+                "SAVEPOINT: (adbc_prepare_probe_1) transaction is aborted",
+                "40000",
+            ),
+            (
+                "COMMIT: transaction is aborted because of concurrency conflicts",
+                "40001",
+            ),
+            ("SAVEPOINT: not allowed in auto commit mode", "25005"),
+            ("Memory allocation failed", "HY013"),
+        ] {
+            let diagnostic = prepare_error(message, sqlstate);
+            assert!(permits_literal_parameter_fallback(&diagnostic));
+            assert!(transient_prepare_diagnostic(&diagnostic));
+        }
+
+        for (message, sqlstate) in [
+            ("Could not determine type for argument number 1", "42000"),
+            (
+                "Cannot have a parameter (?) on both sides of an expression",
+                "22000",
+            ),
+        ] {
+            assert!(!transient_prepare_diagnostic(&prepare_error(
+                message, sqlstate
+            )));
+        }
+        assert!(!transient_prepare_diagnostic(&error(
+            "unknown MonetDB prepared type 'any'",
             Status::InvalidData
         )));
     }
