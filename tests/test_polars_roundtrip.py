@@ -27,6 +27,9 @@ from adbc_driver_monetdb import ConnectionOptions, StatementOptions, dbapi
 
 class _ArrowField(Protocol):
     @property
+    def type(self) -> object: ...
+
+    @property
     def metadata(self) -> dict[bytes, bytes] | None: ...
 
 
@@ -41,6 +44,12 @@ class _ArrowBatch(Protocol):
 class _ArrowTable(Protocol):
     @property
     def schema(self) -> _ArrowSchema: ...
+
+    def column(self, name: str) -> "_ArrowColumn": ...
+
+
+class _ArrowColumn(Protocol):
+    def to_pylist(self) -> list[object]: ...
 
 
 class _PyArrow(Protocol):
@@ -520,6 +529,79 @@ def test_prepare_type_inference_rejection_falls_back_to_literals(
             [42],
             [(42,)],
         ),
+        (
+            "SELECT 'ab' WHERE 'ab' LIKE ? ESCAPE ?",
+            ["a%", "#"],
+            [("ab",)],
+        ),
+        (
+            "SELECT ? IN (?, ?)",
+            [1, 1, 2],
+            [(True,)],
+        ),
+        (
+            "SELECT ? IS NULL, ? IS NOT NULL",
+            [None, "value"],
+            [(True, True)],
+        ),
+        (
+            "SELECT ? BETWEEN ? AND ?",
+            [2, 1, 3],
+            [(True,)],
+        ),
+        (
+            "SELECT ?, CAST(1 AS INT)",
+            [42],
+            [(42, 1)],
+        ),
+        (
+            "VALUES (?)",
+            [42],
+            [(42,)],
+        ),
+        (
+            "SELECT ? UNION SELECT ? ORDER BY 1",
+            [2, 1],
+            [(1,), (2,)],
+        ),
+        (
+            "SELECT COALESCE(?, ?)",
+            [None, "fallback"],
+            [("fallback",)],
+        ),
+        (
+            "SELECT CASE WHEN true THEN ? ELSE ? END",
+            [1, 2],
+            [(1,)],
+        ),
+        (
+            "SELECT * FROM (SELECT ?) AS derived(value)",
+            [42],
+            [(42,)],
+        ),
+        (
+            "SELECT DISTINCT ? FROM (VALUES (1), (2)) AS data(value)",
+            ["same"],
+            [("same",)],
+        ),
+        (
+            "SELECT ?, COUNT(*) FROM (VALUES (1), (2)) AS data(value) GROUP BY ?",
+            ["group", 1],
+            [("group", 2)],
+        ),
+        (
+            "SELECT value FROM (VALUES (2), (1)) AS data(value) ORDER BY ?, value",
+            ["constant"],
+            [(1,), (2,)],
+        ),
+        (
+            (
+                "SELECT value, ROW_NUMBER() OVER (ORDER BY ?, value) "
+                "FROM (VALUES (2), (1)) AS data(value) ORDER BY value"
+            ),
+            ["constant"],
+            [(1, 1), (2, 2)],
+        ),
     ]
 
     with dbapi.connect(monetdb_uri) as conn, conn.cursor() as cursor:
@@ -527,6 +609,110 @@ def test_prepare_type_inference_rejection_falls_back_to_literals(
             assert cursor.adbc_prepare(query) is not None
             cursor.execute(query, parameters)
             assert cursor.fetchall() == expected
+
+
+@pytest.mark.integration
+def test_prepare_outcome_status_negative_cache_and_error_details(monetdb_uri: str) -> None:
+    fallback_query = "SELECT ? IN (?, ?)"
+    with dbapi.connect(monetdb_uri, autocommit=True) as connection:
+        assert connection.adbc_connection.get_option_int(str(ConnectionOptions.PREPARE_THRESHOLD)) == 2
+        with connection.cursor() as first:
+            first.execute(fallback_query, [1, 1, 2])
+            assert first.fetchone() == (True,)
+            status = json.loads(first.adbc_statement.get_option(str(StatementOptions.PREPARE_STATUS)))
+            assert status["path"] == "literal"
+            assert status["negative_cache_hit"] is False
+            assert status["original_diagnostic"] is None
+
+        with connection.cursor() as refused:
+            refused.execute(fallback_query, [2, 1, 2])
+            assert refused.fetchone() == (True,)
+            status = json.loads(refused.adbc_statement.get_option(str(StatementOptions.PREPARE_STATUS)))
+            assert status["path"] == "literal"
+            assert status["negative_cache_hit"] is False
+            assert status["original_diagnostic"]["sqlstate"] == "42000"
+
+        with connection.cursor() as cached:
+            cached.execute(fallback_query, [3, 1, 2])
+            assert cached.fetchone() == (False,)
+            status = json.loads(cached.adbc_statement.get_option(str(StatementOptions.PREPARE_STATUS)))
+            assert status["path"] == "literal"
+            assert status["negative_cache_hit"] is True
+
+        prepared_query = "SELECT CAST(? AS INT)"
+        with connection.cursor() as initial:
+            initial.execute(prepared_query, [41])
+            assert initial.fetchone() == (41,)
+            status = json.loads(initial.adbc_statement.get_option(str(StatementOptions.PREPARE_STATUS)))
+            assert status["path"] == "literal"
+        with connection.cursor() as prepared:
+            prepared.execute(prepared_query, [42])
+            assert prepared.fetchone() == (42,)
+            status = json.loads(prepared.adbc_statement.get_option(str(StatementOptions.PREPARE_STATUS)))
+            assert status == {
+                "path": "prepared",
+                "original_diagnostic": None,
+                "negative_cache_hit": False,
+            }
+
+        with connection.cursor(adbc_stmt_kwargs={StatementOptions.PREPARE_THRESHOLD: 0}) as never:
+            for value in (1, 2):
+                never.execute("SELECT CAST(? AS BIGINT) + 987654321", [value])
+                assert never.fetchone() == (value + 987654321,)
+                status = json.loads(never.adbc_statement.get_option(str(StatementOptions.PREPARE_STATUS)))
+                assert status["path"] == "literal"
+
+        with connection.cursor(adbc_stmt_kwargs={StatementOptions.PREPARE_THRESHOLD: 1}) as immediate:
+            immediate.execute("SELECT CAST(? AS BIGINT) + 123456789", [1])
+            assert immediate.fetchone() == (123456790,)
+            status = json.loads(immediate.adbc_statement.get_option(str(StatementOptions.PREPARE_STATUS)))
+            assert status["path"] == "prepared"
+
+        for query, sqlstate in (
+            ("SELCT ?", "42000"),
+            ("SELECT ? FROM prepare_outcome_missing_table", "42S02"),
+        ):
+            with (
+                connection.cursor(adbc_stmt_kwargs={StatementOptions.PREPARE_THRESHOLD: 1}) as broken,
+                pytest.raises(adbc_driver_manager.ProgrammingError) as caught,
+            ):
+                broken.execute(query, [42])
+            details = cast("dict[bytes, bytes]", dict(caught.value.details or []))
+            diagnostic = json.loads(details[b"adbc.monetdb.prepare_error"])
+            assert diagnostic["sqlstate"] == sqlstate
+            assert diagnostic["message"]
+
+        with (
+            connection.cursor() as unparameterized,
+            pytest.raises(adbc_driver_manager.ProgrammingError, match="syntax error"),
+        ):
+            unparameterized.adbc_prepare("SELCT 1")
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("polars_type", "arrow_type", "values"),
+    [
+        (pl.Int8, pa.int8(), [1, None, 2]),
+        (pl.Int16, pa.int16(), [42, None, 300]),
+        (pl.Int32, pa.int32(), [42, None, 70_000]),
+        (pl.Int64, pa.int64(), [42, 300, 5_000_000_000]),
+        (pl.Float32, pa.float32(), [1.5, None, 2.5]),
+        (pl.Float64, pa.float64(), [1.5, None, 2.5]),
+    ],
+)
+def test_literal_fallback_pins_numeric_result_schema(
+    monetdb_uri: str,
+    polars_type: type[pl.DataType],
+    arrow_type: object,
+    values: list[int | float | None],
+) -> None:
+    parameters = pl.DataFrame({"0": pl.Series("0", values, dtype=polars_type)})
+    with dbapi.connect(monetdb_uri) as connection, connection.cursor() as cursor:
+        cursor.execute("SELECT ? AS value", parameters)
+        table = cast(_ArrowTable, cursor.fetch_arrow_table())
+    assert table.schema.field("value").type == arrow_type
+    assert table.column("value").to_pylist() == values
 
 
 @pytest.mark.integration
@@ -683,7 +869,13 @@ def test_cached_prepared_statement_recovers_after_same_connection_ddl(
 ) -> None:
     table = "prepared_cache_ddl"
     query = f"SELECT value FROM {table} WHERE id = ?"
-    with dbapi.connect(monetdb_uri) as conn, conn.cursor() as cursor:
+    with (
+        dbapi.connect(
+            monetdb_uri,
+            conn_kwargs={ConnectionOptions.PREPARE_THRESHOLD: "1"},
+        ) as conn,
+        conn.cursor() as cursor,
+    ):
         try:
             cursor.execute(f"DROP TABLE IF EXISTS {table}")
             cursor.execute(f"CREATE TABLE {table}(id INTEGER, value INTEGER)")
@@ -702,6 +894,26 @@ def test_cached_prepared_statement_recovers_after_same_connection_ddl(
         finally:
             cursor.execute(f"DROP TABLE IF EXISTS {table}")
             conn.commit()
+
+
+@pytest.mark.integration
+def test_bound_call_invalidates_prepared_outcome_cache(monetdb_uri: str) -> None:
+    with (
+        dbapi.connect(
+            monetdb_uri,
+            autocommit=True,
+            conn_kwargs={ConnectionOptions.PREPARE_THRESHOLD: "1"},
+        ) as conn,
+        conn.cursor() as cursor,
+    ):
+        cursor.execute("SELECT CAST(? AS INT)", [1])
+        assert cursor.fetchone() == (1,)
+        cursor.execute("SELECT COUNT(*) FROM sys.prepared_statements")
+        assert cursor.fetchone() == (1,)
+
+        cursor.execute("CALL sys.setclientinfo('ClientRemark', ?)", ["bound-call"])
+        cursor.execute("SELECT COUNT(*) FROM sys.prepared_statements")
+        assert cursor.fetchone() == (0,)
 
 
 @pytest.mark.integration
@@ -784,7 +996,10 @@ def test_prepared_statement_cache_is_lru_bounded(monetdb_uri: str) -> None:
     with dbapi.connect(
         monetdb_uri,
         autocommit=True,
-        conn_kwargs={ConnectionOptions.PREPARED_CACHE_CAPACITY: "128"},
+        conn_kwargs={
+            ConnectionOptions.PREPARED_CACHE_CAPACITY: "128",
+            ConnectionOptions.PREPARE_THRESHOLD: "1",
+        },
     ) as conn:
         for value in range(128):
             with conn.cursor() as cursor:
@@ -895,9 +1110,11 @@ def test_multi_statement_queries_are_rejected_and_update_scripts_are_split_safel
             cursor.execute("SELECT value FROM injection_multi_guard ORDER BY value")
             assert cursor.fetchall() == [(1,), (2,), (3,)]
 
-            cursor.adbc_statement.set_sql_query("SELECT ? AS value")
+            cursor.adbc_statement.set_sql_query("SELECT CAST(? AS INT) AS value")
             cursor.adbc_statement.bind(pa.record_batch({"0": [1, 2, 3]}))
             assert cursor.adbc_statement.execute_update() == -1
+            status = json.loads(cursor.adbc_statement.get_option(str(StatementOptions.PREPARE_STATUS)))
+            assert status["path"] == "prepared"
         finally:
             cursor.execute("DROP TABLE IF EXISTS injection_multi_guard")
 
@@ -939,11 +1156,11 @@ def test_prepare_sql_cannot_be_smuggled_through_execute_update(monetdb_uri: str)
 
 
 @pytest.mark.integration
-def test_failed_prepare_recovers_user_transaction(monetdb_uri: str) -> None:
+def test_failed_prepare_fallback_preserves_user_transaction(monetdb_uri: str) -> None:
     with dbapi.connect(monetdb_uri, autocommit=False) as conn, conn.cursor() as cursor:
-        cursor.adbc_statement.set_sql_query("SELECT ? +")
-        with pytest.raises(adbc_driver_manager.Error):
-            cursor.adbc_statement.prepare()
+        cursor.adbc_statement.set_options(**{str(StatementOptions.PREPARE_THRESHOLD): "1"})
+        cursor.execute("SELECT ? IN (?, ?)", [1, 1, 2])
+        assert cursor.fetchone() == (True,)
         cursor.execute("SELECT 42")
         assert cursor.fetchone() == (42,)
         conn.rollback()

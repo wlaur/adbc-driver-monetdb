@@ -40,7 +40,7 @@ mod metadata;
 mod parameters;
 use metadata::{like_pattern_matches, load_objects, objects_batch, table_schema};
 use parameters::{
-    ParameterLayout, QueryTemplate, parameter_layout, render_arguments, render_null_parameters,
+    ParameterLayout, QueryTemplate, parameter_layout, parameterized_statements, render_arguments,
     unbound_statements,
 };
 
@@ -67,6 +67,7 @@ const INGEST_RESERVATION_SOURCE_BYTES: usize = 64 * 1024 * 1024;
 const PENDING_BATCH_COMPACTION_FANOUT: usize = 32;
 const PENDING_BATCH_COMPACTION_MAX_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_PREPARED_CACHE_CAPACITY: usize = 512;
+const DEFAULT_PREPARE_THRESHOLD: usize = 2;
 const ADAPTIVE_NETWORK_RTT: Duration = Duration::from_micros(500);
 const REMOTE_WRITE_WINDOW_RTT: Duration = Duration::from_millis(5);
 const INSERT_VALUE_ENCODE_MICROS: u128 = 2;
@@ -83,12 +84,14 @@ const WRITE_BATCH_ROWS_OPTION: &str = "adbc.monetdb.write_batch_rows";
 const WRITE_WINDOW_BYTES_OPTION: &str = "adbc.monetdb.write_window_bytes";
 const INGEST_INSERT_ROWS_OPTION: &str = "adbc.monetdb.ingest_insert_rows";
 const PREPARED_CACHE_CAPACITY_OPTION: &str = "adbc.monetdb.prepared_cache_capacity";
+const PREPARE_THRESHOLD_OPTION: &str = "adbc.monetdb.prepare_threshold";
 const WIRE_COMPRESSION_OPTION: &str = "adbc.monetdb.wire_compression";
 const INGEST_PARTIAL_OPTION: &str = "adbc.monetdb.ingest_partial";
 const INGEST_ATOMICITY_OPTION: &str = "adbc.monetdb.ingest_atomicity";
 const CONSTRAINED_APPEND_OPTION: &str = "adbc.monetdb.constrained_append";
 const INGEST_STATS_OPTION: &str = "adbc.monetdb.ingest_stats";
 const READ_STATS_OPTION: &str = "adbc.monetdb.read_stats";
+const PREPARE_STATUS_OPTION: &str = "adbc.monetdb.prepare_status";
 const BIND_BY_NAME_OPTION: &str = "adbc.monetdb.bind_by_name";
 const DRIVER_MANAGER_BIND_BY_NAME_OPTION: &str = "adbc.statement.bind_by_name";
 const CONNECT_TIMEOUT_OPTION: &str = "adbc.monetdb.connect_timeout_seconds";
@@ -99,6 +102,7 @@ const CLIENT_APPLICATION_OPTION: &str = "adbc.monetdb.client_application";
 const CLIENT_REMARK_OPTION: &str = "adbc.monetdb.client_remark";
 const CLIENT_INFO_OPTION: &str = "adbc.monetdb.client_info";
 const TERMINAL_ERROR_DETAIL: &str = "adbc.monetdb.connection_terminal";
+const PREPARE_ERROR_DETAIL: &str = "adbc.monetdb.prepare_error";
 const MINIMUM_VERSION: (u16, u16, u16) = (11, 55, 0);
 const LOCAL_TEMP_STAGING_MINIMUM_VERSION: (u16, u16, u16) = (11, 55, 7);
 static SAVEPOINT_ID: AtomicU64 = AtomicU64::new(0);
@@ -130,6 +134,7 @@ const URI_QUERY_KEYS: &[&str] = &[
     "write_window_bytes",
     "ingest_insert_rows",
     "prepared_cache_capacity",
+    "prepare_threshold",
     "wire_compression",
     "constrained_append",
 ];
@@ -140,6 +145,7 @@ fn tuning_option_from_uri_key(key: &str) -> Option<&'static str> {
         "write_window_bytes" => Some(WRITE_WINDOW_BYTES_OPTION),
         "ingest_insert_rows" => Some(INGEST_INSERT_ROWS_OPTION),
         "prepared_cache_capacity" => Some(PREPARED_CACHE_CAPACITY_OPTION),
+        "prepare_threshold" => Some(PREPARE_THRESHOLD_OPTION),
         "wire_compression" => Some(WIRE_COMPRESSION_OPTION),
         "constrained_append" => Some(CONSTRAINED_APPEND_OPTION),
         _ => None,
@@ -152,6 +158,7 @@ fn tuning_uri_key(option: &str) -> Option<&'static str> {
         WRITE_WINDOW_BYTES_OPTION => Some("write_window_bytes"),
         INGEST_INSERT_ROWS_OPTION => Some("ingest_insert_rows"),
         PREPARED_CACHE_CAPACITY_OPTION => Some("prepared_cache_capacity"),
+        PREPARE_THRESHOLD_OPTION => Some("prepare_threshold"),
         WIRE_COMPRESSION_OPTION => Some("wire_compression"),
         CONSTRAINED_APPEND_OPTION => Some("constrained_append"),
         _ => None,
@@ -176,6 +183,9 @@ fn validate_tuning_option(key: &str, value: &OptionValue) -> Result<()> {
                     Status::InvalidArguments,
                 ));
             }
+        }
+        PREPARE_THRESHOLD_OPTION => {
+            nonnegative_usize_option(key, value)?;
         }
         WIRE_COMPRESSION_OPTION => {
             WireCompression::parse(value)?;
@@ -658,6 +668,15 @@ fn error(message: impl Into<String>, status: Status) -> Error {
     Error::with_message_and_status(message, status)
 }
 
+fn attach_error_detail(mut value: Error, key: &str, detail: Vec<u8>) -> Error {
+    value.vendor_code = adbc_core::constants::ADBC_ERROR_VENDOR_CODE_PRIVATE_DATA;
+    value
+        .details
+        .get_or_insert_with(Vec::new)
+        .push((key.to_owned(), detail));
+    value
+}
+
 fn not_implemented(what: &str) -> Error {
     error(
         format!("adbc-monetdb: {what} is not implemented"),
@@ -769,6 +788,10 @@ fn invalidate_prepared_cache(connection: &DriverConnection, prepared_cache: &Sha
     connection
         .prepared_generation
         .fetch_add(1, Ordering::AcqRel);
+    clear_prepared_cache(prepared_cache);
+}
+
+fn clear_prepared_cache(prepared_cache: &SharedPreparedCache) {
     prepared_cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -808,10 +831,64 @@ fn map_cursor_error(value: CursorError) -> Error {
         result.sqlstate = sqlstate;
     }
     if terminal {
-        result.vendor_code = adbc_core::constants::ADBC_ERROR_VENDOR_CODE_PRIVATE_DATA;
-        result.details = Some(vec![(TERMINAL_ERROR_DETAIL.to_owned(), b"true".to_vec())]);
+        result = attach_error_detail(result, TERMINAL_ERROR_DETAIL, b"true".to_vec());
     }
     result
+}
+
+fn sqlstate_string(value: &Error) -> Option<String> {
+    value
+        .sqlstate
+        .iter()
+        .any(|character| *character != 0)
+        .then(|| {
+            value
+                .sqlstate
+                .iter()
+                .map(|character| *character as u8 as char)
+                .collect()
+        })
+}
+
+fn json_string(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len() + 2);
+    encoded.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => encoded.push_str("\\\""),
+            '\\' => encoded.push_str("\\\\"),
+            '\n' => encoded.push_str("\\n"),
+            '\r' => encoded.push_str("\\r"),
+            '\t' => encoded.push_str("\\t"),
+            character if character.is_control() => {
+                use std::fmt::Write as _;
+                write!(encoded, "\\u{:04x}", u32::from(character))
+                    .expect("writing to a String cannot fail");
+            }
+            character => encoded.push(character),
+        }
+    }
+    encoded.push('"');
+    encoded
+}
+
+fn diagnostic_json(value: &Error) -> String {
+    let sqlstate = sqlstate_string(value)
+        .as_deref()
+        .map(json_string)
+        .unwrap_or_else(|| "null".to_owned());
+    format!(
+        "{{\"message\":{},\"sqlstate\":{sqlstate}}}",
+        json_string(&value.message)
+    )
+}
+
+fn attach_prepare_diagnostic(execution: Error, prepare: &Error) -> Error {
+    attach_error_detail(
+        execution,
+        PREPARE_ERROR_DETAIL,
+        diagnostic_json(prepare).into_bytes(),
+    )
 }
 
 fn sqlstate_status(sqlstate: Option<&str>, message: &str) -> Status {
@@ -1019,6 +1096,7 @@ impl Optionable for MonetdbDatabase {
                     PREPARED_CACHE_CAPACITY_OPTION => {
                         return Ok(DEFAULT_PREPARED_CACHE_CAPACITY.to_string());
                     }
+                    PREPARE_THRESHOLD_OPTION => return Ok(DEFAULT_PREPARE_THRESHOLD.to_string()),
                     WIRE_COMPRESSION_OPTION => "auto",
                     CONSTRAINED_APPEND_OPTION => "auto",
                     _ => unreachable!("tuning option was recognized"),
@@ -1268,6 +1346,7 @@ impl Database for MonetdbDatabase {
             write_batch_rows: None,
             write_window_bytes: None,
             ingest_insert_rows: 100,
+            prepare_threshold: DEFAULT_PREPARE_THRESHOLD,
             wire_compression: WireCompression::Auto,
             measured_round_trip,
             ingest_partial: IngestPartial::Block,
@@ -1285,6 +1364,7 @@ impl Database for MonetdbDatabase {
             WRITE_WINDOW_BYTES_OPTION,
             INGEST_INSERT_ROWS_OPTION,
             PREPARED_CACHE_CAPACITY_OPTION,
+            PREPARE_THRESHOLD_OPTION,
             WIRE_COMPRESSION_OPTION,
             CONSTRAINED_APPEND_OPTION,
         ] {
@@ -1372,6 +1452,7 @@ pub struct MonetdbConnection {
     write_batch_rows: Option<usize>,
     write_window_bytes: Option<usize>,
     ingest_insert_rows: usize,
+    prepare_threshold: usize,
     wire_compression: WireCompression,
     measured_round_trip: Duration,
     ingest_partial: IngestPartial,
@@ -1438,8 +1519,69 @@ struct PreparedCache {
 }
 
 struct CachedPrepared {
-    entry: Arc<PreparedEntry>,
+    outcome: PrepareOutcome,
     last_used: u64,
+}
+
+#[derive(Clone)]
+struct LiteralFallback {
+    template: QueryTemplate,
+    diagnostic: Error,
+}
+
+#[derive(Clone)]
+enum PrepareOutcome {
+    Prepared(Arc<PreparedEntry>),
+    Literal(Arc<LiteralFallback>),
+    Deferred(Arc<QueryTemplate>, usize),
+}
+
+#[derive(Clone, Copy)]
+enum PrepareRequest {
+    Declare,
+    Execute,
+    Force,
+}
+
+enum PrepareDecision {
+    Outcome(PrepareOutcome, bool),
+    Prepare,
+}
+
+struct PrepareStatus {
+    path: &'static str,
+    diagnostic: Option<Error>,
+    negative_cache_hit: bool,
+}
+
+impl PrepareStatus {
+    fn prepared() -> Self {
+        Self {
+            path: "prepared",
+            diagnostic: None,
+            negative_cache_hit: false,
+        }
+    }
+
+    fn literal(diagnostic: Option<Error>, negative_cache_hit: bool) -> Self {
+        Self {
+            path: "literal",
+            diagnostic,
+            negative_cache_hit,
+        }
+    }
+
+    fn to_json(&self) -> String {
+        let diagnostic = self
+            .diagnostic
+            .as_ref()
+            .map(diagnostic_json)
+            .unwrap_or_else(|| "null".to_owned());
+        format!(
+            "{{\"path\":\"{}\",\"original_diagnostic\":{diagnostic},\"negative_cache_hit\":{}}}",
+            self.path, self.negative_cache_hit
+        )
+    }
 }
 
 impl PreparedCache {
@@ -1452,46 +1594,124 @@ impl PreparedCache {
         }
     }
 
-    fn get(&mut self, query: &str) -> Option<Arc<PreparedEntry>> {
+    fn get_outcome(&mut self, query: &str) -> Option<PrepareOutcome> {
         let query = normalize_prepared_query(query);
         let last_used = self.next_use();
         let cached = self.entries.get_mut(query)?;
         cached.last_used = last_used;
-        Some(Arc::clone(&cached.entry))
+        Some(cached.outcome.clone())
+    }
+
+    fn get(&mut self, query: &str) -> Option<Arc<PreparedEntry>> {
+        match self.get_outcome(query)? {
+            PrepareOutcome::Prepared(entry) => Some(entry),
+            PrepareOutcome::Literal(_) | PrepareOutcome::Deferred(_, _) => None,
+        }
+    }
+
+    fn prepare_decision(
+        &mut self,
+        query: &str,
+        template: QueryTemplate,
+        threshold: usize,
+        request: PrepareRequest,
+    ) -> PrepareDecision {
+        let query = normalize_prepared_query(query).to_owned();
+        let last_used = self.next_use();
+        if let Some(cached) = self.entries.get_mut(&query) {
+            cached.last_used = last_used;
+            match &mut cached.outcome {
+                PrepareOutcome::Prepared(entry) => {
+                    return PrepareDecision::Outcome(
+                        PrepareOutcome::Prepared(Arc::clone(entry)),
+                        true,
+                    );
+                }
+                PrepareOutcome::Literal(fallback) => {
+                    return PrepareDecision::Outcome(
+                        PrepareOutcome::Literal(Arc::clone(fallback)),
+                        true,
+                    );
+                }
+                PrepareOutcome::Deferred(template, executions) => match request {
+                    PrepareRequest::Declare => {
+                        return PrepareDecision::Outcome(
+                            PrepareOutcome::Deferred(Arc::clone(template), *executions),
+                            true,
+                        );
+                    }
+                    PrepareRequest::Execute => {
+                        *executions = executions.saturating_add(1);
+                        if threshold == 0 || *executions < threshold {
+                            return PrepareDecision::Outcome(
+                                PrepareOutcome::Deferred(Arc::clone(template), *executions),
+                                true,
+                            );
+                        }
+                    }
+                    PrepareRequest::Force => {}
+                },
+            }
+            self.entries.remove(&query);
+            return PrepareDecision::Prepare;
+        }
+        if !matches!(request, PrepareRequest::Force) && threshold != 1 {
+            let executions = usize::from(matches!(request, PrepareRequest::Execute));
+            let template = Arc::new(template);
+            self.entries.insert(
+                query,
+                CachedPrepared {
+                    outcome: PrepareOutcome::Deferred(Arc::clone(&template), executions),
+                    last_used,
+                },
+            );
+            self.trim();
+            return PrepareDecision::Outcome(PrepareOutcome::Deferred(template, executions), false);
+        }
+        PrepareDecision::Prepare
     }
 
     fn insert(&mut self, query: String, candidate: Arc<PreparedEntry>) -> Arc<PreparedEntry> {
         let query = normalize_prepared_query(&query).to_owned();
-        if let Some(existing) = self.get(&query) {
+        if let Some(PrepareOutcome::Prepared(existing)) = self.get_outcome(&query) {
             return existing;
         }
         let last_used = self.next_use();
         self.entries.insert(
             query,
             CachedPrepared {
-                entry: Arc::clone(&candidate),
+                outcome: PrepareOutcome::Prepared(Arc::clone(&candidate)),
                 last_used,
             },
         );
-        while self.entries.len() > self.capacity {
-            let oldest = self
-                .entries
-                .iter()
-                .min_by_key(|(_, cached)| cached.last_used)
-                .map(|(query, _)| query.clone())
-                .expect("a nonempty cache has an LRU key");
-            self.entries.remove(&oldest);
-        }
+        self.trim();
         candidate
+    }
+
+    fn insert_literal(&mut self, query: String, candidate: Arc<LiteralFallback>) -> PrepareOutcome {
+        let query = normalize_prepared_query(&query).to_owned();
+        if let Some(existing) = self.get_outcome(&query)
+            && !matches!(existing, PrepareOutcome::Deferred(_, _))
+        {
+            return existing;
+        }
+        let last_used = self.next_use();
+        self.entries.insert(
+            query,
+            CachedPrepared {
+                outcome: PrepareOutcome::Literal(Arc::clone(&candidate)),
+                last_used,
+            },
+        );
+        self.trim();
+        PrepareOutcome::Literal(candidate)
     }
 
     fn remove_if_id(&mut self, query: &str, id: u64) {
         let query = normalize_prepared_query(query);
-        if self
-            .entries
-            .get(query)
-            .is_some_and(|cached| cached.entry.id == id)
-        {
+        if self.entries.get(query).is_some_and(
+            |cached| matches!(&cached.outcome, PrepareOutcome::Prepared(entry) if entry.id == id),
+        ) {
             self.entries.remove(query);
         }
     }
@@ -1503,7 +1723,11 @@ impl PreparedCache {
     fn set_capacity(&mut self, capacity: usize) {
         assert!(capacity > 0, "prepared cache capacity must be positive");
         self.capacity = capacity;
-        while self.entries.len() > capacity {
+        self.trim();
+    }
+
+    fn trim(&mut self) {
+        while self.entries.len() > self.capacity {
             let oldest = self
                 .entries
                 .iter()
@@ -1573,6 +1797,11 @@ impl Optionable for MonetdbConnection {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .set_capacity(capacity);
+            self.options.set(key, value);
+            return Ok(());
+        }
+        if key.as_ref() == PREPARE_THRESHOLD_OPTION {
+            self.prepare_threshold = nonnegative_usize_option(PREPARE_THRESHOLD_OPTION, &value)?;
             self.options.set(key, value);
             return Ok(());
         }
@@ -1694,6 +1923,9 @@ impl Optionable for MonetdbConnection {
                 .capacity
                 .to_string());
         }
+        if key.as_ref() == PREPARE_THRESHOLD_OPTION {
+            return Ok(self.prepare_threshold.to_string());
+        }
         if key.as_ref() == WIRE_COMPRESSION_OPTION {
             return Ok(self.wire_compression.as_str().to_owned());
         }
@@ -1755,6 +1987,10 @@ impl Optionable for MonetdbConnection {
             )
             .map_err(|_| error("prepared_cache_capacity exceeds i64", Status::Internal));
         }
+        if key.as_ref() == PREPARE_THRESHOLD_OPTION {
+            return i64::try_from(self.prepare_threshold)
+                .map_err(|_| error("prepare_threshold exceeds i64", Status::Internal));
+        }
         self.options.get_int(key)
     }
 
@@ -1782,6 +2018,7 @@ impl Connection for MonetdbConnection {
             write_batch_rows: self.write_batch_rows,
             write_window_bytes: self.write_window_bytes,
             ingest_insert_rows: self.ingest_insert_rows,
+            prepare_threshold: self.prepare_threshold,
             wire_compression: self.wire_compression,
             measured_round_trip: self.measured_round_trip,
             ingest_partial: self.ingest_partial,
@@ -1790,9 +2027,13 @@ impl Connection for MonetdbConnection {
             server_version: self.version,
             ingest_stats: None,
             read_stats: None,
+            prepare_status: None,
             bound: None,
             prepared: false,
             prepared_entry: None,
+            literal_fallback: None,
+            deferred_template: None,
+            unbound_deferred: false,
             prepared_parameter_schema: None,
             prepared_result_schema: None,
             bind_by_name: false,
@@ -1955,6 +2196,7 @@ pub struct MonetdbStatement {
     write_batch_rows: Option<usize>,
     write_window_bytes: Option<usize>,
     ingest_insert_rows: usize,
+    prepare_threshold: usize,
     wire_compression: WireCompression,
     measured_round_trip: Duration,
     ingest_partial: IngestPartial,
@@ -1963,9 +2205,13 @@ pub struct MonetdbStatement {
     server_version: (u16, u16, u16),
     ingest_stats: Option<String>,
     read_stats: Option<SharedReadStats>,
+    prepare_status: Option<PrepareStatus>,
     bound: Option<Box<dyn RecordBatchReader + Send>>,
     prepared: bool,
     prepared_entry: Option<PreparedSlot>,
+    literal_fallback: Option<Arc<LiteralFallback>>,
+    deferred_template: Option<Arc<QueryTemplate>>,
+    unbound_deferred: bool,
     prepared_parameter_schema: Option<Schema>,
     prepared_result_schema: Option<Schema>,
     bind_by_name: bool,
@@ -2010,6 +2256,11 @@ impl Optionable for MonetdbStatement {
             self.options.set(key, value);
             return Ok(());
         }
+        if key.as_ref() == PREPARE_THRESHOLD_OPTION {
+            self.prepare_threshold = nonnegative_usize_option(PREPARE_THRESHOLD_OPTION, &value)?;
+            self.options.set(key, value);
+            return Ok(());
+        }
         if key.as_ref() == WIRE_COMPRESSION_OPTION {
             self.wire_compression = WireCompression::parse(&value)?;
             self.options.set(key, self.wire_compression.as_str().into());
@@ -2031,7 +2282,10 @@ impl Optionable for MonetdbStatement {
                 .set(key, self.constrained_append.as_str().into());
             return Ok(());
         }
-        if matches!(key.as_ref(), INGEST_STATS_OPTION | READ_STATS_OPTION) {
+        if matches!(
+            key.as_ref(),
+            INGEST_STATS_OPTION | READ_STATS_OPTION | PREPARE_STATUS_OPTION
+        ) {
             return Err(error(
                 format!("option '{}' is read-only", key.as_ref()),
                 Status::InvalidArguments,
@@ -2126,6 +2380,9 @@ impl Optionable for MonetdbStatement {
         if key.as_ref() == INGEST_INSERT_ROWS_OPTION {
             return Ok(self.ingest_insert_rows.to_string());
         }
+        if key.as_ref() == PREPARE_THRESHOLD_OPTION {
+            return Ok(self.prepare_threshold.to_string());
+        }
         if key.as_ref() == WIRE_COMPRESSION_OPTION {
             return Ok(self.wire_compression.as_str().to_owned());
         }
@@ -2156,6 +2413,13 @@ impl Optionable for MonetdbStatement {
                         .map(ReadStats::to_json)
                 })
                 .ok_or_else(|| unknown_option(READ_STATS_OPTION));
+        }
+        if key.as_ref() == PREPARE_STATUS_OPTION {
+            return self
+                .prepare_status
+                .as_ref()
+                .map(PrepareStatus::to_json)
+                .ok_or_else(|| unknown_option(PREPARE_STATUS_OPTION));
         }
         if key == OptionStatement::IngestMode {
             return Ok(self
@@ -2211,6 +2475,10 @@ impl Optionable for MonetdbStatement {
             return i64::try_from(self.ingest_insert_rows)
                 .map_err(|_| error("ingest_insert_rows exceeds i64", Status::Internal));
         }
+        if key.as_ref() == PREPARE_THRESHOLD_OPTION {
+            return i64::try_from(self.prepare_threshold)
+                .map_err(|_| error("prepare_threshold exceeds i64", Status::Internal));
+        }
         self.options.get_int(key)
     }
 
@@ -2255,68 +2523,114 @@ impl Statement for MonetdbStatement {
                     Status::InvalidState,
                 ));
             }
-            if !self.prepared {
-                self.prepare()?;
-            }
-            let mut queries = self.take_bound_queries()?;
-            if queries.is_empty()? {
-                let schema = match self.prepared_result_schema.clone() {
-                    Some(schema) => schema,
-                    None => {
-                        let schema = self.execute_schema()?;
-                        self.prepared_result_schema = Some(schema.clone());
-                        schema
-                    }
-                };
-                let schema = Arc::new(schema);
-                let rows_affected = schema.fields().is_empty().then_some(0);
-                return Ok(StatementResult {
-                    reader: Box::new(EmptyReader::new(schema)),
-                    rows_affected,
-                });
-            }
-            if self
-                .prepared_result_schema
-                .as_ref()
-                .is_some_and(|schema| schema.fields().is_empty())
-            {
-                let rows_affected =
-                    execute_updates_atomic(&self.connection, &mut queries, self.timeouts)?;
-                return Ok(StatementResult {
-                    reader: Box::new(EmptyReader::default()),
-                    rows_affected,
-                });
-            }
-            if self.prepared_result_schema.is_none() {
-                let schema = self.execute_schema()?;
-                if schema.fields().is_empty() {
+            let query = self
+                .query
+                .as_deref()
+                .ok_or_else(|| error("SQL query is not set", Status::InvalidState))?;
+            let invalidates_cache = query_invalidates_prepared_cache(query)?;
+            let result = (|| -> Result<StatementResult> {
+                if !self.prepared {
+                    self.prepare()?;
+                }
+                self.resolve_deferred_for_execution(false)?;
+                let mut queries = self.take_bound_queries()?;
+                if queries.is_empty()? {
+                    let schema = match self.prepared_result_schema.clone() {
+                        Some(schema) => schema,
+                        None => {
+                            let schema = self.execute_schema()?;
+                            self.prepared_result_schema = Some(schema.clone());
+                            schema
+                        }
+                    };
+                    let schema = Arc::new(schema);
+                    let rows_affected = schema.fields().is_empty().then_some(0);
+                    return Ok(StatementResult {
+                        reader: Box::new(EmptyReader::new(schema)),
+                        rows_affected,
+                    });
+                }
+                if self
+                    .prepared_result_schema
+                    .as_ref()
+                    .is_some_and(|schema| schema.fields().is_empty())
+                {
                     let rows_affected =
                         execute_updates_atomic(&self.connection, &mut queries, self.timeouts)?;
-                    self.prepared_result_schema = Some(schema);
                     return Ok(StatementResult {
                         reader: Box::new(EmptyReader::default()),
                         rows_affected,
                     });
                 }
-                self.prepared_result_schema = Some(schema);
+                if self.prepared_result_schema.is_none()
+                    && (self.literal_fallback.is_some() || self.deferred_template.is_some())
+                    && let Some(query) = queries.take_if_single()?
+                {
+                    let read_stats = Arc::new(Mutex::new(None));
+                    self.read_stats = Some(Arc::clone(&read_stats));
+                    let result = with_bound_query_diagnostic(
+                        query_result_with_timeouts(
+                            &self.connection,
+                            &query.sql,
+                            ReadExecutionOptions {
+                                batch_rows: self.read_batch_rows,
+                                window_bytes: self.read_window_bytes,
+                                prefetch: self.read_prefetch,
+                                measured_round_trip: self.measured_round_trip,
+                                stats: Some(read_stats),
+                            },
+                            self.timeouts,
+                        ),
+                        &query,
+                    )?;
+                    self.prepared_result_schema = Some(result.reader.schema().as_ref().clone());
+                    return Ok(result);
+                }
+                if self.prepared_result_schema.is_none() {
+                    let schema = match &self.literal_fallback {
+                        Some(fallback) => prepare_literal_execution_schema(
+                            &self.connection,
+                            queries.pending().ok_or_else(|| {
+                                error("no parameter row is pending", Status::Internal)
+                            })?,
+                            fallback,
+                            self.timeouts,
+                        )?,
+                        None => self.execute_schema()?,
+                    };
+                    if schema.fields().is_empty() {
+                        let rows_affected =
+                            execute_updates_atomic(&self.connection, &mut queries, self.timeouts)?;
+                        self.prepared_result_schema = Some(schema);
+                        return Ok(StatementResult {
+                            reader: Box::new(EmptyReader::default()),
+                            rows_affected,
+                        });
+                    }
+                    self.prepared_result_schema = Some(schema);
+                }
+                let read_stats = Arc::new(Mutex::new(None));
+                self.read_stats = Some(Arc::clone(&read_stats));
+                Ok(StatementResult {
+                    reader: parameter_query_reader(
+                        &self.connection,
+                        queries,
+                        ReadExecutionOptions {
+                            batch_rows: self.read_batch_rows,
+                            window_bytes: self.read_window_bytes,
+                            prefetch: self.read_prefetch,
+                            measured_round_trip: self.measured_round_trip,
+                            stats: Some(read_stats),
+                        },
+                        self.timeouts,
+                    )?,
+                    rows_affected: None,
+                })
+            })();
+            if invalidates_cache {
+                clear_prepared_cache(&self.prepared_cache);
             }
-            let read_stats = Arc::new(Mutex::new(None));
-            self.read_stats = Some(Arc::clone(&read_stats));
-            return Ok(StatementResult {
-                reader: parameter_query_reader(
-                    &self.connection,
-                    queries,
-                    ReadExecutionOptions {
-                        batch_rows: self.read_batch_rows,
-                        window_bytes: self.read_window_bytes,
-                        prefetch: self.read_prefetch,
-                        measured_round_trip: self.measured_round_trip,
-                        stats: Some(read_stats),
-                    },
-                    self.timeouts,
-                )?,
-                rows_affected: None,
-            });
+            return result;
         }
         let query = self
             .query
@@ -2357,8 +2671,21 @@ impl Statement for MonetdbStatement {
             return self.ingest();
         }
         if self.bound.is_some() {
+            let query = self
+                .query
+                .as_deref()
+                .ok_or_else(|| error("SQL query is not set", Status::InvalidState))?;
+            let invalidates_cache = query_invalidates_prepared_cache(query)?;
+            if !self.prepared {
+                self.prepare()?;
+            }
+            self.resolve_deferred_for_execution(true)?;
             let mut queries = self.take_bound_queries()?;
-            return execute_updates_atomic(&self.connection, &mut queries, self.timeouts);
+            let result = execute_updates_atomic(&self.connection, &mut queries, self.timeouts);
+            if invalidates_cache {
+                clear_prepared_cache(&self.prepared_cache);
+            }
+            return result;
         }
         let query = self
             .query
@@ -2393,6 +2720,7 @@ impl Statement for MonetdbStatement {
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::clone(&entry);
             self.prepared_parameter_schema = Some(entry.parameters.clone());
             self.prepared_result_schema = Some(entry.result.clone());
+            self.prepare_status = Some(PrepareStatus::prepared());
             return Ok(entry.result.clone());
         }
         if let Some(schema) = &self.prepared_result_schema {
@@ -2402,23 +2730,56 @@ impl Statement for MonetdbStatement {
             .query
             .as_deref()
             .ok_or_else(|| error("SQL query is not set", Status::InvalidState))?;
-        let layout = parameter_layout(query)?;
-        let metadata = if layout.is_named() {
-            let query = render_null_parameters(query)?;
-            prepare_query_allowing_any(&self.connection, &query, 0, self.timeouts)?
-        } else {
-            match prepare_query(&self.connection, query, layout.count(), self.timeouts) {
-                Ok(metadata) => metadata,
-                Err(value) if requires_literal_parameter_fallback(&value) => {
-                    let query = render_null_parameters(query)?;
-                    prepare_query_allowing_any(&self.connection, &query, 0, self.timeouts)?
-                }
-                Err(value) => return Err(value),
+        let template = QueryTemplate::parse(query)?;
+        let layout = template.layout().clone();
+        if layout.is_named() {
+            self.prepare_status = Some(PrepareStatus::literal(None, false));
+            let rendered = template.render_nulls()?;
+            let metadata =
+                prepare_query_allowing_any(&self.connection, &rendered, 0, self.timeouts)?;
+            lock_connection(&self.connection)?.try_deallocate(metadata.id);
+            return Ok(metadata.result);
+        }
+        if layout.count() == 0 {
+            self.prepare_status = Some(PrepareStatus::prepared());
+            let metadata = prepare_query(&self.connection, query, 0, self.timeouts)?;
+            lock_connection(&self.connection)?.try_deallocate(metadata.id);
+            return Ok(metadata.result);
+        }
+        let (outcome, cache_hit) = prepare_outcome_cached(
+            &self.connection,
+            &self.prepared_cache,
+            query,
+            template,
+            self.prepare_threshold,
+            PrepareRequest::Force,
+            self.timeouts,
+        )?;
+        match outcome {
+            PrepareOutcome::Prepared(entry) => {
+                self.prepare_status = Some(PrepareStatus::prepared());
+                Ok(entry.result.clone())
             }
-        };
-        let connection = lock_connection(&self.connection)?;
-        connection.try_deallocate(metadata.id);
-        Ok(metadata.result)
+            PrepareOutcome::Literal(fallback) => {
+                self.prepare_status = Some(PrepareStatus::literal(
+                    Some(fallback.diagnostic.clone()),
+                    cache_hit,
+                ));
+                self.literal_fallback = Some(Arc::clone(&fallback));
+                let rendered = fallback.template.render_nulls()?;
+                let metadata =
+                    match prepare_query_allowing_any(&self.connection, &rendered, 0, self.timeouts)
+                    {
+                        Ok(metadata) => metadata,
+                        Err(_) => return Err(fallback.diagnostic.clone()),
+                    };
+                lock_connection(&self.connection)?.try_deallocate(metadata.id);
+                Ok(metadata.result)
+            }
+            PrepareOutcome::Deferred(_, _) => {
+                unreachable!("forced preparation cannot produce a deferred outcome")
+            }
+        }
     }
 
     fn execute_partitions(&mut self) -> Result<PartitionedResult> {
@@ -2426,6 +2787,15 @@ impl Statement for MonetdbStatement {
     }
 
     fn get_parameter_schema(&self) -> Result<Schema> {
+        if self.unbound_deferred {
+            let query = self
+                .query
+                .as_deref()
+                .ok_or_else(|| error("SQL query is not set", Status::InvalidState))?;
+            let metadata = prepare_query(&self.connection, query, 0, self.timeouts)?;
+            lock_connection(&self.connection)?.try_deallocate(metadata.id);
+            return Ok(metadata.parameters);
+        }
         if let Some(slot) = &self.prepared_entry {
             let query = self
                 .query
@@ -2442,6 +2812,33 @@ impl Statement for MonetdbStatement {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::clone(&entry);
             return Ok(entry.parameters.clone());
+        }
+        if let Some(template) = &self.deferred_template {
+            let query = self
+                .query
+                .as_deref()
+                .ok_or_else(|| error("SQL query is not set", Status::InvalidState))?;
+            let parameter_count = template.layout().count();
+            let (outcome, _) = prepare_outcome_cached(
+                &self.connection,
+                &self.prepared_cache,
+                query,
+                template.as_ref().clone(),
+                self.prepare_threshold,
+                PrepareRequest::Force,
+                self.timeouts,
+            )?;
+            return match outcome {
+                PrepareOutcome::Prepared(entry) => Ok(entry.parameters.clone()),
+                PrepareOutcome::Literal(_) => Ok(Schema::new(
+                    (0..parameter_count)
+                        .map(|index| Field::new(index.to_string(), DataType::Null, true))
+                        .collect::<Vec<_>>(),
+                )),
+                PrepareOutcome::Deferred(_, _) => {
+                    unreachable!("forced preparation cannot produce a deferred outcome")
+                }
+            };
         }
         if let Some(schema) = &self.prepared_parameter_schema {
             return Ok(schema.clone());
@@ -2469,10 +2866,19 @@ impl Statement for MonetdbStatement {
             .query
             .as_deref()
             .ok_or_else(|| error("SQL query is not set", Status::InvalidState))?;
-        let layout = parameter_layout(query)?;
+        if is_prepare_statement(query) {
+            return Err(error(
+                "Statement::prepare() accepts the SQL to prepare, not a PREPARE statement",
+                Status::InvalidArguments,
+            ));
+        }
+        let template = QueryTemplate::parse(query)?;
+        let layout = template.layout().clone();
         let parameter_count = layout.count();
         if parameter_count == 0 {
             self.prepared_parameter_schema = Some(Schema::empty());
+            self.prepare_status = Some(PrepareStatus::literal(None, false));
+            self.unbound_deferred = true;
             self.prepared = true;
             return Ok(());
         }
@@ -2483,30 +2889,48 @@ impl Statement for MonetdbStatement {
                     .map(|name| Field::new(name, DataType::Null, true))
                     .collect::<Vec<_>>(),
             ));
+            self.prepare_status = Some(PrepareStatus::literal(None, false));
             self.prepared_result_schema = Some(self.execute_schema()?);
             self.prepared = true;
             return Ok(());
         }
-        match prepare_cached(
+        let (outcome, cache_hit) = prepare_outcome_cached(
             &self.connection,
             &self.prepared_cache,
             query,
-            parameter_count,
+            template,
+            self.prepare_threshold,
+            PrepareRequest::Declare,
             self.timeouts,
-        ) {
-            Ok(entry) => {
+        )?;
+        match outcome {
+            PrepareOutcome::Prepared(entry) => {
                 self.prepared_parameter_schema = Some(entry.parameters.clone());
                 self.prepared_result_schema = Some(entry.result.clone());
                 self.prepared_entry = Some(Arc::new(Mutex::new(entry)));
+                self.prepare_status = Some(PrepareStatus::prepared());
             }
-            Err(value) if requires_literal_parameter_fallback(&value) => {
+            PrepareOutcome::Literal(fallback) => {
                 self.prepared_parameter_schema = Some(Schema::new(
                     (0..parameter_count)
                         .map(|index| Field::new(index.to_string(), DataType::Null, true))
                         .collect::<Vec<_>>(),
                 ));
+                self.prepare_status = Some(PrepareStatus::literal(
+                    Some(fallback.diagnostic.clone()),
+                    cache_hit,
+                ));
+                self.literal_fallback = Some(fallback);
             }
-            Err(value) => return Err(value),
+            PrepareOutcome::Deferred(template, _) => {
+                self.prepared_parameter_schema = Some(Schema::new(
+                    (0..parameter_count)
+                        .map(|index| Field::new(index.to_string(), DataType::Null, true))
+                        .collect::<Vec<_>>(),
+                ));
+                self.prepare_status = Some(PrepareStatus::literal(None, false));
+                self.deferred_template = Some(template);
+            }
         }
         self.prepared = true;
         Ok(())
@@ -2536,31 +2960,70 @@ impl Statement for MonetdbStatement {
     }
 }
 
-fn requires_literal_parameter_fallback(value: &Error) -> bool {
-    if value.message == "unknown MonetDB prepared type 'any'" {
-        return true;
-    }
-    if value.sqlstate.map(|value| value as u8) != *b"42000" {
-        return false;
-    }
-
-    let message = value.message.to_ascii_lowercase();
-    message.contains("could not determine type for argument")
-        || message.contains("result type missing")
-        || message.contains("cannot have a parameter (?)")
-        || message.contains("parameter not allowed")
-        || message.contains("parameters not allowed")
-        || message.contains("cannot set parameter types")
-        || (message.contains("query projection")
-            && message.contains("parameter with known sql type"))
-}
-
 impl MonetdbStatement {
     fn clear_prepared(&mut self) {
         self.prepared_entry = None;
+        self.literal_fallback = None;
+        self.deferred_template = None;
+        self.unbound_deferred = false;
         self.prepared_parameter_schema = None;
         self.prepared_result_schema = None;
+        self.prepare_status = None;
         self.prepared = false;
+    }
+
+    fn resolve_deferred_for_execution(&mut self, force: bool) -> Result<()> {
+        let Some(template) = self.deferred_template.clone() else {
+            return Ok(());
+        };
+        let query = self
+            .query
+            .clone()
+            .ok_or_else(|| error("SQL query is not set", Status::InvalidState))?;
+        let parameter_count = template.layout().count();
+        let (outcome, cache_hit) = prepare_outcome_cached(
+            &self.connection,
+            &self.prepared_cache,
+            &query,
+            template.as_ref().clone(),
+            self.prepare_threshold,
+            if force {
+                PrepareRequest::Force
+            } else {
+                PrepareRequest::Execute
+            },
+            self.timeouts,
+        )?;
+        match outcome {
+            PrepareOutcome::Prepared(entry) => {
+                self.prepared_parameter_schema = Some(entry.parameters.clone());
+                self.prepared_result_schema = Some(entry.result.clone());
+                self.prepared_entry = Some(Arc::new(Mutex::new(entry)));
+                self.literal_fallback = None;
+                self.deferred_template = None;
+                self.prepare_status = Some(PrepareStatus::prepared());
+            }
+            PrepareOutcome::Literal(fallback) => {
+                self.prepared_parameter_schema = Some(Schema::new(
+                    (0..parameter_count)
+                        .map(|index| Field::new(index.to_string(), DataType::Null, true))
+                        .collect::<Vec<_>>(),
+                ));
+                self.prepared_result_schema = None;
+                self.prepared_entry = None;
+                self.literal_fallback = Some(Arc::clone(&fallback));
+                self.deferred_template = None;
+                self.prepare_status = Some(PrepareStatus::literal(
+                    Some(fallback.diagnostic.clone()),
+                    cache_hit,
+                ));
+            }
+            PrepareOutcome::Deferred(template, _) => {
+                self.deferred_template = Some(template);
+                self.prepare_status = Some(PrepareStatus::literal(None, false));
+            }
+        }
+        Ok(())
     }
 
     fn take_bound_queries(&mut self) -> Result<BoundQueryStream> {
@@ -2574,7 +3037,16 @@ impl MonetdbStatement {
             .take()
             .ok_or_else(|| error("no Arrow parameters are bound", Status::InvalidState))?;
         let schema = reader.schema();
-        let template = QueryTemplate::parse(&query)?;
+        let template = self
+            .literal_fallback
+            .as_ref()
+            .map(|fallback| fallback.template.clone())
+            .or_else(|| {
+                self.deferred_template
+                    .as_ref()
+                    .map(|template| template.as_ref().clone())
+            })
+            .map_or_else(|| QueryTemplate::parse(&query), Ok)?;
         let layout = template.layout();
         if layout.is_named() != self.bind_by_name {
             return Err(error(
@@ -2627,10 +3099,11 @@ impl MonetdbStatement {
             schema,
             template,
             prepared,
+            literal_fallback: self.literal_fallback.clone(),
             bind_by_name: self.bind_by_name,
             batch: None,
             next_row: 0,
-            pending: None,
+            pending: VecDeque::new(),
             finished: false,
         })
     }
@@ -2902,6 +3375,7 @@ impl MonetdbStatement {
                     .map(|arguments| BoundQuery {
                         sql: format!("EXECUTE {}({arguments})", entry.id),
                         prepared: None,
+                        prepare_diagnostic: None,
                     })
                     .collect::<Vec<_>>();
                 let mut total = 0i64;
@@ -5702,6 +6176,7 @@ struct PreparedInvocation {
 struct BoundQuery {
     sql: String,
     prepared: Option<PreparedInvocation>,
+    prepare_diagnostic: Option<Error>,
 }
 
 impl BoundQuery {
@@ -5713,8 +6188,36 @@ impl BoundQuery {
                 entry,
                 arguments,
             }),
+            prepare_diagnostic: None,
         }
     }
+
+    fn literal(sql: String, fallback: Option<&LiteralFallback>) -> Self {
+        Self {
+            sql,
+            prepared: None,
+            prepare_diagnostic: fallback.map(|fallback| fallback.diagnostic.clone()),
+        }
+    }
+}
+
+fn with_bound_query_diagnostic<T>(result: Result<T>, query: &BoundQuery) -> Result<T> {
+    result.map_err(|value| match &query.prepare_diagnostic {
+        Some(diagnostic) => attach_prepare_diagnostic(value, diagnostic),
+        None => value,
+    })
+}
+
+fn prepare_literal_execution_schema(
+    connection: &SharedConnection,
+    query: &BoundQuery,
+    fallback: &LiteralFallback,
+    timeouts: Timeouts,
+) -> Result<Schema> {
+    let metadata = prepare_query_allowing_any(connection, &query.sql, 0, timeouts)
+        .map_err(|value| attach_prepare_diagnostic(value, &fallback.diagnostic))?;
+    lock_connection(connection)?.try_deallocate(metadata.id);
+    Ok(metadata.result)
 }
 
 struct BoundQueryStream {
@@ -5722,10 +6225,11 @@ struct BoundQueryStream {
     schema: SchemaRef,
     template: QueryTemplate,
     prepared: Option<PreparedPlan>,
+    literal_fallback: Option<Arc<LiteralFallback>>,
     bind_by_name: bool,
     batch: Option<RecordBatch>,
     next_row: usize,
-    pending: Option<BoundQuery>,
+    pending: VecDeque<BoundQuery>,
     finished: bool,
 }
 
@@ -5733,10 +6237,28 @@ impl BoundQueryStream {
     fn is_empty(&mut self) -> Result<bool> {
         match self.next().transpose()? {
             Some(query) => {
-                self.pending = Some(query);
+                self.pending.push_back(query);
                 Ok(false)
             }
             None => Ok(true),
+        }
+    }
+
+    fn pending(&self) -> Option<&BoundQuery> {
+        self.pending.front()
+    }
+
+    fn take_if_single(&mut self) -> Result<Option<BoundQuery>> {
+        let Some(first) = self.next().transpose()? else {
+            return Ok(None);
+        };
+        match self.next().transpose()? {
+            None => Ok(Some(first)),
+            Some(second) => {
+                self.pending.push_front(second);
+                self.pending.push_front(first);
+                Ok(None)
+            }
         }
     }
 }
@@ -5745,7 +6267,7 @@ impl Iterator for BoundQueryStream {
     type Item = Result<BoundQuery>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(query) = self.pending.take() {
+        if let Some(query) = self.pending.pop_front() {
             return Some(Ok(query));
         }
         if self.finished {
@@ -5770,10 +6292,7 @@ impl Iterator for BoundQueryStream {
                     None => self
                         .template
                         .render_row(batch, row, self.bind_by_name)
-                        .map(|sql| BoundQuery {
-                            sql,
-                            prepared: None,
-                        }),
+                        .map(|sql| BoundQuery::literal(sql, self.literal_fallback.as_deref())),
                 };
                 return Some(query);
             }
@@ -6011,6 +6530,57 @@ struct PreparedMetadata {
     result: Schema,
 }
 
+fn prepare_outcome_cached(
+    connection: &SharedConnection,
+    cache: &SharedPreparedCache,
+    query: &str,
+    template: QueryTemplate,
+    threshold: usize,
+    request: PrepareRequest,
+    timeouts: Timeouts,
+) -> Result<(PrepareOutcome, bool)> {
+    let query = normalize_prepared_query(query);
+    match cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .prepare_decision(query, template.clone(), threshold, request)
+    {
+        PrepareDecision::Outcome(outcome, cache_hit) => return Ok((outcome, cache_hit)),
+        PrepareDecision::Prepare => {}
+    }
+    let parameter_count = template.layout().count();
+    match prepare_query(connection, query, parameter_count, timeouts) {
+        Ok(metadata) => {
+            let candidate = Arc::new(PreparedEntry::new(metadata, connection));
+            let entry = cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(query.to_owned(), candidate);
+            Ok((PrepareOutcome::Prepared(entry), false))
+        }
+        Err(diagnostic) if permits_literal_parameter_fallback(&diagnostic) => {
+            let candidate = Arc::new(LiteralFallback {
+                template,
+                diagnostic,
+            });
+            let outcome = cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert_literal(query.to_owned(), candidate);
+            Ok((outcome, false))
+        }
+        Err(value) => Err(value),
+    }
+}
+
+fn permits_literal_parameter_fallback(value: &Error) -> bool {
+    sqlstate_string(value).is_some()
+        || value.message == "unknown MonetDB prepared type 'any'"
+        || value
+            .message
+            .starts_with("invalid structural split in PREPARE metadata")
+}
+
 fn prepare_cached(
     connection: &SharedConnection,
     cache: &SharedPreparedCache,
@@ -6078,9 +6648,26 @@ fn prepare_cached_with_status_locked(
 struct PreparedField {
     data_type: MonetType,
     undetermined: bool,
+    parameter: bool,
     name: Option<String>,
     origin_schema: Option<String>,
     origin_table: Option<String>,
+}
+
+fn prepared_result_count(fields: &[PreparedField], lexer_parameter_count: usize) -> Result<usize> {
+    let result_count = fields.partition_point(|field| !field.parameter);
+    if fields[result_count..].iter().all(|field| field.parameter) {
+        return Ok(result_count);
+    }
+    let structural_parameter_count = fields.iter().filter(|field| field.parameter).count();
+    Err(error(
+        format!(
+            "invalid structural split in PREPARE metadata: parameter rows must follow result rows; \
+             metadata marked {structural_parameter_count} parameters and the SQL lexer found \
+             {lexer_parameter_count}"
+        ),
+        Status::InvalidData,
+    ))
 }
 
 fn prepare_query(
@@ -6172,6 +6759,11 @@ fn prepare_query_inner_locked(
                 .get_str(5)
                 .map_err(map_cursor_error)?
                 .map(str::to_owned);
+            // MonetDB `sql/backends/monet5/sql_result.c` writes SQL NULL for the
+            // schema, table, and column fields of parameter rows; result-column
+            // names are non-NULL. `clients/odbc/driver/SQLPrepare.c` uses the same
+            // column-NULL discriminator.
+            let parameter = name.is_none();
             let origin_schema = cursor
                 .get_str(3)
                 .map_err(map_cursor_error)?
@@ -6188,6 +6780,7 @@ fn prepare_query_inner_locked(
                         && (digits <= 0 || scale < 0 || scale > digits));
             fields.push(PreparedField {
                 undetermined: provisional,
+                parameter,
                 data_type: if provisional {
                     MonetType::Varchar(0)
                 } else {
@@ -6198,15 +6791,7 @@ fn prepare_query_inner_locked(
                 origin_table,
             });
         }
-        let result_count = fields.len().checked_sub(parameter_count).ok_or_else(|| {
-            error(
-                format!(
-                    "PREPARE returned {} metadata rows for {parameter_count} parameters",
-                    fields.len()
-                ),
-                Status::InvalidData,
-            )
-        })?;
+        let result_count = prepared_result_count(&fields, parameter_count)?;
         restore_declared_result_types(&mut cursor, &mut fields[..result_count])?;
         let parameter_fields = fields
             .drain(result_count..)
@@ -6559,25 +7144,27 @@ fn is_prepare_statement(query: &str) -> bool {
 }
 
 fn query_invalidates_prepared_cache(query: &str) -> Result<bool> {
-    Ok(unbound_statements(query)?.into_iter().any(|statement| {
-        leading_sql_keyword(statement).is_some_and(|keyword| {
-            matches!(
-                keyword.to_ascii_uppercase().as_str(),
-                "ALTER"
-                    | "ANALYZE"
-                    | "CALL"
-                    | "COMMENT"
-                    | "CREATE"
-                    | "DEALLOCATE"
-                    | "DROP"
-                    | "GRANT"
-                    | "RENAME"
-                    | "REVOKE"
-                    | "SET"
-                    | "TRUNCATE"
-            )
-        })
-    }))
+    Ok(parameterized_statements(query)?
+        .into_iter()
+        .any(|statement| {
+            leading_sql_keyword(statement).is_some_and(|keyword| {
+                matches!(
+                    keyword.to_ascii_uppercase().as_str(),
+                    "ALTER"
+                        | "ANALYZE"
+                        | "CALL"
+                        | "COMMENT"
+                        | "CREATE"
+                        | "DEALLOCATE"
+                        | "DROP"
+                        | "GRANT"
+                        | "RENAME"
+                        | "REVOKE"
+                        | "SET"
+                        | "TRUNCATE"
+                )
+            })
+        }))
 }
 
 fn leading_sql_keyword(query: &str) -> Option<&str> {
@@ -6736,7 +7323,7 @@ fn bound_query_reader_with_retry(
             let retry = retry_bound_query(connection, &query, timeouts)?;
             query_reader_with_timeouts(connection, &retry.sql, read_options, timeouts)
         }
-        result => result,
+        result => with_bound_query_diagnostic(result, &query),
     }
 }
 
@@ -7204,7 +7791,7 @@ fn execute_single_bound_update(
             let retry = retry_bound_query(connection, &query, timeouts)?;
             execute_update(connection, &retry.sql, timeouts)
         }
-        result => result,
+        result => with_bound_query_diagnostic(result, &query),
     }
 }
 
@@ -7224,7 +7811,9 @@ fn execute_updates_atomic_from_first(
         None,
         timeouts,
     )?;
-    if let Err(root) = cursor.execute(&first.sql).map_err(map_cursor_error) {
+    if let Err(root) =
+        with_bound_query_diagnostic(cursor.execute(&first.sql).map_err(map_cursor_error), &first)
+    {
         let retryable =
             allow_retry && first.prepared.is_some() && prepared_statement_missing(&root);
         let root_message = root.message.clone();
@@ -7303,7 +7892,16 @@ fn execute_update_batch(
         script.push_str(query.sql.trim_end().trim_end_matches(';'));
         script.push_str(";\n");
     }
-    cursor.execute(&script).map_err(map_cursor_error)?;
+    let executed = cursor.execute(&script).map_err(map_cursor_error);
+    match queries
+        .first()
+        .and_then(|query| query.prepare_diagnostic.as_ref())
+    {
+        Some(diagnostic) => {
+            executed.map_err(|value| attach_prepare_diagnostic(value, diagnostic))?
+        }
+        None => executed?,
+    }
     loop {
         add_current_affected_rows(cursor, total, has_count)?;
         if !cursor.next_reply().map_err(map_cursor_error)? {
@@ -8174,7 +8772,7 @@ mod tests {
     use proptest::prelude::*;
 
     #[test]
-    fn classifies_only_monetdb_parameter_prepare_limitations_for_literal_fallback() {
+    fn gates_literal_fallback_on_prepare_outcome_not_diagnostic_text() {
         let prepare_error = |message: &str, sqlstate: &str| {
             let mut value = error(message, Status::InvalidArguments);
             value.sqlstate = parse_sqlstate(sqlstate).unwrap();
@@ -8184,38 +8782,120 @@ mod tests {
         for message in [
             "Could not determine type for argument number 1",
             "Result type missing",
-            "Cannot have a parameter (?) on both sides of an expression",
-            "Cannot have a parameter (?) for IS NOT NULL operator",
-            "SELECT: parameter not allowed on left hand side of LIKE operator",
-            "LISTAGG: parameters not allowed as arguments to window functions",
-            "SELECT: parameters not allowed at PARTITION BY clause from window functions",
-            "Cannot set parameter types under set relations at the moment",
-            "Query projection must have at least one parameter with known SQL type",
+            "syntax error, unexpected '?', expecting STRING",
+            "For the IN operator, both sides must have a type defined",
+            "a future MonetDB diagnostic unknown to this driver",
         ] {
-            assert!(requires_literal_parameter_fallback(&prepare_error(
+            assert!(permits_literal_parameter_fallback(&prepare_error(
                 message, "42000"
             )));
         }
 
-        for message in [
-            "syntax error, unexpected end of input",
-            "EXEC called with wrong number of arguments: expected 2, got 1",
-            "CREATE FUNCTION: procedures cannot have return parameters",
-            "SELECT: with DISTINCT ORDER BY expressions must appear in select list",
-        ] {
-            assert!(!requires_literal_parameter_fallback(&prepare_error(
-                message, "42000"
-            )));
-        }
-
-        assert!(!requires_literal_parameter_fallback(&prepare_error(
+        assert!(permits_literal_parameter_fallback(&prepare_error(
             "Cannot have a parameter (?) on both sides of an expression",
             "22000"
         )));
-        assert!(requires_literal_parameter_fallback(&error(
+        assert!(permits_literal_parameter_fallback(&error(
             "unknown MonetDB prepared type 'any'",
             Status::InvalidData
         )));
+        assert!(permits_literal_parameter_fallback(&error(
+            "invalid structural split in PREPARE metadata: test",
+            Status::InvalidData
+        )));
+        for status in [Status::IO, Status::Timeout, Status::Cancelled] {
+            assert!(!permits_literal_parameter_fallback(&error(
+                "transport did not complete PREPARE",
+                status
+            )));
+        }
+        assert!(!permits_literal_parameter_fallback(&error(
+            "unknown MonetDB prepared type 'future_type'",
+            Status::InvalidData
+        )));
+    }
+
+    #[test]
+    fn prepare_threshold_counts_executions_not_declarations() {
+        let template = QueryTemplate::parse("SELECT CAST(? AS BIGINT)").unwrap();
+        let mut cache = PreparedCache::new(4);
+        assert!(matches!(
+            cache.prepare_decision(
+                "SELECT CAST(? AS BIGINT)",
+                template.clone(),
+                2,
+                PrepareRequest::Declare,
+            ),
+            PrepareDecision::Outcome(PrepareOutcome::Deferred(_, 0), false)
+        ));
+        assert!(matches!(
+            cache.prepare_decision(
+                "SELECT CAST(? AS BIGINT)",
+                template.clone(),
+                2,
+                PrepareRequest::Execute,
+            ),
+            PrepareDecision::Outcome(PrepareOutcome::Deferred(_, 1), true)
+        ));
+        assert!(matches!(
+            cache.prepare_decision(
+                "SELECT CAST(? AS BIGINT)",
+                template.clone(),
+                2,
+                PrepareRequest::Declare,
+            ),
+            PrepareDecision::Outcome(PrepareOutcome::Deferred(_, 1), true)
+        ));
+        assert!(matches!(
+            cache.prepare_decision(
+                "SELECT CAST(? AS BIGINT)",
+                template,
+                2,
+                PrepareRequest::Execute,
+            ),
+            PrepareDecision::Prepare
+        ));
+    }
+
+    #[test]
+    fn prepare_threshold_zero_never_prepares_and_force_bypasses_it() {
+        let query = "SELECT CAST(? AS BIGINT)";
+        let template = QueryTemplate::parse(query).unwrap();
+        let mut cache = PreparedCache::new(4);
+        for _ in 0..3 {
+            assert!(matches!(
+                cache.prepare_decision(query, template.clone(), 0, PrepareRequest::Execute,),
+                PrepareDecision::Outcome(PrepareOutcome::Deferred(_, _), _)
+            ));
+        }
+        assert!(matches!(
+            cache.prepare_decision(query, template, 0, PrepareRequest::Force),
+            PrepareDecision::Prepare
+        ));
+    }
+
+    #[test]
+    fn splits_prepare_metadata_on_the_server_parameter_marker() {
+        let field = |parameter| PreparedField {
+            data_type: MonetType::Int,
+            undetermined: false,
+            parameter,
+            name: (!parameter).then(|| "value".to_owned()),
+            origin_schema: None,
+            origin_table: None,
+        };
+        let fields = [field(false), field(false), field(true), field(true)];
+        assert_eq!(prepared_result_count(&fields, 2).unwrap(), 2);
+        assert_eq!(prepared_result_count(&fields, 99).unwrap(), 2);
+
+        let interleaved = [field(false), field(true), field(false)];
+        let failure = prepared_result_count(&interleaved, 1).unwrap_err();
+        assert!(
+            failure
+                .message
+                .contains("parameter rows must follow result rows")
+        );
+        assert!(failure.message.contains("SQL lexer found 1"));
     }
 
     #[test]
@@ -9020,6 +9700,7 @@ mod tests {
             "/* comment */ CREATE TABLE t(value INT)",
             "INSERT INTO t VALUES (1); DROP TABLE t",
             "SET SCHEMA sys",
+            "CALL p(?)",
         ] {
             assert!(query_invalidates_prepared_cache(query).unwrap(), "{query}");
         }
@@ -9028,6 +9709,7 @@ mod tests {
             "INSERT INTO t VALUES (1)",
             "UPDATE t SET value = 2",
             "DELETE FROM t",
+            "SELECT ? FROM t",
         ] {
             assert!(!query_invalidates_prepared_cache(query).unwrap(), "{query}");
         }
@@ -9156,6 +9838,7 @@ mod tests {
         let mut field = PreparedField {
             data_type: MonetType::Decimal(3, 2),
             undetermined: false,
+            parameter: false,
             name: Some("value".into()),
             origin_schema: None,
             origin_table: Some("shared".into()),

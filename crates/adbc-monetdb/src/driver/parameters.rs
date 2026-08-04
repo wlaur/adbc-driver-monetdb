@@ -55,6 +55,7 @@ enum ParameterSlot {
     Named(usize),
 }
 
+#[derive(Clone)]
 pub(super) struct QueryTemplate {
     query: String,
     segments: Vec<Range<usize>>,
@@ -81,7 +82,7 @@ impl QueryTemplate {
         row: usize,
         bind_by_name: bool,
     ) -> Result<String> {
-        let values = render_arguments(batch, row)?;
+        let values = render_template_arguments(batch, row)?;
         match &self.layout {
             ParameterLayout::Positional(count) => {
                 if bind_by_name {
@@ -180,6 +181,7 @@ pub(super) fn parameter_layout(query: &str) -> Result<ParameterLayout> {
     Ok(QueryTemplate::parse(query)?.layout)
 }
 
+#[cfg(test)]
 pub(super) fn render_null_parameters(query: &str) -> Result<String> {
     QueryTemplate::parse(query)?.render_nulls()
 }
@@ -206,6 +208,21 @@ pub(super) fn render_arguments(batch: &RecordBatch, row: usize) -> Result<Vec<St
         .iter()
         .zip(batch.schema().fields())
         .map(|(array, field)| literal(field, array.as_ref(), row))
+        .collect()
+}
+
+fn render_template_arguments(batch: &RecordBatch, row: usize) -> Result<Vec<String>> {
+    if row >= batch.num_rows() {
+        return Err(error(
+            "parameter row is out of bounds",
+            Status::InvalidArguments,
+        ));
+    }
+    batch
+        .columns()
+        .iter()
+        .zip(batch.schema().fields())
+        .map(|(array, field)| template_literal(field, array.as_ref(), row))
         .collect()
 }
 
@@ -561,6 +578,14 @@ pub(super) fn unbound_statements(query: &str) -> Result<Vec<&str>> {
     if !scan.slots.is_empty() {
         return Err(error("parameters are not bound", Status::InvalidState));
     }
+    statement_slices(query, scan)
+}
+
+pub(super) fn parameterized_statements(query: &str) -> Result<Vec<&str>> {
+    statement_slices(query, scan_query(query)?)
+}
+
+fn statement_slices(query: &str, scan: QueryScan) -> Result<Vec<&str>> {
     if scan.statements.is_empty() {
         return Err(error("SQL query is empty", Status::InvalidArguments));
     }
@@ -754,6 +779,30 @@ fn literal(field: &Field, array: &dyn Array, row: usize) -> Result<String> {
             ));
         }
     })
+}
+
+fn template_literal(field: &Field, array: &dyn Array, row: usize) -> Result<String> {
+    let value = literal(field, array, row)?;
+    if matches!(field.data_type(), DataType::Null) {
+        return Ok(value);
+    }
+    let extension = field
+        .metadata()
+        .get("ARROW:extension:name")
+        .map(String::as_str);
+    let requires_cast = array.is_null(row)
+        || matches!(
+            field.data_type(),
+            DataType::Int8 | DataType::Int16 | DataType::Int64 | DataType::Float32
+        )
+        || matches!(field.data_type(), DataType::Int32)
+            && extension != Some("monetdb.interval_month");
+    if !requires_cast {
+        return Ok(value);
+    }
+    let data_type = monetdb_arrow::sql_type_for_field(field)
+        .map_err(|value| error(value.to_string(), Status::NotImplemented))?;
+    Ok(format!("CAST({value} AS {data_type})"))
 }
 
 fn downcast<T: 'static>(array: &dyn Array, expected: DataType) -> Result<&T> {
@@ -1089,9 +1138,9 @@ mod tests {
     use std::{fmt::Write, sync::Arc, time::Duration};
 
     use arrow_array::{
-        DictionaryArray, DurationMillisecondArray, Float64Array, Int8Array, Int32Array,
-        StringArray, Time64MicrosecondArray, UInt64Array, builder::FixedSizeBinaryBuilder,
-        types::Int8Type,
+        DictionaryArray, DurationMillisecondArray, Float32Array, Float64Array, Int8Array,
+        Int16Array, Int32Array, Int64Array, StringArray, Time64MicrosecondArray, UInt64Array,
+        builder::FixedSizeBinaryBuilder, types::Int8Type,
     };
     use arrow_schema::{Field, Schema};
     use proptest::prelude::*;
@@ -1113,7 +1162,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             render_row("SELECT ?, '?', \"?\", ? -- ?", &batch, 0, false).unwrap(),
-            "SELECT 42, '?', \"?\", R'a''b' -- ?"
+            "SELECT CAST(42 AS INT), '?', \"?\", R'a''b' -- ?"
         );
     }
 
@@ -1215,7 +1264,7 @@ mod tests {
         );
         assert_eq!(
             render_row(query, &batch, 0, true).unwrap(),
-            "SELECT R'a''b', 7 + 7, ':ignored', TIME '12:34:56' -- :ignored"
+            "SELECT R'a''b', CAST(7 AS INT) + CAST(7 AS INT), ':ignored', TIME '12:34:56' -- :ignored"
         );
         assert_eq!(
             render_null_parameters(query).unwrap(),
@@ -1291,6 +1340,53 @@ mod tests {
             assert_eq!(date_literal(days).unwrap(), expected);
         }
         assert_eq!(format_time(3_723_123_456).unwrap(), "01:02:03.123456");
+    }
+
+    #[test]
+    fn pins_template_numeric_literals_to_the_arrow_field_type() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("i8", DataType::Int8, true),
+                Field::new("i16", DataType::Int16, true),
+                Field::new("i32", DataType::Int32, true),
+                Field::new("i64", DataType::Int64, true),
+                Field::new("f32", DataType::Float32, true),
+                Field::new("f64", DataType::Float64, true),
+            ])),
+            vec![
+                Arc::new(Int8Array::from(vec![Some(1), None])),
+                Arc::new(Int16Array::from(vec![Some(2), None])),
+                Arc::new(Int32Array::from(vec![Some(3), None])),
+                Arc::new(Int64Array::from(vec![Some(4), None])),
+                Arc::new(Float32Array::from(vec![Some(1.5), None])),
+                Arc::new(Float64Array::from(vec![Some(2.5), None])),
+            ],
+        )
+        .unwrap();
+        let query = "SELECT ?, ?, ?, ?, ?, ?";
+        assert_eq!(
+            render_row(query, &batch, 0, false).unwrap(),
+            "SELECT CAST(1 AS TINYINT), CAST(2 AS SMALLINT), CAST(3 AS INT), \
+             CAST(4 AS BIGINT), CAST(1.5e0 AS REAL), 2.5e0"
+        );
+        assert_eq!(
+            render_row(query, &batch, 1, false).unwrap(),
+            "SELECT CAST(NULL AS TINYINT), CAST(NULL AS SMALLINT), CAST(NULL AS INT), \
+             CAST(NULL AS BIGINT), CAST(NULL AS REAL), CAST(NULL AS DOUBLE)"
+        );
+        assert_eq!(
+            render_arguments(&batch, 0).unwrap(),
+            ["1", "2", "3", "4", "1.5e0", "2.5e0"]
+        );
+        assert_eq!(
+            template_literal(
+                &Field::new("null", DataType::Null, true),
+                &arrow_array::NullArray::new(1),
+                0,
+            )
+            .unwrap(),
+            "NULL"
+        );
     }
 
     #[test]

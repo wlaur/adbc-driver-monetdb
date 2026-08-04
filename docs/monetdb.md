@@ -65,6 +65,27 @@ returns the effective value. Prefetch remains enabled by default and can retain 
 bounded windows. The read-only statement option `adbc.monetdb.read_stats` reports the effective
 budget, per-window row and byte counts, observed widths, prefetch use, and buffer reuse as JSON.
 
+Arrow consumers retain about one result-sized set of buffers through `fetch_arrow_table` or
+`fetch_record_batch`. Converting a multi-chunk table to Polars with its default `rechunk=True`
+adds a full-size transient copy, so the fetch-then-convert path can briefly hold about twice the
+result size. `pl.from_arrow(table, rechunk=False)` avoids that copy for numeric columns; string
+conversion may still allocate. Rechunking is Polars behavior, not a driver option.
+
+## Parameters and prepared statements
+
+Deferred, successful, and refused positional PREPARE outcomes share a per-connection LRU. The
+default `adbc.monetdb.prepare_threshold=2` executes a one-row parameterized statement once with
+typed literals, then attempts PREPARE on its second execution. Set it to `1` to prepare immediately or `0` to
+remain on literals; it is available at database, connection, statement, and URI scope. Explicit
+schema introspection and multi-row updates prepare immediately. A refusal with a server SQL
+diagnostic keeps typed literal binding for that SQL; transport, timeout, and cancellation failures
+do not. Integer and `Float32` literals are cast to the canonical MonetDB type derived from the
+Arrow field so result schemas do not vary with parameter values.
+
+The read-only statement option `adbc.monetdb.prepare_status` reports the selected path, original
+diagnostic, and whether a refusal-cache entry was used. A failed literal execution remains the
+primary error and carries the original PREPARE diagnostic in `adbc.monetdb.prepare_error`.
+
 ## Bulk ingestion
 
 The driver measures and coalesces producer batches into COPY windows using a 512 MiB logical
@@ -111,7 +132,7 @@ encoded input passes a conservative expansion-aware gate and its incrementally r
 within 8 MiB; the row threshold adapts upward on measured higher-latency connections. Set
 `adbc.monetdb.ingest_insert_rows=0` to force COPY. The URI accepts `read_window_bytes`,
 `write_window_bytes`,
-`ingest_insert_rows`, `prepared_cache_capacity`, `wire_compression`, and `constrained_append` for
+`ingest_insert_rows`, `prepared_cache_capacity`, `prepare_threshold`, `wire_compression`, and `constrained_append` for
 URI-only consumers.
 
 Appending to an existing table matches stream columns to destination columns by name,
@@ -175,10 +196,12 @@ ADBC treats driver loading and the `uri` database option separately.
 {{ types|safe }}
 
 MonetDB `JSON` query results use Arrow's canonical
-[`arrow.json`](https://arrow.apache.org/docs/format/CanonicalExtensions.html#json) extension with
-UTF-8 string storage. Under the supported storage policy, Polars loads that storage as `String`;
-it is not automatically expanded to `Struct` because rows may contain objects, arrays, scalars,
-and JSON `null` with different shapes. Applications that know an object schema can explicitly use
+[`arrow.json`](https://arrow.apache.org/docs/format/CanonicalExtensions.html#json) extension. The
+Arrow field carries JSON extension metadata over physical UTF-8 string values; it is not an Arrow
+`Struct` and the driver does not parse every document into one. Arrow-aware consumers can preserve
+the JSON identity. Polars 1.x exposes the storage as `String` and may warn about the unknown
+extension unless its extension policy is configured. Rows may contain objects, arrays, scalars,
+and JSON `null` with different shapes; applications that know one object schema can explicitly use
 `str.json_decode(dtype=pl.Struct(...))`.
 
 Functions declared to return JSON—including `json.filter`, `json.keyarray`, and
