@@ -45,7 +45,7 @@ wheels = [
 
 [[package]]
 name = "adbc-driver-monetdb"
-version = "0.12.0"
+version = "0.12.1"
 source = { editable = "." }
 dependencies = [
     { name = "adbc-driver-manager" },
