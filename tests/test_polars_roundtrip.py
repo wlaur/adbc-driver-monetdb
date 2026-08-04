@@ -647,6 +647,118 @@ def test_literal_fallback_supports_bound_limit_and_offset(monetdb_uri: str) -> N
                 assert cursor.fetchone() == (datetime(2024, 3, 1), 42)
 
 
+def _prepare_path(cursor: dbapi.Cursor) -> str:
+    status = json.loads(cursor.adbc_statement.get_option(str(StatementOptions.PREPARE_STATUS)))
+    return cast("str", status["path"])
+
+
+@pytest.mark.integration
+def test_literal_fallback_supports_bound_sample_and_seed(monetdb_uri: str) -> None:
+    query = "SELECT value FROM (VALUES (1), (2), (3), (4)) AS data(value) SaMpLe ? SEED ?"
+    with dbapi.connect(monetdb_uri) as connection, connection.cursor() as cursor:
+        paths: list[str] = []
+        for _ in range(3):
+            cursor.execute(query, (2, 42))
+            assert len(cursor.fetchall()) == 2
+            paths.append(_prepare_path(cursor))
+    assert paths == ["literal", "prepared", "prepared"]
+
+
+@pytest.mark.integration
+def test_aborted_transaction_does_not_pin_the_literal_path(monetdb_uri: str) -> None:
+    query = "SELECT CAST(? AS BIGINT) AS value /* transient probe */"
+    with dbapi.connect(monetdb_uri) as connection, connection.cursor() as cursor:
+        cursor.execute(query, [1])
+        assert cursor.fetchone() == (1,)
+        assert _prepare_path(cursor) == "literal"
+
+        with pytest.raises(adbc_driver_manager.Error):
+            cursor.execute("SELECT * FROM transient_probe_missing_table")
+        with pytest.raises(adbc_driver_manager.Error, match="aborted"):
+            cursor.execute(query, [2])
+        connection.rollback()
+
+        paths: list[str] = []
+        for value in (3, 4):
+            cursor.execute(query, [value])
+            assert cursor.fetchone() == (value,)
+            paths.append(_prepare_path(cursor))
+    assert paths == ["literal", "prepared"]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("polars_type", "arrow_type", "values", "expected"),
+    [
+        (pl.UInt8(), pa.int16(), [5, 200], [5, 200]),
+        (pl.UInt16(), pa.int32(), [5, 40_000], [5, 40_000]),
+        (pl.UInt32(), pa.int64(), [5, 3_000_000_000], [5, 3_000_000_000]),
+        (
+            pl.UInt64(),
+            pa.decimal128(38, 0),
+            [5, 10_000_000_000_000_000_000],
+            [Decimal(5), Decimal(10_000_000_000_000_000_000)],
+        ),
+        (
+            pl.Decimal(precision=5, scale=2),
+            pa.decimal128(5, 2),
+            [Decimal("9.99"), Decimal("100.00")],
+            [Decimal("9.99"), Decimal("100.00")],
+        ),
+    ],
+)
+def test_literal_fallback_pins_unsigned_and_decimal_result_schema(
+    monetdb_uri: str,
+    polars_type: pl.DataType,
+    arrow_type: object,
+    values: list[object],
+    expected: list[object],
+) -> None:
+    # Both parameter rows must produce one result schema. Without a pinned CAST the narrow and
+    # the wide value of each pair are different MonetDB types, which aborts the second row of a
+    # bound SELECT with "parameterized query schema changed between rows".
+    parameters = pl.DataFrame({"0": pl.Series("0", values, dtype=polars_type)})
+    with dbapi.connect(monetdb_uri) as connection, connection.cursor() as cursor:
+        cursor.execute("SELECT ? AS value", parameters)
+        table = cast("_ArrowTable", cursor.fetch_arrow_table())
+    assert table.schema.field("value").type == arrow_type
+    assert table.column("value").to_pylist() == expected
+
+
+@pytest.mark.integration
+def test_one_row_bound_dml_follows_the_prepare_threshold(monetdb_uri: str) -> None:
+    with dbapi.connect(monetdb_uri, autocommit=True) as connection, connection.cursor() as cursor:
+        try:
+            cursor.execute("CREATE TABLE bound_dml_threshold(value INT)")
+            paths: list[str] = []
+            for value in (1, 2, 3):
+                cursor.executemany("INSERT INTO bound_dml_threshold VALUES (?)", [(value,)])
+                paths.append(_prepare_path(cursor))
+            assert paths == ["literal", "prepared", "prepared"]
+            with connection.cursor() as batched:
+                batched.executemany("INSERT INTO bound_dml_threshold VALUES (? + 10)", [(4,), (5,)])
+                assert _prepare_path(batched) == "prepared"
+            cursor.execute("SELECT COUNT(*) FROM bound_dml_threshold")
+            assert cursor.fetchone() == (5,)
+        finally:
+            cursor.execute("DROP TABLE IF EXISTS bound_dml_threshold")
+
+
+@pytest.mark.integration
+def test_bound_select_rowcount_does_not_change_with_the_prepare_path(monetdb_uri: str) -> None:
+    query = "SELECT value FROM (VALUES (1), (2)) AS data(value) WHERE value >= ?"
+    with dbapi.connect(monetdb_uri) as connection, connection.cursor() as cursor:
+        counts: list[int] = []
+        paths: list[str] = []
+        for _ in range(3):
+            cursor.execute(query, [1])
+            counts.append(cursor.rowcount)
+            paths.append(_prepare_path(cursor))
+            assert cursor.fetchall() == [(1,), (2,)]
+    assert paths == ["literal", "prepared", "prepared"]
+    assert counts == [-1, -1, -1]
+
+
 @pytest.mark.integration
 def test_prepare_outcome_status_negative_cache_and_error_details(monetdb_uri: str) -> None:
     fallback_query = "SELECT ? IN (?, ?)"
@@ -718,11 +830,13 @@ def test_prepare_outcome_status_negative_cache_and_error_details(monetdb_uri: st
             assert diagnostic["sqlstate"] == sqlstate
             assert diagnostic["message"]
 
-        with (
-            connection.cursor() as unparameterized,
-            pytest.raises(adbc_driver_manager.ProgrammingError, match="syntax error"),
-        ):
-            unparameterized.adbc_prepare("SELCT 1")
+        with connection.cursor() as unparameterized:
+            # A statement without placeholders has nothing to prepare: the empty parameter
+            # schema is known without asking the server, so the syntax error surfaces at
+            # execution instead of at preparation.
+            assert str(cast("object", unparameterized.adbc_prepare("SELCT 1"))) == ""
+            with pytest.raises(adbc_driver_manager.ProgrammingError, match="syntax error"):
+                unparameterized.execute("SELCT 1")
 
 
 @pytest.mark.integration

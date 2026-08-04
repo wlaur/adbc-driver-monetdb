@@ -78,9 +78,11 @@ default `adbc.monetdb.prepare_threshold=2` executes a one-row parameterized stat
 typed literals, then attempts PREPARE on its second execution. Set it to `1` to prepare immediately or `0` to
 remain on literals; it is available at database, connection, statement, and URI scope. Explicit
 schema introspection and multi-row updates prepare immediately. A refusal with a server SQL
-diagnostic keeps typed literal binding for that SQL; transport, timeout, and cancellation failures
-do not. Integer and `Float32` literals are cast to the canonical MonetDB type derived from the
-Arrow field so result schemas do not vary with parameter values.
+diagnostic keeps typed literal binding for that SQL; transport, timeout, cancellation, and
+connection-state failures do not. Numeric literals are cast to the canonical MonetDB type derived
+from the Arrow field so result schemas do not vary with parameter values. Parameters in a
+row-count position (`LIMIT`, `OFFSET`, `FETCH FIRST`/`NEXT`, `SAMPLE`, `SEED`) render as bare
+integers because MonetDB's grammar rejects an expression there.
 
 The read-only statement option `adbc.monetdb.prepare_status` reports the selected path, original
 diagnostic, and whether a refusal-cache entry was used. A failed literal execution remains the

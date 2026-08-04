@@ -400,6 +400,17 @@ fn terminates_block(word: &str, block: ProceduralBlock) -> bool {
     }
 }
 
+// sql/server/sql_parser.y accepts only a bare number or a placeholder in the row-count positions:
+// `opt_limit`/`opt_offset` take `poslng` or `param`, `opt_sample` takes `poslng`, `INTNUM`, or
+// `param`, and `opt_seed` takes `intval` or `param`. A CAST expression is a syntax error there
+// ("expecting sqlINT or INTNUM or ':' or '?'"), so parameters in these positions stay uncast.
+fn is_bare_integer_keyword(word: &str) -> bool {
+    word.eq_ignore_ascii_case("limit")
+        || word.eq_ignore_ascii_case("offset")
+        || word.eq_ignore_ascii_case("sample")
+        || word.eq_ignore_ascii_case("seed")
+}
+
 fn scan_query(query: &str) -> Result<QueryScan> {
     let bytes = query.as_bytes();
     let mut state = LexState::Normal;
@@ -539,8 +550,7 @@ fn scan_query(query: &str) -> Result<QueryScan> {
                     }
                     let word = &query[index..end];
                     procedural.observe_word(word);
-                    bare_integer_parameter = word.eq_ignore_ascii_case("limit")
-                        || word.eq_ignore_ascii_case("offset")
+                    bare_integer_parameter = is_bare_integer_keyword(word)
                         || fetch_row_count
                             && (word.eq_ignore_ascii_case("first")
                                 || word.eq_ignore_ascii_case("next"));
@@ -856,19 +866,35 @@ fn typed_template_literal(
         .metadata()
         .get("ARROW:extension:name")
         .map(String::as_str);
-    let requires_cast = array.is_null(row)
-        || matches!(
-            field.data_type(),
-            DataType::Int8 | DataType::Int16 | DataType::Int64 | DataType::Float32
-        )
-        || matches!(field.data_type(), DataType::Int32)
-            && extension != Some("monetdb.interval_month");
+    let requires_cast = array.is_null(row) || value_dependent_literal_type(field, extension);
     if !requires_cast {
         return Ok(value);
     }
     let data_type = monetdb_arrow::sql_type_for_field(field)
         .map_err(|value| error(value.to_string(), Status::NotImplemented))?;
     Ok(format!("CAST({value} AS {data_type})"))
+}
+
+// MonetDB derives the SQL type of a numeric literal from the value: `5` is TINYINT where `200` is
+// SMALLINT, `9.99` is DECIMAL(3,2) where `10.00` is DECIMAL(4,2), and every approximate literal is
+// DOUBLE. Casting to the type the bound Arrow field maps to keeps the literal path's result schema
+// identical to the prepared path's and stable across rows. Literal widths of the remaining types
+// vary without changing the Arrow type they decode back to, so those stay uncast.
+fn value_dependent_literal_type(field: &Field, extension: Option<&str>) -> bool {
+    match field.data_type() {
+        DataType::Int32 => extension != Some("monetdb.interval_month"),
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64
+        | DataType::Float16
+        | DataType::Float32
+        | DataType::Decimal128(_, _) => true,
+        _ => false,
+    }
 }
 
 fn downcast<T: 'static>(array: &dyn Array, expected: DataType) -> Result<&T> {
@@ -1204,9 +1230,11 @@ mod tests {
     use std::{fmt::Write, sync::Arc, time::Duration};
 
     use arrow_array::{
-        DictionaryArray, DurationMillisecondArray, Float32Array, Float64Array, Int8Array,
-        Int16Array, Int32Array, Int64Array, StringArray, Time64MicrosecondArray, UInt64Array,
-        builder::FixedSizeBinaryBuilder, types::Int8Type,
+        ArrowPrimitiveType, DictionaryArray, DurationMillisecondArray, Float32Array, Float64Array,
+        Int8Array, Int16Array, Int32Array, Int64Array, StringArray, Time64MicrosecondArray,
+        UInt64Array,
+        builder::FixedSizeBinaryBuilder,
+        types::{Float16Type, Int8Type},
     };
     use arrow_schema::{Field, Schema};
     use proptest::prelude::*;
@@ -1244,13 +1272,13 @@ mod tests {
         )
         .unwrap();
         let query = "SELECT JSON '{\"limit\":\"?\",\"offset\":\"?\",\"fetch\":\"next ?\"}', \
-                     'LIMIT ? OFFSET ?', \"limit\", ? \
-                     /* LIMIT ? OFFSET ? FETCH NEXT ? */ -- LIMIT ?\n";
+                     'LIMIT ? SAMPLE ? SEED ?', \"limit\", ? \
+                     /* LIMIT ? OFFSET ? FETCH NEXT ? SAMPLE ? */ -- LIMIT ?\n";
         assert_eq!(
             render_row(query, &batch, 0, false).unwrap(),
             "SELECT JSON '{\"limit\":\"?\",\"offset\":\"?\",\"fetch\":\"next ?\"}', \
-             'LIMIT ? OFFSET ?', \"limit\", CAST(42 AS BIGINT) \
-             /* LIMIT ? OFFSET ? FETCH NEXT ? */ -- LIMIT ?\n"
+             'LIMIT ? SAMPLE ? SEED ?', \"limit\", CAST(42 AS BIGINT) \
+             /* LIMIT ? OFFSET ? FETCH NEXT ? SAMPLE ? */ -- LIMIT ?\n"
         );
     }
 
@@ -1432,39 +1460,61 @@ mod tests {
 
     #[test]
     fn pins_template_numeric_literals_to_the_arrow_field_type() {
+        type Half = <Float16Type as ArrowPrimitiveType>::Native;
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
                 Field::new("i8", DataType::Int8, true),
                 Field::new("i16", DataType::Int16, true),
                 Field::new("i32", DataType::Int32, true),
                 Field::new("i64", DataType::Int64, true),
+                Field::new("u8", DataType::UInt8, true),
+                Field::new("u16", DataType::UInt16, true),
+                Field::new("u32", DataType::UInt32, true),
+                Field::new("u64", DataType::UInt64, true),
+                Field::new("f16", DataType::Float16, true),
                 Field::new("f32", DataType::Float32, true),
                 Field::new("f64", DataType::Float64, true),
+                Field::new("decimal", DataType::Decimal128(4, 2), true),
             ])),
             vec![
                 Arc::new(Int8Array::from(vec![Some(1), None])),
                 Arc::new(Int16Array::from(vec![Some(2), None])),
                 Arc::new(Int32Array::from(vec![Some(3), None])),
                 Arc::new(Int64Array::from(vec![Some(4), None])),
+                Arc::new(UInt8Array::from(vec![Some(5), None])),
+                Arc::new(UInt16Array::from(vec![Some(6), None])),
+                Arc::new(UInt32Array::from(vec![Some(7), None])),
+                Arc::new(UInt64Array::from(vec![Some(8), None])),
+                Arc::new(Float16Array::from(vec![Some(Half::from_f32(0.5)), None])),
                 Arc::new(Float32Array::from(vec![Some(1.5), None])),
                 Arc::new(Float64Array::from(vec![Some(2.5), None])),
+                Arc::new(
+                    Decimal128Array::from(vec![Some(999), None])
+                        .with_precision_and_scale(4, 2)
+                        .unwrap(),
+                ),
             ],
         )
         .unwrap();
-        let query = "SELECT ?, ?, ?, ?, ?, ?";
+        let query = "SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?";
         assert_eq!(
             render_row(query, &batch, 0, false).unwrap(),
-            "SELECT CAST(1 AS TINYINT), CAST(2 AS SMALLINT), CAST(3 AS INT), \
-             CAST(4 AS BIGINT), CAST(1.5e0 AS REAL), 2.5e0"
+            "SELECT CAST(1 AS TINYINT), CAST(2 AS SMALLINT), CAST(3 AS INT), CAST(4 AS BIGINT), \
+             CAST(5 AS SMALLINT), CAST(6 AS INT), CAST(7 AS BIGINT), CAST(8 AS HUGEINT), \
+             CAST(5e-1 AS REAL), CAST(1.5e0 AS REAL), 2.5e0, CAST(9.99 AS DECIMAL(4, 2))"
         );
         assert_eq!(
             render_row(query, &batch, 1, false).unwrap(),
             "SELECT CAST(NULL AS TINYINT), CAST(NULL AS SMALLINT), CAST(NULL AS INT), \
-             CAST(NULL AS BIGINT), CAST(NULL AS REAL), CAST(NULL AS DOUBLE)"
+             CAST(NULL AS BIGINT), CAST(NULL AS SMALLINT), CAST(NULL AS INT), \
+             CAST(NULL AS BIGINT), CAST(NULL AS HUGEINT), CAST(NULL AS REAL), \
+             CAST(NULL AS REAL), CAST(NULL AS DOUBLE), CAST(NULL AS DECIMAL(4, 2))"
         );
         assert_eq!(
             render_arguments(&batch, 0).unwrap(),
-            ["1", "2", "3", "4", "1.5e0", "2.5e0"]
+            [
+                "1", "2", "3", "4", "5", "6", "7", "8", "5e-1", "1.5e0", "2.5e0", "9.99"
+            ]
         );
         let null_field = Field::new("null", DataType::Null, true);
         let null_array = arrow_array::NullArray::new(1);
@@ -1565,6 +1615,34 @@ mod tests {
             .unwrap(),
             "SELECT CAST(7 AS INT) AS value FROM values_table \
              OFFSET /* generated */ 1 ROWS FETCH NeXt\n2 ROWS ONLY"
+        );
+    }
+
+    #[test]
+    fn renders_sample_and_seed_parameters_as_bare_integer_literals() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("value", DataType::Int32, false),
+                Field::new("rows", DataType::Int64, false),
+                Field::new("seed", DataType::Int32, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![7])),
+                Arc::new(Int64Array::from(vec![10])),
+                Arc::new(Int32Array::from(vec![42])),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            render_row(
+                "SELECT ? AS value FROM values_table SaMpLe /* generated */ ? SEED\n?",
+                &batch,
+                0,
+                false,
+            )
+            .unwrap(),
+            "SELECT CAST(7 AS INT) AS value FROM values_table \
+             SaMpLe /* generated */ 10 SEED\n42"
         );
     }
 

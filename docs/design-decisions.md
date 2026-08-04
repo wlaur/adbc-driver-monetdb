@@ -287,6 +287,11 @@ requirements change their premises.
   positions and can add or change diagnostics as its type propagator evolves. Diagnostic text is
   therefore not a stable capability boundary. Any completed server SQL diagnostic from `PREPARE`
   selects the typed-literal path; transport, timeout, and cancellation failures remain terminal.
+  So do connection-state diagnostics (SQLSTATE classes 25, 40, and HY): an aborted transaction
+  fails the probe's `SAVEPOINT` before MonetDB parses the statement, which says nothing about
+  whether the statement can be prepared. Treating those as a refusal cached a verdict that pinned
+  a pooled connection to literals for the rest of its life, so they now fail the execution that
+  met them and leave the cache untouched.
   An invalid statement still fails when the rendered SQL is prepared or executed. If a NULL-only
   schema probe cannot establish that distinction, the original `PREPARE` diagnostic is returned;
   if concrete execution fails, its diagnostic remains primary and the prepare diagnostic is
@@ -296,17 +301,31 @@ requirements change their premises.
   parameterized statement executes once as a typed literal, the second execution probes PREPARE,
   and later executions reuse an accepted plan. Threshold zero stays literal and threshold one
   preserves eager prepare;
-  explicit schema introspection and multi-row updates force preparation. Reuse count is the only
+  explicit schema introspection and multi-row updates force preparation, while a one-row bound
+  update is an ordinary execution and follows the threshold. Deciding that reads the leading rows
+  of the bound stream and pushes them back, which the batch would have buffered anyway.
+  A statement without placeholders has nothing to prepare: its empty parameter schema is answered
+  from client state, and its SQL is validated when it executes. A row-returning bound statement
+  reports no affected-row count on either path, because MonetDB supplies one for a literal
+  execution but not for `EXECUTE`, and DB-API `rowcount` must not depend on which path a repeated
+  execution took. Reuse count is the only
   heuristic because SQL length does not predict future reuse. A rejected SQL shape pays the server
   probe once, including across new statements, and a server version that later accepts the shape
   returns to the prepared path after normal cache invalidation. `adbc.monetdb.prepare_status`
   exposes the selected path, original diagnostic, and negative-cache hit without making the
   diagnostic classifier part of the public contract.
-- Literal-template rendering casts Arrow `Int8`, `Int16`, `Int32`, `Int64`, and `Float32` values to
-  the SQL type supplied by the shared Arrow-to-MonetDB mapping. This preserves the bound Arrow
-  schema when the concrete value or a NULL would otherwise let MonetDB choose a wider or unknown
-  result type. Prepared `EXECUTE` arguments stay uncast because the server already has their
-  declared parameter types.
+- Literal-template rendering casts every Arrow numeric whose literal SQL type follows the value —
+  the signed and unsigned integers, `Float16`, `Float32`, and `Decimal128` — to the SQL type
+  supplied by the shared Arrow-to-MonetDB mapping. This preserves the bound Arrow schema when the
+  concrete value or a NULL would otherwise let MonetDB choose a wider or unknown result type; `5`
+  is `TINYINT` where `200` is `SMALLINT`, and one uncast pair aborts a multi-row bound SELECT
+  between rows. Text, binary, and temporal literals stay uncast: their widths vary without
+  changing the Arrow type they decode back to. Prepared `EXECUTE` arguments stay uncast because
+  the server already has their declared parameter types.
+- The row-count grammar positions take no expression, so a parameter after `LIMIT`, `OFFSET`,
+  `FETCH FIRST`/`NEXT`, `SAMPLE`, or `SEED` renders as a bare integer literal instead. That set is
+  the complete list of parameterizable bare-integer positions in the DML grammar; window-frame
+  bounds accept expressions and need no exception.
 - PREPARE metadata is split using MonetDB's structural marker: parameter rows have SQL NULL in the
   column-name field and follow result rows. The SQL lexer count is retained only in diagnostics for
   malformed server metadata, not used as the split boundary. This follows MonetDB's
