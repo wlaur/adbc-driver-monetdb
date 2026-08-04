@@ -4031,8 +4031,8 @@ SOFTWARE.
 ================================================================================
 MIT License
 ================================================================================
-- adbc-monetdb 0.12.0 https://github.com/wlaur/adbc-driver-monetdb
-- monetdb-arrow 0.12.0 https://github.com/wlaur/adbc-driver-monetdb
+- adbc-monetdb 0.12.1 https://github.com/wlaur/adbc-driver-monetdb
+- monetdb-arrow 0.12.1 https://github.com/wlaur/adbc-driver-monetdb
 - libm 0.2.16 https://github.com/rust-lang/compiler-builtins
 
 MIT License

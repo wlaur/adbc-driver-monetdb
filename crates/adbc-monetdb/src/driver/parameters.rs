@@ -55,11 +55,17 @@ enum ParameterSlot {
     Named(usize),
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TemplateSlot {
+    parameter: ParameterSlot,
+    bare_integer_literal: bool,
+}
+
 #[derive(Clone)]
 pub(super) struct QueryTemplate {
     query: String,
     segments: Vec<Range<usize>>,
-    slots: Vec<ParameterSlot>,
+    slots: Vec<TemplateSlot>,
     layout: ParameterLayout,
 }
 
@@ -100,8 +106,10 @@ impl QueryTemplate {
                         Status::InvalidArguments,
                     ));
                 }
-                self.render(|slot| match slot {
-                    ParameterSlot::Positional(index) => Ok(values[*index].as_str()),
+                self.render(|slot| match slot.parameter {
+                    ParameterSlot::Positional(index) => {
+                        Ok(values[index].render(slot.bare_integer_literal))
+                    }
                     ParameterSlot::Named(_) => unreachable!("layout and slots agree"),
                 })
             }
@@ -115,10 +123,7 @@ impl QueryTemplate {
                 let schema = batch.schema();
                 let mut named_values = HashMap::with_capacity(values.len());
                 for (field, value) in schema.fields().iter().zip(&values) {
-                    if named_values
-                        .insert(field.name().as_str(), value.as_str())
-                        .is_some()
-                    {
+                    if named_values.insert(field.name().as_str(), value).is_some() {
                         return Err(error(
                             format!("bound parameter name '{}' is duplicated", field.name()),
                             Status::InvalidArguments,
@@ -145,13 +150,13 @@ impl QueryTemplate {
                         Status::InvalidArguments,
                     ));
                 }
-                self.render(|slot| match slot {
+                self.render(|slot| match slot.parameter {
                     ParameterSlot::Named(index) => named_values
-                        .get(names[*index].as_str())
-                        .copied()
+                        .get(names[index].as_str())
+                        .map(|value| value.render(slot.bare_integer_literal))
                         .ok_or_else(|| {
                             error(
-                                format!("named parameter '{}' was not bound", names[*index]),
+                                format!("named parameter '{}' was not bound", names[index]),
                                 Status::InvalidArguments,
                             )
                         }),
@@ -163,7 +168,7 @@ impl QueryTemplate {
 
     fn render<'a>(
         &self,
-        mut resolve: impl FnMut(&ParameterSlot) -> Result<&'a str>,
+        mut resolve: impl FnMut(&TemplateSlot) -> Result<&'a str>,
     ) -> Result<String> {
         let mut output = String::with_capacity(self.query.len());
         for (segment, slot) in self.segments.iter().zip(&self.slots) {
@@ -211,7 +216,22 @@ pub(super) fn render_arguments(batch: &RecordBatch, row: usize) -> Result<Vec<St
         .collect()
 }
 
-fn render_template_arguments(batch: &RecordBatch, row: usize) -> Result<Vec<String>> {
+struct TemplateArgument {
+    literal: String,
+    typed: String,
+}
+
+impl TemplateArgument {
+    fn render(&self, bare_integer_literal: bool) -> &str {
+        if bare_integer_literal {
+            &self.literal
+        } else {
+            &self.typed
+        }
+    }
+}
+
+fn render_template_arguments(batch: &RecordBatch, row: usize) -> Result<Vec<TemplateArgument>> {
     if row >= batch.num_rows() {
         return Err(error(
             "parameter row is out of bounds",
@@ -222,7 +242,11 @@ fn render_template_arguments(batch: &RecordBatch, row: usize) -> Result<Vec<Stri
         .columns()
         .iter()
         .zip(batch.schema().fields())
-        .map(|(array, field)| template_literal(field, array.as_ref(), row))
+        .map(|(array, field)| {
+            let literal = literal(field, array.as_ref(), row)?;
+            let typed = typed_template_literal(field, array.as_ref(), row, literal.clone())?;
+            Ok(TemplateArgument { literal, typed })
+        })
         .collect()
 }
 
@@ -240,6 +264,7 @@ enum LexState {
 struct ScannedSlot {
     range: Range<usize>,
     name: Option<Range<usize>>,
+    bare_integer_literal: bool,
 }
 
 struct QueryScan {
@@ -384,6 +409,8 @@ fn scan_query(query: &str) -> Result<QueryScan> {
     let mut statements = Vec::new();
     let mut slots = Vec::new();
     let mut procedural = ProceduralScan::new();
+    let mut bare_integer_parameter = false;
+    let mut fetch_row_count = false;
     while index < bytes.len() {
         let current = bytes[index];
         let next = bytes.get(index + 1).copied();
@@ -398,6 +425,8 @@ fn scan_query(query: &str) -> Result<QueryScan> {
                         statement_start = index + 1;
                         statement_has_code = false;
                         procedural.reset();
+                        bare_integer_parameter = false;
+                        fetch_row_count = false;
                     }
                     index += 1;
                 }
@@ -421,7 +450,10 @@ fn scan_query(query: &str) -> Result<QueryScan> {
                     slots.push(ScannedSlot {
                         range: index..index + 1,
                         name: None,
+                        bare_integer_literal: bare_integer_parameter,
                     });
+                    bare_integer_parameter = false;
+                    fetch_row_count = false;
                     index += 1;
                 }
                 (b':', Some(next), _)
@@ -448,36 +480,51 @@ fn scan_query(query: &str) -> Result<QueryScan> {
                     slots.push(ScannedSlot {
                         range: index..end,
                         name: Some(index + 1..end),
+                        bare_integer_literal: bare_integer_parameter,
                     });
+                    bare_integer_parameter = false;
+                    fetch_row_count = false;
                     index = end;
                 }
                 (b'r' | b'R' | b'x' | b'X', Some(b'\''), _) => {
                     statement_has_code = true;
+                    bare_integer_parameter = false;
+                    fetch_row_count = false;
                     state = LexState::RawSingleQuote;
                     index += 2;
                 }
                 (b'e' | b'E', Some(b'\''), _) => {
                     statement_has_code = true;
+                    bare_integer_parameter = false;
+                    fetch_row_count = false;
                     state = LexState::EscapedSingleQuote;
                     index += 2;
                 }
                 (b'u' | b'U', Some(b'&'), Some(b'\'')) => {
                     statement_has_code = true;
+                    bare_integer_parameter = false;
+                    fetch_row_count = false;
                     state = LexState::RawSingleQuote;
                     index += 3;
                 }
                 (b'u' | b'U', Some(b'&'), Some(b'"')) => {
                     statement_has_code = true;
+                    bare_integer_parameter = false;
+                    fetch_row_count = false;
                     state = LexState::DoubleQuote;
                     index += 3;
                 }
                 (b'\'', _, _) => {
                     statement_has_code = true;
+                    bare_integer_parameter = false;
+                    fetch_row_count = false;
                     state = LexState::SingleQuote;
                     index += 1;
                 }
                 (b'"', _, _) => {
                     statement_has_code = true;
+                    bare_integer_parameter = false;
+                    fetch_row_count = false;
                     state = LexState::DoubleQuote;
                     index += 1;
                 }
@@ -490,11 +537,20 @@ fn scan_query(query: &str) -> Result<QueryScan> {
                     {
                         end += 1;
                     }
-                    procedural.observe_word(&query[index..end]);
+                    let word = &query[index..end];
+                    procedural.observe_word(word);
+                    bare_integer_parameter = word.eq_ignore_ascii_case("limit")
+                        || word.eq_ignore_ascii_case("offset")
+                        || fetch_row_count
+                            && (word.eq_ignore_ascii_case("first")
+                                || word.eq_ignore_ascii_case("next"));
+                    fetch_row_count = word.eq_ignore_ascii_case("fetch");
                     index = end;
                 }
                 _ => {
                     statement_has_code = true;
+                    bare_integer_parameter = false;
+                    fetch_row_count = false;
                     index = next_char(query, index);
                 }
             },
@@ -620,7 +676,10 @@ fn compile_query(query: &str) -> Result<QueryTemplate> {
                         Status::InvalidArguments,
                     ));
                 }
-                slots.push(ParameterSlot::Positional(positional_count));
+                slots.push(TemplateSlot {
+                    parameter: ParameterSlot::Positional(positional_count),
+                    bare_integer_literal: scanned.bare_integer_literal,
+                });
                 positional_count += 1;
             }
             Some(name_range) => {
@@ -635,7 +694,10 @@ fn compile_query(query: &str) -> Result<QueryTemplate> {
                     named.push(name.to_owned());
                     named.len() - 1
                 });
-                slots.push(ParameterSlot::Named(name_index));
+                slots.push(TemplateSlot {
+                    parameter: ParameterSlot::Named(name_index),
+                    bare_integer_literal: scanned.bare_integer_literal,
+                });
             }
         }
         segment_start = scanned.range.end;
@@ -781,8 +843,12 @@ fn literal(field: &Field, array: &dyn Array, row: usize) -> Result<String> {
     })
 }
 
-fn template_literal(field: &Field, array: &dyn Array, row: usize) -> Result<String> {
-    let value = literal(field, array, row)?;
+fn typed_template_literal(
+    field: &Field,
+    array: &dyn Array,
+    row: usize,
+    value: String,
+) -> Result<String> {
     if matches!(field.data_type(), DataType::Null) {
         return Ok(value);
     }
@@ -1167,6 +1233,28 @@ mod tests {
     }
 
     #[test]
+    fn ignores_row_limit_keywords_and_parameters_inside_literals_and_comments() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Int64,
+                false,
+            )])),
+            vec![Arc::new(Int64Array::from(vec![42]))],
+        )
+        .unwrap();
+        let query = "SELECT JSON '{\"limit\":\"?\",\"offset\":\"?\",\"fetch\":\"next ?\"}', \
+                     'LIMIT ? OFFSET ?', \"limit\", ? \
+                     /* LIMIT ? OFFSET ? FETCH NEXT ? */ -- LIMIT ?\n";
+        assert_eq!(
+            render_row(query, &batch, 0, false).unwrap(),
+            "SELECT JSON '{\"limit\":\"?\",\"offset\":\"?\",\"fetch\":\"next ?\"}', \
+             'LIMIT ? OFFSET ?', \"limit\", CAST(42 AS BIGINT) \
+             /* LIMIT ? OFFSET ? FETCH NEXT ? */ -- LIMIT ?\n"
+        );
+    }
+
+    #[test]
     fn validates_parameter_counts_and_lexing() {
         assert_eq!(parameter_layout("SELECT ? /* ? */").unwrap().count(), 1);
         assert_eq!(
@@ -1378,14 +1466,105 @@ mod tests {
             render_arguments(&batch, 0).unwrap(),
             ["1", "2", "3", "4", "1.5e0", "2.5e0"]
         );
+        let null_field = Field::new("null", DataType::Null, true);
+        let null_array = arrow_array::NullArray::new(1);
         assert_eq!(
-            template_literal(
-                &Field::new("null", DataType::Null, true),
-                &arrow_array::NullArray::new(1),
+            typed_template_literal(
+                &null_field,
+                &null_array,
                 0,
+                literal(&null_field, &null_array, 0).unwrap(),
             )
             .unwrap(),
             "NULL"
+        );
+    }
+
+    #[test]
+    fn renders_limit_and_offset_parameters_as_bare_integer_literals() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("value", DataType::Int32, false),
+                Field::new("minimum", DataType::Int64, false),
+                Field::new("limit", DataType::Int64, false),
+                Field::new("offset", DataType::Int32, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![10])),
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int32Array::from(vec![0])),
+            ],
+        )
+        .unwrap();
+        let query = "SELECT limited.total FROM (\
+                     SELECT source.total FROM (SELECT ? AS total) AS source \
+                     WHERE source.total >= ? ORDER BY source.total DESC \
+                     LiMiT /* generated */ ? OFFSET\n?\
+                     ) AS limited";
+        assert_eq!(
+            render_row(query, &batch, 0, false).unwrap(),
+            "SELECT limited.total FROM (\
+             SELECT source.total FROM (SELECT CAST(10 AS INT) AS total) AS source \
+             WHERE source.total >= CAST(1 AS BIGINT) ORDER BY source.total DESC \
+             LiMiT /* generated */ 1 OFFSET\n0\
+             ) AS limited"
+        );
+    }
+
+    #[test]
+    fn renders_named_limit_parameters_without_changing_other_integer_parameters() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("row_count", DataType::Int64, false),
+                Field::new("value", DataType::Int32, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![2])),
+                Arc::new(Int32Array::from(vec![7])),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            render_row(
+                "WITH source_rows AS (SELECT :value AS limit_value FROM values_table) \
+                 SELECT limit_value FROM source_rows LIMIT :row_count",
+                &batch,
+                0,
+                true,
+            )
+            .unwrap(),
+            "WITH source_rows AS (SELECT CAST(7 AS INT) AS limit_value FROM values_table) \
+             SELECT limit_value FROM source_rows LIMIT 2"
+        );
+    }
+
+    #[test]
+    fn renders_offset_fetch_parameters_as_bare_integer_literals() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("value", DataType::Int32, false),
+                Field::new("offset", DataType::Int64, false),
+                Field::new("row_count", DataType::Int32, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![7])),
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int32Array::from(vec![2])),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            render_row(
+                "SELECT ? AS value FROM values_table \
+                 OFFSET /* generated */ ? ROWS FETCH NeXt\n? ROWS ONLY",
+                &batch,
+                0,
+                false,
+            )
+            .unwrap(),
+            "SELECT CAST(7 AS INT) AS value FROM values_table \
+             OFFSET /* generated */ 1 ROWS FETCH NeXt\n2 ROWS ONLY"
         );
     }
 
