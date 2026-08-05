@@ -1,5 +1,7 @@
 import datetime
+import json
 from collections.abc import Iterator
+from typing import cast
 
 import pytest
 
@@ -9,6 +11,7 @@ SOURCE_TABLE = "adbc_remote_source"
 LOCAL_TABLE = "adbc_remote_local"
 DIMENSION_TABLE = "adbc_remote_dimension"
 MERGE_TABLE = "adbc_remote_merge"
+VIEW_TABLE = "adbc_remote_view"
 SOURCE_ROWS = 1_000
 
 
@@ -26,6 +29,7 @@ def remote_tables(
         dbapi.connect(source_uri, autocommit=True) as source,
         dbapi.connect(monetdb_uri, autocommit=True) as master,
     ):
+        master.execute(f"DROP VIEW IF EXISTS {VIEW_TABLE}")
         for table in (MERGE_TABLE, DIMENSION_TABLE, LOCAL_TABLE, SOURCE_TABLE):
             master.execute(f"DROP TABLE IF EXISTS {table}")
         source.execute(f"DROP TABLE IF EXISTS {SOURCE_TABLE}")
@@ -40,6 +44,7 @@ def remote_tables(
             f"CREATE REMOTE TABLE {SOURCE_TABLE}(id BIGINT, payload VARCHAR(64), observed_at TIMESTAMP) "
             f"ON {_sql_string(server_uri)} WITH USER {_sql_string(username)} PASSWORD {_sql_string(password)}"
         )
+        master.execute(f"CREATE VIEW {VIEW_TABLE} AS SELECT id, payload, observed_at FROM {SOURCE_TABLE}")
         master.execute(f"CREATE TABLE {LOCAL_TABLE}(id BIGINT, payload VARCHAR(64), observed_at TIMESTAMP)")
         master.execute(
             f"INSERT INTO {LOCAL_TABLE} VALUES "
@@ -60,6 +65,7 @@ def remote_tables(
         yield source_uri, monetdb_uri
     finally:
         with dbapi.connect(monetdb_uri, autocommit=True) as master:
+            master.execute(f"DROP VIEW IF EXISTS {VIEW_TABLE}")
             for table in (MERGE_TABLE, DIMENSION_TABLE, LOCAL_TABLE, SOURCE_TABLE):
                 master.execute(f"DROP TABLE IF EXISTS {table}")
         with dbapi.connect(source_uri, autocommit=True) as source:
@@ -100,6 +106,59 @@ def test_remote_table_fetches_through_xexportbin(
         f"remote-{SOURCE_ROWS - 1}",
         datetime.datetime(2024, 1, 1, 0, 16, 39),
     )
+
+
+@pytest.mark.integration
+def test_prepared_remote_query_falls_back_without_aborting_transaction(
+    remote_tables: tuple[str, str],
+) -> None:
+    _, master_uri = remote_tables
+    query = f"SELECT AVG(id) FROM {VIEW_TABLE} WHERE observed_at >= ? AND observed_at < ?"
+    parameters = (
+        datetime.datetime(2024, 1, 1),
+        datetime.datetime(2024, 1, 2),
+    )
+    statuses: list[dict[str, object]] = []
+    with dbapi.connect(master_uri) as connection:
+        for _ in range(3):
+            with connection.cursor() as cursor:
+                assert cursor.adbc_prepare(query) is not None
+                cursor.execute(query, parameters)
+                row = cursor.fetchone()
+                assert row is not None
+                assert float(cast("float", row[0])) == pytest.approx(499.5)
+                statuses.append(json.loads(cursor.adbc_statement.get_option(str(StatementOptions.PREPARE_STATUS))))
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1")
+            assert cursor.fetchone() == (1,)
+
+    assert [status["path"] for status in statuses] == ["literal"] * 3
+    assert [status["negative_cache_hit"] for status in statuses] == [False, True, True]
+    diagnostic = statuses[0]["original_diagnostic"]
+    assert isinstance(diagnostic, dict)
+    assert diagnostic["message"] == ("Exception occurred in the remote server, please check the log there")
+
+
+@pytest.mark.integration
+def test_failed_remote_literal_retry_preserves_transaction_and_prepared_plan(
+    remote_tables: tuple[str, str],
+) -> None:
+    _, master_uri = remote_tables
+    query = f"SELECT AVG(id / ?) FROM {VIEW_TABLE}"
+    with dbapi.connect(master_uri) as connection:
+        for _ in range(2):
+            with connection.cursor() as cursor:
+                assert cursor.adbc_prepare(query) is not None
+                with pytest.raises(
+                    dbapi.OperationalError,
+                    match="Exception occurred in the remote server",
+                ):
+                    cursor.execute(query, (0,))
+                status = json.loads(cursor.adbc_statement.get_option(str(StatementOptions.PREPARE_STATUS)))
+                assert status["path"] == "prepared"
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1")
+            assert cursor.fetchone() == (1,)
 
 
 @pytest.mark.integration

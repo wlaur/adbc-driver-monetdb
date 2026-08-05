@@ -8,7 +8,7 @@ use std::{
     path::Path,
     sync::{
         Arc, Mutex, MutexGuard, Weak,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel},
     },
     thread::{self, JoinHandle},
@@ -1472,17 +1472,44 @@ struct PreparedEntry {
     parameters: Schema,
     result: Schema,
     connection: Weak<DriverConnection>,
+    verified: AtomicBool,
+    literal_fallback: Mutex<Option<Arc<LiteralFallback>>>,
 }
 
 impl PreparedEntry {
-    fn new(metadata: PreparedMetadata, connection: &SharedConnection) -> Self {
+    fn new(metadata: PreparedMetadata, connection: &SharedConnection, query: &str) -> Self {
+        let verified = !prepared_execution_needs_verification(query, &metadata.result);
         Self {
             id: metadata.id,
             generation: connection.prepared_generation.load(Ordering::Acquire),
             parameters: metadata.parameters,
             result: metadata.result,
             connection: Arc::downgrade(connection),
+            verified: AtomicBool::new(verified),
+            literal_fallback: Mutex::new(None),
         }
+    }
+
+    fn is_verified(&self) -> bool {
+        self.verified.load(Ordering::Acquire)
+    }
+
+    fn mark_verified(&self) {
+        self.verified.store(true, Ordering::Release);
+    }
+
+    fn literal_fallback(&self) -> Option<Arc<LiteralFallback>> {
+        self.literal_fallback
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn demote(&self, fallback: Arc<LiteralFallback>) {
+        *self
+            .literal_fallback
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(fallback);
     }
 }
 
@@ -1705,6 +1732,30 @@ impl PreparedCache {
         );
         self.trim();
         PrepareOutcome::Literal(candidate)
+    }
+
+    fn replace_prepared_with_literal(
+        &mut self,
+        query: &str,
+        id: u64,
+        candidate: Arc<LiteralFallback>,
+    ) -> Arc<LiteralFallback> {
+        let query = normalize_prepared_query(query).to_owned();
+        match self.entries.get(&query).map(|entry| entry.outcome.clone()) {
+            Some(PrepareOutcome::Literal(fallback)) => return fallback,
+            Some(PrepareOutcome::Prepared(entry)) if entry.id != id => return candidate,
+            _ => {}
+        }
+        let last_used = self.next_use();
+        self.entries.insert(
+            query,
+            CachedPrepared {
+                outcome: PrepareOutcome::Literal(Arc::clone(&candidate)),
+                last_used,
+            },
+        );
+        self.trim();
+        candidate
     }
 
     fn remove_if_id(&mut self, query: &str, id: u64) {
@@ -2553,6 +2604,48 @@ impl Statement for MonetdbStatement {
                     .as_ref()
                     .is_some_and(|schema| schema.fields().is_empty())
                 {
+                    if let Some(query) = queries.take_if_single()? {
+                        let query = current_bound_query(&self.connection, &query, self.timeouts)?;
+                        if query
+                            .prepared
+                            .as_ref()
+                            .is_some_and(|invocation| !invocation.entry.is_verified())
+                        {
+                            let read_stats = Arc::new(Mutex::new(None));
+                            self.read_stats = Some(Arc::clone(&read_stats));
+                            let mut result = execute_unverified_prepared_result(
+                                &self.connection,
+                                &query,
+                                ReadExecutionOptions {
+                                    batch_rows: self.read_batch_rows,
+                                    window_bytes: self.read_window_bytes,
+                                    prefetch: self.read_prefetch,
+                                    measured_round_trip: self.measured_round_trip,
+                                    stats: Some(read_stats),
+                                },
+                                self.timeouts,
+                            )?;
+                            let schema = result.reader.schema();
+                            if !schema.fields().is_empty() {
+                                result.rows_affected = None;
+                            }
+                            self.prepared_result_schema = Some(schema.as_ref().clone());
+                            let fallback = self.prepared_entry.as_ref().and_then(|slot| {
+                                slot.lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .literal_fallback()
+                            });
+                            if let Some(fallback) = fallback {
+                                self.prepare_status = Some(PrepareStatus::literal(
+                                    Some(fallback.diagnostic.clone()),
+                                    false,
+                                ));
+                                self.literal_fallback = Some(fallback);
+                            }
+                            return Ok(result);
+                        }
+                        queries.pending.push_front(query);
+                    }
                     let rows_affected =
                         execute_updates_atomic(&self.connection, &mut queries, self.timeouts)?;
                     return Ok(StatementResult {
@@ -6196,6 +6289,7 @@ struct PreparedInvocation {
     plan: PreparedPlan,
     entry: Arc<PreparedEntry>,
     arguments: String,
+    literal_sql: Option<String>,
 }
 
 #[derive(Clone)]
@@ -6206,13 +6300,19 @@ struct BoundQuery {
 }
 
 impl BoundQuery {
-    fn prepared(plan: PreparedPlan, entry: Arc<PreparedEntry>, arguments: String) -> Self {
+    fn prepared(
+        plan: PreparedPlan,
+        entry: Arc<PreparedEntry>,
+        arguments: String,
+        literal_sql: Option<String>,
+    ) -> Self {
         Self {
             sql: format!("EXECUTE {}({arguments})", entry.id),
             prepared: Some(PreparedInvocation {
                 plan,
                 entry,
                 arguments,
+                literal_sql,
             }),
             prepare_diagnostic: None,
         }
@@ -6306,15 +6406,30 @@ impl Iterator for BoundQueryStream {
                 let row = self.next_row;
                 self.next_row += 1;
                 let query = match &self.prepared {
-                    Some(plan) => render_arguments(batch, row).map(|values| {
+                    Some(plan) => (|| {
                         let entry = Arc::clone(
                             &plan
                                 .entry
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner),
                         );
-                        BoundQuery::prepared(plan.clone(), entry, values.join(", "))
-                    }),
+                        if let Some(fallback) = entry.literal_fallback() {
+                            let sql = self.template.render_row(batch, row, self.bind_by_name)?;
+                            return Ok(BoundQuery::literal(sql, Some(&fallback)));
+                        }
+                        let literal_sql = if entry.is_verified() {
+                            None
+                        } else {
+                            Some(self.template.render_row(batch, row, self.bind_by_name)?)
+                        };
+                        let arguments = render_arguments(batch, row)?.join(", ");
+                        Ok(BoundQuery::prepared(
+                            plan.clone(),
+                            entry,
+                            arguments,
+                            literal_sql,
+                        ))
+                    })(),
                     None => self
                         .template
                         .render_row(batch, row, self.bind_by_name)
@@ -6356,6 +6471,201 @@ fn prepared_statement_missing(value: &Error) -> bool {
         && value.message.contains("EXEC: PREPARED Statement missing")
 }
 
+fn remote_prepared_execution_failed(value: &Error) -> bool {
+    value
+        .message
+        .contains("Exception occurred in the remote server, please check the log there")
+}
+
+fn prepared_execution_needs_verification(query: &str, result: &Schema) -> bool {
+    result.fields().is_empty()
+        && leading_sql_keyword(query).is_some_and(|keyword| {
+            matches!(
+                keyword.to_ascii_uppercase().as_str(),
+                "SELECT" | "WITH" | "VALUES"
+            )
+        })
+}
+
+struct PreparedExecutionSavepoint {
+    name: String,
+    retain_until_transaction_end: bool,
+}
+
+fn begin_prepared_execution_savepoint(
+    connection: &SharedConnection,
+    timeouts: Timeouts,
+) -> Result<Option<PreparedExecutionSavepoint>> {
+    let connection = lock_connection(connection)?;
+    if connection
+        .server_info()
+        .map_err(map_cursor_error)?
+        .autocommit
+    {
+        return Ok(None);
+    }
+    let retain_until_transaction_end =
+        transaction_scoped_temporary_table_state(&connection, None, timeouts)?.any;
+    let name = savepoint_name("prepared_execution");
+    let mut cursor = connection.cursor();
+    cursor.set_timeouts(timeouts);
+    cursor
+        .execute(&format!("SAVEPOINT {name}"))
+        .map_err(map_cursor_error)?;
+    Ok(Some(PreparedExecutionSavepoint {
+        name,
+        retain_until_transaction_end,
+    }))
+}
+
+fn complete_prepared_execution_savepoint(
+    connection: &SharedConnection,
+    savepoint: Option<&PreparedExecutionSavepoint>,
+    timeouts: Timeouts,
+) -> Result<()> {
+    let Some(savepoint) = savepoint.filter(|value| !value.retain_until_transaction_end) else {
+        return Ok(());
+    };
+    let connection = lock_connection(connection)?;
+    let mut cursor = connection.cursor();
+    cursor.set_timeouts(timeouts);
+    cursor
+        .execute(&format!("RELEASE SAVEPOINT {}", savepoint.name))
+        .map_err(map_cursor_error)
+}
+
+fn rollback_prepared_execution_savepoint(
+    connection: &SharedConnection,
+    savepoint: Option<&PreparedExecutionSavepoint>,
+    timeouts: Timeouts,
+) -> Result<()> {
+    let Some(savepoint) = savepoint else {
+        return Ok(());
+    };
+    let connection = lock_connection(connection)?;
+    let mut cursor = connection.cursor();
+    cursor.set_timeouts(timeouts);
+    cursor
+        .execute(&format!("ROLLBACK TO SAVEPOINT {}", savepoint.name))
+        .map_err(map_cursor_error)?;
+    Ok(())
+}
+
+fn literal_prepared_bound_query(
+    query: &BoundQuery,
+    diagnostic: Error,
+) -> Result<(BoundQuery, Arc<LiteralFallback>)> {
+    let invocation = query.prepared.as_ref().ok_or_else(|| {
+        error(
+            "cannot demote an unprepared parameter query",
+            Status::Internal,
+        )
+    })?;
+    let sql = invocation
+        .literal_sql
+        .clone()
+        .ok_or_else(|| error("prepared fallback SQL is unavailable", Status::Internal))?;
+    let candidate = Arc::new(LiteralFallback {
+        template: QueryTemplate::parse(&invocation.plan.query)?,
+        diagnostic,
+    });
+    Ok((BoundQuery::literal(sql, Some(&candidate)), candidate))
+}
+
+fn demote_prepared_bound_query(
+    query: &BoundQuery,
+    candidate: Arc<LiteralFallback>,
+) -> Result<Arc<LiteralFallback>> {
+    let invocation = query.prepared.as_ref().ok_or_else(|| {
+        error(
+            "cannot demote an unprepared parameter query",
+            Status::Internal,
+        )
+    })?;
+    let fallback = invocation
+        .plan
+        .cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .replace_prepared_with_literal(&invocation.plan.query, invocation.entry.id, candidate);
+    invocation.entry.demote(Arc::clone(&fallback));
+    Ok(fallback)
+}
+
+fn execute_unverified_prepared_result(
+    connection: &SharedConnection,
+    query: &BoundQuery,
+    read_options: ReadExecutionOptions,
+    timeouts: Timeouts,
+) -> Result<StatementResult> {
+    let invocation = query.prepared.as_ref().ok_or_else(|| {
+        error(
+            "prepared execution verification requires a prepared query",
+            Status::Internal,
+        )
+    })?;
+    let savepoint = begin_prepared_execution_savepoint(connection, timeouts)?;
+    match query_result_with_timeouts(connection, &query.sql, read_options.clone(), timeouts) {
+        Ok(result) => {
+            complete_prepared_execution_savepoint(connection, savepoint.as_ref(), timeouts)?;
+            invocation.entry.mark_verified();
+            Ok(result)
+        }
+        Err(mut value) if remote_prepared_execution_failed(&value) => {
+            if let Err(recovery) =
+                rollback_prepared_execution_savepoint(connection, savepoint.as_ref(), timeouts)
+            {
+                value.message = format!(
+                    "{}; restoring the transaction after prepared remote execution also failed: {}",
+                    value.message, recovery.message
+                );
+                return Err(value);
+            }
+            let (literal, candidate) = literal_prepared_bound_query(query, value)?;
+            let result = with_bound_query_diagnostic(
+                query_result_with_timeouts(connection, &literal.sql, read_options, timeouts),
+                &literal,
+            );
+            match result {
+                Ok(result) => {
+                    complete_prepared_execution_savepoint(
+                        connection,
+                        savepoint.as_ref(),
+                        timeouts,
+                    )?;
+                    demote_prepared_bound_query(query, candidate)?;
+                    Ok(result)
+                }
+                Err(mut value) => {
+                    if let Err(recovery) = rollback_prepared_execution_savepoint(
+                        connection,
+                        savepoint.as_ref(),
+                        timeouts,
+                    ) {
+                        value.message = format!(
+                            "{}; restoring the transaction after literal remote execution also failed: {}",
+                            value.message, recovery.message
+                        );
+                        return Err(value);
+                    }
+                    if let Err(recovery) = complete_prepared_execution_savepoint(
+                        connection,
+                        savepoint.as_ref(),
+                        timeouts,
+                    ) {
+                        value.message = format!(
+                            "{}; releasing the prepared execution savepoint also failed: {}",
+                            value.message, recovery.message
+                        );
+                    }
+                    Err(value)
+                }
+            }
+        }
+        Err(value) => Err(value),
+    }
+}
+
 fn current_bound_query(
     connection: &SharedConnection,
     query: &BoundQuery,
@@ -6364,6 +6674,13 @@ fn current_bound_query(
     let Some(invocation) = &query.prepared else {
         return Ok(query.clone());
     };
+    if let Some(fallback) = invocation.entry.literal_fallback() {
+        let sql = invocation
+            .literal_sql
+            .clone()
+            .ok_or_else(|| error("prepared fallback SQL is unavailable", Status::Internal))?;
+        return Ok(BoundQuery::literal(sql, Some(&fallback)));
+    }
     let cached = invocation
         .plan
         .cache
@@ -6391,6 +6708,7 @@ fn current_bound_query(
         invocation.plan.clone(),
         entry,
         invocation.arguments.clone(),
+        invocation.literal_sql.clone(),
     ))
 }
 
@@ -6440,10 +6758,14 @@ fn retry_bound_query(
             Arc::clone(&slot)
         }
     };
+    if invocation.entry.is_verified() {
+        entry.mark_verified();
+    }
     Ok(BoundQuery::prepared(
         invocation.plan.clone(),
         entry,
         invocation.arguments.clone(),
+        invocation.literal_sql.clone(),
     ))
 }
 
@@ -6577,7 +6899,7 @@ fn prepare_outcome_cached(
     let parameter_count = template.layout().count();
     match prepare_query(connection, query, parameter_count, timeouts) {
         Ok(metadata) => {
-            let candidate = Arc::new(PreparedEntry::new(metadata, connection));
+            let candidate = Arc::new(PreparedEntry::new(metadata, connection, query));
             let entry = cache
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -6646,7 +6968,7 @@ fn prepare_cached_with_status(
         return Ok((entry, true));
     }
     let metadata = prepare_query(connection, query, parameter_count, timeouts)?;
-    let candidate = Arc::new(PreparedEntry::new(metadata, connection));
+    let candidate = Arc::new(PreparedEntry::new(metadata, connection, query));
     Ok((
         cache
             .lock()
@@ -6673,7 +6995,7 @@ fn prepare_cached_with_status_locked(
         return Ok((entry, true));
     }
     let metadata = prepare_query_inner_locked(connection, query, parameter_count, false, timeouts)?;
-    let candidate = Arc::new(PreparedEntry::new(metadata, shared_connection));
+    let candidate = Arc::new(PreparedEntry::new(metadata, shared_connection, query));
     Ok((
         cache
             .lock()
@@ -7349,7 +7671,14 @@ fn bound_query_reader_with_retry(
     timeouts: Timeouts,
 ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
     let query = current_bound_query(connection, query, timeouts)?;
-    match query_reader_with_timeouts(connection, &query.sql, read_options.clone(), timeouts) {
+    let result = match &query.prepared {
+        Some(invocation) if !invocation.entry.is_verified() => {
+            execute_unverified_prepared_result(connection, &query, read_options.clone(), timeouts)
+                .map(|result| result.reader)
+        }
+        _ => query_reader_with_timeouts(connection, &query.sql, read_options.clone(), timeouts),
+    };
+    match result {
         Err(value) if query.prepared.is_some() && prepared_statement_missing(&value) => {
             if !lock_connection(connection)?
                 .server_info()
@@ -8808,6 +9137,37 @@ fn qualified_name(schema: Option<&str>, table: &str) -> Result<String> {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn identifies_prepared_remote_execution_failure() {
+        assert!(remote_prepared_execution_failed(&error(
+            "Exception occurred in the remote server, please check the log there",
+            Status::Unknown
+        )));
+        assert!(!remote_prepared_execution_failed(&error(
+            "Identifier A0 doesn't exist",
+            Status::Unknown
+        )));
+    }
+
+    #[test]
+    fn verifies_only_row_queries_with_empty_prepare_metadata() {
+        let empty = Schema::empty();
+        let result = Schema::new(vec![Field::new("value", DataType::Int64, true)]);
+
+        for query in [
+            "SELECT ?",
+            "WITH value AS (SELECT ?) SELECT * FROM value",
+            "VALUES (?)",
+        ] {
+            assert!(prepared_execution_needs_verification(query, &empty));
+            assert!(!prepared_execution_needs_verification(query, &result));
+        }
+        assert!(!prepared_execution_needs_verification(
+            "UPDATE values SET value = ?",
+            &empty
+        ));
+    }
 
     #[test]
     fn gates_literal_fallback_on_prepare_outcome_not_diagnostic_text() {
