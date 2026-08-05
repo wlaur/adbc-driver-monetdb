@@ -462,6 +462,14 @@ retried once when MonetDB can recover without rolling back user work. MonetDB ab
 transaction when `EXECUTE` reports a missing prepared plan, so a stale plan in that state follows
 the normal database-error contract: roll back before retrying. One-row bound DML executes directly;
 multi-row bound DML retains a savepoint so the whole parameter batch remains atomic.
+MonetDB can accept `PREPARE` for a remote-table query while returning no result metadata, then
+reject its `EXECUTE` on the remote server. The driver verifies only row-returning plans with empty
+result metadata on their first execution. A successful probe keeps the prepared fast path; this
+specific remote execution failure rolls back the internal probe savepoint and caches typed-literal
+execution for that SQL shape only after the retry is accepted. A failed retry restores the caller
+transaction and leaves the plan uncached for a later probe. Prepared queries with declared result
+metadata and statements beginning with a DML keyword keep their existing path without an added
+probe.
 When a statement reaches its threshold and MonetDB refuses to `PREPARE` it with a server SQL
 diagnostic, the driver keeps using
 its typed literal-binding path for that statement. The decision depends on the PREPARE outcome,
@@ -546,7 +554,7 @@ close that connection and open another one before issuing more work.
 Client information is sent at login by default. The `client` value in
 [`sys.sessions`](https://www.monetdb.org/documentation-Dec2025/user-guide/sql-catalog/users-roles-privileges-sessions/)
 identifies this driver and its protocol library, for example
-`adbc_driver_monetdb 0.12.2 / monetdb-rust 0.2.2-wlaur.1`. The Python shim uses the basename of
+`adbc_driver_monetdb 0.12.3 / monetdb-rust 0.2.2-wlaur.1`. The Python shim uses the basename of
 `sys.argv[0]` as the default `application`. Hostname and process id are also sent by default, as
 they are by pymonetdb and libmapi; use `client_info=false` if that host metadata should not leave
 the client.
