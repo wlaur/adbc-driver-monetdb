@@ -1478,7 +1478,7 @@ struct PreparedEntry {
 
 impl PreparedEntry {
     fn new(metadata: PreparedMetadata, connection: &SharedConnection, query: &str) -> Self {
-        let verified = !prepared_execution_needs_verification(query, &metadata.result);
+        let verified = !prepared_row_execution_needs_verification(query);
         Self {
             id: metadata.id,
             generation: connection.prepared_generation.load(Ordering::Acquire),
@@ -2630,18 +2630,7 @@ impl Statement for MonetdbStatement {
                                 result.rows_affected = None;
                             }
                             self.prepared_result_schema = Some(schema.as_ref().clone());
-                            let fallback = self.prepared_entry.as_ref().and_then(|slot| {
-                                slot.lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                    .literal_fallback()
-                            });
-                            if let Some(fallback) = fallback {
-                                self.prepare_status = Some(PrepareStatus::literal(
-                                    Some(fallback.diagnostic.clone()),
-                                    false,
-                                ));
-                                self.literal_fallback = Some(fallback);
-                            }
+                            self.refresh_prepared_literal_fallback();
                             return Ok(result);
                         }
                         queries.pending.push_front(query);
@@ -2709,19 +2698,21 @@ impl Statement for MonetdbStatement {
                 }
                 let read_stats = Arc::new(Mutex::new(None));
                 self.read_stats = Some(Arc::clone(&read_stats));
+                let reader = parameter_query_reader(
+                    &self.connection,
+                    queries,
+                    ReadExecutionOptions {
+                        batch_rows: self.read_batch_rows,
+                        window_bytes: self.read_window_bytes,
+                        prefetch: self.read_prefetch,
+                        measured_round_trip: self.measured_round_trip,
+                        stats: Some(read_stats),
+                    },
+                    self.timeouts,
+                )?;
+                self.refresh_prepared_literal_fallback();
                 Ok(StatementResult {
-                    reader: parameter_query_reader(
-                        &self.connection,
-                        queries,
-                        ReadExecutionOptions {
-                            batch_rows: self.read_batch_rows,
-                            window_bytes: self.read_window_bytes,
-                            prefetch: self.read_prefetch,
-                            measured_round_trip: self.measured_round_trip,
-                            stats: Some(read_stats),
-                        },
-                        self.timeouts,
-                    )?,
+                    reader,
                     rows_affected: None,
                 })
             })();
@@ -3050,6 +3041,21 @@ impl Statement for MonetdbStatement {
 }
 
 impl MonetdbStatement {
+    fn refresh_prepared_literal_fallback(&mut self) {
+        let fallback = self.prepared_entry.as_ref().and_then(|slot| {
+            slot.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .literal_fallback()
+        });
+        if let Some(fallback) = fallback {
+            self.prepare_status = Some(PrepareStatus::literal(
+                Some(fallback.diagnostic.clone()),
+                false,
+            ));
+            self.literal_fallback = Some(fallback);
+        }
+    }
+
     fn clear_prepared(&mut self) {
         self.prepared_entry = None;
         self.literal_fallback = None;
@@ -6452,14 +6458,14 @@ fn remote_prepared_execution_failed(value: &Error) -> bool {
         .contains("Exception occurred in the remote server, please check the log there")
 }
 
-fn prepared_execution_needs_verification(query: &str, result: &Schema) -> bool {
-    result.fields().is_empty()
-        && leading_sql_keyword(query).is_some_and(|keyword| {
-            matches!(
-                keyword.to_ascii_uppercase().as_str(),
-                "SELECT" | "WITH" | "VALUES"
-            )
-        })
+fn prepared_row_execution_needs_verification(query: &str) -> bool {
+    // PREPARE can return complete result metadata even when EXECUTE fails through a remote view.
+    leading_sql_keyword(query).is_some_and(|keyword| {
+        matches!(
+            keyword.to_ascii_uppercase().as_str(),
+            "SELECT" | "WITH" | "VALUES"
+        )
+    })
 }
 
 struct PreparedExecutionSavepoint {
@@ -9126,21 +9132,16 @@ mod tests {
     }
 
     #[test]
-    fn verifies_only_row_queries_with_empty_prepare_metadata() {
-        let empty = Schema::empty();
-        let result = Schema::new(vec![Field::new("value", DataType::Int64, true)]);
-
+    fn verifies_prepared_row_queries_on_first_execution() {
         for query in [
             "SELECT ?",
             "WITH value AS (SELECT ?) SELECT * FROM value",
             "VALUES (?)",
         ] {
-            assert!(prepared_execution_needs_verification(query, &empty));
-            assert!(!prepared_execution_needs_verification(query, &result));
+            assert!(prepared_row_execution_needs_verification(query));
         }
-        assert!(!prepared_execution_needs_verification(
-            "UPDATE values SET value = ?",
-            &empty
+        assert!(!prepared_row_execution_needs_verification(
+            "UPDATE values SET value = ?"
         ));
     }
 
