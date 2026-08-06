@@ -292,8 +292,7 @@ requirements change their premises.
   cached typed-literal template after a successful retry, and avoids aborting caller work. A failed
   literal retry restores the savepoint and leaves the plan available for a later probe. This adds
   transaction-control round trips once per prepared row-query shape, while subsequent executions
-  retain the ordinary prepared fast path. Statements beginning with a DML keyword remain verified
-  at preparation.
+  retain the ordinary prepared fast path.
 - `PREPARE` can narrow declared decimal widths from column statistics. The driver restores
   declared catalog types when MonetDB supplies an unambiguous table/column origin. Current server
   metadata omits the origin schema, so identical table and column names in multiple schemas are
