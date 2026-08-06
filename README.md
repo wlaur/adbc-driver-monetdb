@@ -464,7 +464,8 @@ the normal database-error contract: roll back before retrying. One-row bound DML
 multi-row bound DML retains a savepoint so the whole parameter batch remains atomic.
 MonetDB can accept `PREPARE` for a remote-table query or a view that depends on one, then reject its
 `EXECUTE` on the remote server. Complete result metadata does not rule out this failure, so the
-driver verifies every row-returning prepared plan on its first execution. A successful probe keeps
+driver verifies every row-returning prepared plan on its first execution, including a parenthesized
+compound select. A successful probe keeps
 the prepared fast path; this specific remote execution failure rolls back the internal probe
 savepoint and caches typed-literal execution for that SQL shape only after the retry is accepted. A
 failed retry restores the caller transaction and leaves the plan uncached for a later probe. In a

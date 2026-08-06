@@ -6460,6 +6460,12 @@ fn remote_prepared_execution_failed(value: &Error) -> bool {
 
 fn prepared_row_execution_needs_verification(query: &str) -> bool {
     // PREPARE can return complete result metadata even when EXECUTE fails through a remote view.
+    // A parenthesized query expression such as "(SELECT ...) UNION (SELECT ...)" has no leading
+    // keyword, and only a query expression may begin with "(" — MonetDB's grammar admits no
+    // parenthesized DML statement.
+    if leading_sql_offset(query).is_some_and(|offset| query.as_bytes().get(offset) == Some(&b'(')) {
+        return true;
+    }
     leading_sql_keyword(query).is_some_and(|keyword| {
         matches!(
             keyword.to_ascii_uppercase().as_str(),
@@ -7508,7 +7514,7 @@ fn query_invalidates_prepared_cache(query: &str) -> Result<bool> {
         }))
 }
 
-fn leading_sql_keyword(query: &str) -> Option<&str> {
+fn leading_sql_offset(query: &str) -> Option<usize> {
     let bytes = query.as_bytes();
     let mut index = 0;
     loop {
@@ -7537,7 +7543,13 @@ fn leading_sql_keyword(query: &str) -> Option<&str> {
             _ => break,
         }
     }
-    let start = index;
+    Some(index)
+}
+
+fn leading_sql_keyword(query: &str) -> Option<&str> {
+    let bytes = query.as_bytes();
+    let start = leading_sql_offset(query)?;
+    let mut index = start;
     while bytes
         .get(index)
         .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
@@ -9137,6 +9149,8 @@ mod tests {
             "SELECT ?",
             "WITH value AS (SELECT ?) SELECT * FROM value",
             "VALUES (?)",
+            "(SELECT ? LIMIT 1) UNION ALL (SELECT ? LIMIT 1)",
+            "  /* leading */ (SELECT ?)",
         ] {
             assert!(prepared_row_execution_needs_verification(query));
         }

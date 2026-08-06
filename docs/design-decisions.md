@@ -280,7 +280,9 @@ requirements change their premises.
 - MonetDB can accept `PREPARE` over a remote table or a view that depends on one and then reject
   `EXECUTE` with its remote-server wrapper diagnostic. This can happen whether `PREPARE` returns an
   empty or complete result schema; its metadata does not expose the remote dependency. Every
-  row-returning `SELECT`, `WITH`, and `VALUES` plan therefore starts unverified. Its first prepared
+  row-returning `SELECT`, `WITH`, and `VALUES` plan therefore starts unverified, as does a
+  parenthesized query expression such as a compound select, which has no leading keyword at all and
+  which MonetDB's grammar admits for no other statement kind. Its first prepared
   execution uses an internal savepoint in a caller transaction. Success verifies the plan; the
   remote wrapper rolls back that savepoint, replaces only that normalized SQL shape with a negative
   cached typed-literal template after a successful retry, and avoids aborting caller work. A failed

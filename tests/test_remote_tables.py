@@ -154,6 +154,37 @@ def test_prepared_remote_query_falls_back_without_aborting_transaction(
 
 
 @pytest.mark.integration
+def test_prepared_parenthesized_remote_query_falls_back_without_aborting_transaction(
+    remote_tables: tuple[str, str],
+) -> None:
+    _, master_uri = remote_tables
+    # A compound select has no leading keyword, which is the shape SQLAlchemy emits
+    # for a union of limited selects.
+    query = (
+        f"(SELECT AVG(measurement) FROM {VIEW_TABLE} WHERE observed_at >= ? AND observed_at < ?) "
+        f"UNION ALL (SELECT AVG(measurement) FROM {LOCAL_TABLE} WHERE id >= ?)"
+    )
+    parameters = (datetime.datetime(2024, 1, 1), datetime.datetime(2024, 1, 2), 0)
+    statuses: list[dict[str, object]] = []
+    with dbapi.connect(master_uri) as connection:
+        for _ in range(2):
+            with connection.cursor() as cursor:
+                assert cursor.adbc_prepare(query) is not None
+                cursor.execute(query, parameters)
+                assert sorted(cast("float", row[0]) for row in cursor.fetchall()) == [
+                    pytest.approx(499.5),
+                    pytest.approx(1_000.5),
+                ]
+                statuses.append(json.loads(cursor.adbc_statement.get_option(str(StatementOptions.PREPARE_STATUS))))
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1")
+            assert cursor.fetchone() == (1,)
+
+    assert [status["path"] for status in statuses] == ["literal"] * 2
+    assert [status["negative_cache_hit"] for status in statuses] == [False, True]
+
+
+@pytest.mark.integration
 def test_failed_remote_literal_retry_preserves_transaction_and_prepared_plan(
     remote_tables: tuple[str, str],
 ) -> None:
