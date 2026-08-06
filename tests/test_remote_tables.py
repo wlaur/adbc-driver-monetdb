@@ -33,23 +33,29 @@ def remote_tables(
         for table in (MERGE_TABLE, DIMENSION_TABLE, LOCAL_TABLE, SOURCE_TABLE):
             master.execute(f"DROP TABLE IF EXISTS {table}")
         source.execute(f"DROP TABLE IF EXISTS {SOURCE_TABLE}")
-        source.execute(f"CREATE TABLE {SOURCE_TABLE}(id BIGINT, payload VARCHAR(64), observed_at TIMESTAMP)")
+        source.execute(
+            f"CREATE TABLE {SOURCE_TABLE}(id BIGINT, payload VARCHAR(64), observed_at TIMESTAMP, measurement REAL)"
+        )
         source.execute(
             f"INSERT INTO {SOURCE_TABLE} "
             "SELECT value, 'remote-' || CAST(value AS VARCHAR(20)), "
-            "TIMESTAMP '2024-01-01 00:00:00' + value * INTERVAL '1' SECOND "
+            "TIMESTAMP '2024-01-01 00:00:00' + value * INTERVAL '1' SECOND, CAST(value AS REAL) "
             f"FROM sys.generate_series(0, {SOURCE_ROWS})"
         )
         master.execute(
-            f"CREATE REMOTE TABLE {SOURCE_TABLE}(id BIGINT, payload VARCHAR(64), observed_at TIMESTAMP) "
+            f"CREATE REMOTE TABLE {SOURCE_TABLE}"
+            "(id BIGINT, payload VARCHAR(64), observed_at TIMESTAMP, measurement REAL) "
             f"ON {_sql_string(server_uri)} WITH USER {_sql_string(username)} PASSWORD {_sql_string(password)}"
         )
-        master.execute(f"CREATE VIEW {VIEW_TABLE} AS SELECT id, payload, observed_at FROM {SOURCE_TABLE}")
-        master.execute(f"CREATE TABLE {LOCAL_TABLE}(id BIGINT, payload VARCHAR(64), observed_at TIMESTAMP)")
+        master.execute(f"CREATE VIEW {VIEW_TABLE} AS SELECT id, payload, observed_at, measurement FROM {SOURCE_TABLE}")
+        master.execute(
+            f"CREATE TABLE {LOCAL_TABLE}(id BIGINT, payload VARCHAR(64), observed_at TIMESTAMP, measurement REAL)"
+        )
         master.execute(
             f"INSERT INTO {LOCAL_TABLE} VALUES "
-            f"({SOURCE_ROWS}, 'local-{SOURCE_ROWS}', TIMESTAMP '2024-01-02 00:00:00'), "
-            f"({SOURCE_ROWS + 1}, 'local-{SOURCE_ROWS + 1}', TIMESTAMP '2024-01-02 00:00:01')"
+            f"({SOURCE_ROWS}, 'local-{SOURCE_ROWS}', TIMESTAMP '2024-01-02 00:00:00', {SOURCE_ROWS}), "
+            f"({SOURCE_ROWS + 1}, 'local-{SOURCE_ROWS + 1}', "
+            f"TIMESTAMP '2024-01-02 00:00:01', {SOURCE_ROWS + 1})"
         )
         master.execute(f"CREATE TABLE {DIMENSION_TABLE}(id BIGINT, label VARCHAR(64))")
         master.execute(
@@ -57,7 +63,9 @@ def remote_tables(
             "SELECT value, 'dimension-' || CAST(value AS VARCHAR(20)) "
             f"FROM sys.generate_series(0, {SOURCE_ROWS})"
         )
-        master.execute(f"CREATE MERGE TABLE {MERGE_TABLE}(id BIGINT, payload VARCHAR(64), observed_at TIMESTAMP)")
+        master.execute(
+            f"CREATE MERGE TABLE {MERGE_TABLE}(id BIGINT, payload VARCHAR(64), observed_at TIMESTAMP, measurement REAL)"
+        )
         master.execute(f"ALTER TABLE {MERGE_TABLE} ADD TABLE {SOURCE_TABLE}")
         master.execute(f"ALTER TABLE {MERGE_TABLE} ADD TABLE {LOCAL_TABLE}")
 
@@ -113,10 +121,16 @@ def test_prepared_remote_query_falls_back_without_aborting_transaction(
     remote_tables: tuple[str, str],
 ) -> None:
     _, master_uri = remote_tables
-    query = f"SELECT AVG(id) FROM {VIEW_TABLE} WHERE observed_at >= ? AND observed_at < ?"
+    query = (
+        f"SELECT (CAST(? AS DOUBLE) * (SELECT AVG(measurement) FROM {LOCAL_TABLE})) / "
+        f"CAST(((SELECT AVG(measurement) FROM {VIEW_TABLE} "
+        "WHERE observed_at >= ? AND observed_at < ?) * ?) AS DOUBLE)"
+    )
     parameters = (
+        100,
         datetime.datetime(2024, 1, 1),
         datetime.datetime(2024, 1, 2),
+        1_000.0,
     )
     statuses: list[dict[str, object]] = []
     with dbapi.connect(master_uri) as connection:
@@ -126,7 +140,7 @@ def test_prepared_remote_query_falls_back_without_aborting_transaction(
                 cursor.execute(query, parameters)
                 row = cursor.fetchone()
                 assert row is not None
-                assert float(cast("float", row[0])) == pytest.approx(499.5)
+                assert float(cast("float", row[0])) == pytest.approx(100 * 1_000.5 / (499.5 * 1_000))
                 statuses.append(json.loads(cursor.adbc_statement.get_option(str(StatementOptions.PREPARE_STATUS))))
         with connection.cursor() as cursor:
             cursor.execute("SELECT 1")

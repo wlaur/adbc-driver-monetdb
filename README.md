@@ -462,14 +462,15 @@ retried once when MonetDB can recover without rolling back user work. MonetDB ab
 transaction when `EXECUTE` reports a missing prepared plan, so a stale plan in that state follows
 the normal database-error contract: roll back before retrying. One-row bound DML executes directly;
 multi-row bound DML retains a savepoint so the whole parameter batch remains atomic.
-MonetDB can accept `PREPARE` for a remote-table query while returning no result metadata, then
-reject its `EXECUTE` on the remote server. The driver verifies only row-returning plans with empty
-result metadata on their first execution. A successful probe keeps the prepared fast path; this
-specific remote execution failure rolls back the internal probe savepoint and caches typed-literal
-execution for that SQL shape only after the retry is accepted. A failed retry restores the caller
-transaction and leaves the plan uncached for a later probe. Prepared queries with declared result
-metadata and statements beginning with a DML keyword keep their existing path without an added
-probe.
+MonetDB can accept `PREPARE` for a remote-table query or a view that depends on one, then reject its
+`EXECUTE` on the remote server. Complete result metadata does not rule out this failure, so the
+driver verifies every row-returning prepared plan on its first execution. A successful probe keeps
+the prepared fast path; this specific remote execution failure rolls back the internal probe
+savepoint and caches typed-literal execution for that SQL shape only after the retry is accepted. A
+failed retry restores the caller transaction and leaves the plan uncached for a later probe. In a
+caller transaction, the verification adds transaction-control round trips once per prepared SQL
+shape; later executions retain the ordinary prepared path. Statements beginning with a DML keyword
+remain verified at preparation.
 When a statement reaches its threshold and MonetDB refuses to `PREPARE` it with a server SQL
 diagnostic, the driver keeps using
 its typed literal-binding path for that statement. The decision depends on the PREPARE outcome,

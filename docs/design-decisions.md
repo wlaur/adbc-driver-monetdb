@@ -277,15 +277,17 @@ requirements change their premises.
   statement executes directly to avoid three transaction-control round trips; a rare stale-plan
   error in an explicit transaction follows the normal database-error contract and requires the
   caller to roll back.
-- MonetDB can expose an empty result schema for an accepted `PREPARE` over a remote table and then
-  reject `EXECUTE` with its remote-server wrapper diagnostic. Row-returning `SELECT`, `WITH`, and
-  `VALUES` plans with empty result metadata therefore start unverified. Their first execution uses
-  an internal savepoint in a caller transaction. Success verifies the plan; the remote wrapper
-  rolls back that savepoint, replaces only that normalized SQL shape with a negative cached
-  typed-literal template after a successful retry, and avoids aborting caller work. A failed
-  literal retry restores the savepoint and leaves the plan available for a later probe. Plans with
-  declared result metadata and statements beginning with a DML keyword are verified at preparation
-  and retain the ordinary fast path.
+- MonetDB can accept `PREPARE` over a remote table or a view that depends on one and then reject
+  `EXECUTE` with its remote-server wrapper diagnostic. This can happen whether `PREPARE` returns an
+  empty or complete result schema; its metadata does not expose the remote dependency. Every
+  row-returning `SELECT`, `WITH`, and `VALUES` plan therefore starts unverified. Its first prepared
+  execution uses an internal savepoint in a caller transaction. Success verifies the plan; the
+  remote wrapper rolls back that savepoint, replaces only that normalized SQL shape with a negative
+  cached typed-literal template after a successful retry, and avoids aborting caller work. A failed
+  literal retry restores the savepoint and leaves the plan available for a later probe. This adds
+  transaction-control round trips once per prepared row-query shape, while subsequent executions
+  retain the ordinary prepared fast path. Statements beginning with a DML keyword remain verified
+  at preparation.
 - `PREPARE` can narrow declared decimal widths from column statistics. The driver restores
   declared catalog types when MonetDB supplies an unambiguous table/column origin. Current server
   metadata omits the origin schema, so identical table and column names in multiple schemas are
