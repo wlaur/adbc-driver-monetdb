@@ -3426,25 +3426,18 @@ impl MonetdbStatement {
                     .collect::<Vec<_>>();
                 type PreparedAttempt = (Option<(Arc<PreparedEntry>, bool)>, Option<Error>);
                 let prepare = |names: &[String]| -> Result<PreparedAttempt> {
-                    let mut prepared = None;
-                    let mut prepare_error = None;
-                    for insert_query in insert_parameter_queries(&operation_target, names)? {
-                        match prepare_cached_with_status_locked(
-                            &self.connection,
-                            &connection,
-                            &self.prepared_cache,
-                            &insert_query,
-                            names.len(),
-                            self.timeouts,
-                        ) {
-                            Ok(value) => {
-                                prepared = Some(value);
-                                break;
-                            }
-                            Err(value) => prepare_error = Some(value),
-                        }
-                    }
-                    Ok((prepared, prepare_error))
+                    let insert_query = insert_parameter_query(&operation_target, names)?;
+                    Ok(match prepare_cached_with_status_locked(
+                        &self.connection,
+                        &connection,
+                        &self.prepared_cache,
+                        &insert_query,
+                        names.len(),
+                        self.timeouts,
+                    ) {
+                        Ok(value) => (Some(value), None),
+                        Err(value) => (None, Some(value)),
+                    })
                 };
                 let (mut prepared, prepare_error) = prepare(&stream_names)?;
                 if prepared.is_none()
@@ -4061,32 +4054,14 @@ fn execute_ingest_target_mode(
     Ok(())
 }
 
-fn insert_parameter_queries(target: &str, names: &[String]) -> Result<Vec<String>> {
+fn insert_parameter_query(target: &str, names: &[String]) -> Result<String> {
     let placeholders = std::iter::repeat_n("?", names.len())
         .collect::<Vec<_>>()
         .join(", ");
-    let mut queries = Vec::with_capacity(2);
-    if names.iter().all(|name| is_simple_unquoted_identifier(name)) {
-        queries.push(format!(
-            "INSERT INTO {target} ({}) VALUES ({placeholders})",
-            names
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    }
-    queries.push(format!(
+    Ok(format!(
         "INSERT INTO {target} ({}) VALUES ({placeholders})",
         quoted_column_list(names)?
-    ));
-    Ok(queries)
-}
-
-fn is_simple_unquoted_identifier(name: &str) -> bool {
-    let mut bytes = name.bytes();
-    bytes.next().is_some_and(|byte| byte.is_ascii_alphabetic())
-        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    ))
 }
 
 fn append_mismatch_status(mode: &str) -> Status {
@@ -9432,16 +9407,13 @@ mod tests {
     fn renders_insert_column_lists_from_the_names_it_is_given() {
         let names = ["a".to_owned(), "b".to_owned()];
         assert_eq!(
-            insert_parameter_queries("t", &names).unwrap(),
-            [
-                "INSERT INTO t (a, b) VALUES (?, ?)",
-                "INSERT INTO t (\"a\", \"b\") VALUES (?, ?)"
-            ]
+            insert_parameter_query("t", &names).unwrap(),
+            "INSERT INTO t (\"a\", \"b\") VALUES (?, ?)"
         );
         let quoted = ["Col One".to_owned()];
         assert_eq!(
-            insert_parameter_queries("t", &quoted).unwrap(),
-            ["INSERT INTO t (\"Col One\") VALUES (?)"]
+            insert_parameter_query("t", &quoted).unwrap(),
+            "INSERT INTO t (\"Col One\") VALUES (?)"
         );
     }
 
