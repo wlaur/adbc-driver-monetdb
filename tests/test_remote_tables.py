@@ -12,7 +12,12 @@ LOCAL_TABLE = "adbc_remote_local"
 DIMENSION_TABLE = "adbc_remote_dimension"
 MERGE_TABLE = "adbc_remote_merge"
 VIEW_TABLE = "adbc_remote_view"
+NESTED_VIEW_TABLE = "adbc_remote_view_nested"
+DEEP_VIEW_TABLE = "adbc_remote_view_deep"
+MIXED_VIEW_TABLE = "adbc_remote_view_mixed"
 SOURCE_ROWS = 1_000
+
+VIEWS = (MIXED_VIEW_TABLE, DEEP_VIEW_TABLE, NESTED_VIEW_TABLE, VIEW_TABLE)
 
 
 def _sql_string(value: str) -> str:
@@ -29,7 +34,8 @@ def remote_tables(
         dbapi.connect(source_uri, autocommit=True) as source,
         dbapi.connect(monetdb_uri, autocommit=True) as master,
     ):
-        master.execute(f"DROP VIEW IF EXISTS {VIEW_TABLE}")
+        for view in VIEWS:
+            master.execute(f"DROP VIEW IF EXISTS {view}")
         for table in (MERGE_TABLE, DIMENSION_TABLE, LOCAL_TABLE, SOURCE_TABLE):
             master.execute(f"DROP TABLE IF EXISTS {table}")
         source.execute(f"DROP TABLE IF EXISTS {SOURCE_TABLE}")
@@ -68,12 +74,25 @@ def remote_tables(
         )
         master.execute(f"ALTER TABLE {MERGE_TABLE} ADD TABLE {SOURCE_TABLE}")
         master.execute(f"ALTER TABLE {MERGE_TABLE} ADD TABLE {LOCAL_TABLE}")
+        # A view chain: the remote dependency is progressively further from the query.
+        master.execute(
+            f"CREATE VIEW {NESTED_VIEW_TABLE} AS SELECT id, payload, measurement FROM {VIEW_TABLE} WHERE id >= 0"
+        )
+        master.execute(
+            f"CREATE VIEW {DEEP_VIEW_TABLE} AS "
+            f"SELECT id, measurement FROM {NESTED_VIEW_TABLE} WHERE measurement IS NOT NULL"
+        )
+        master.execute(
+            f"CREATE VIEW {MIXED_VIEW_TABLE} AS SELECT r.id AS id, r.measurement AS measurement, d.label AS label "
+            f"FROM {VIEW_TABLE} r JOIN {DIMENSION_TABLE} d ON r.id = d.id"
+        )
 
     try:
         yield source_uri, monetdb_uri
     finally:
         with dbapi.connect(monetdb_uri, autocommit=True) as master:
-            master.execute(f"DROP VIEW IF EXISTS {VIEW_TABLE}")
+            for view in VIEWS:
+                master.execute(f"DROP VIEW IF EXISTS {view}")
             for table in (MERGE_TABLE, DIMENSION_TABLE, LOCAL_TABLE, SOURCE_TABLE):
                 master.execute(f"DROP TABLE IF EXISTS {table}")
         with dbapi.connect(source_uri, autocommit=True) as source:
@@ -153,35 +172,138 @@ def test_prepared_remote_query_falls_back_without_aborting_transaction(
     assert diagnostic["message"] == ("Exception occurred in the remote server, please check the log there")
 
 
+# Every shape whose plan reaches the remote server. MonetDB accepts PREPARE for all of
+# them and only rejects EXECUTE, so each must converge on the typed-literal fallback
+# without aborting the caller transaction.
+REMOTE_SHAPES: tuple[tuple[str, str, int], ...] = (
+    ("direct-remote-table", f"SELECT COUNT(*) FROM {SOURCE_TABLE} WHERE id >= ?", SOURCE_ROWS),
+    ("view", f"SELECT COUNT(*) FROM {VIEW_TABLE} WHERE id >= ?", SOURCE_ROWS),
+    ("nested-view", f"SELECT COUNT(*) FROM {NESTED_VIEW_TABLE} WHERE id >= ?", SOURCE_ROWS),
+    ("twice-nested-view", f"SELECT COUNT(*) FROM {DEEP_VIEW_TABLE} WHERE id >= ?", SOURCE_ROWS),
+    ("view-joining-local", f"SELECT COUNT(*) FROM {MIXED_VIEW_TABLE} WHERE id >= ?", SOURCE_ROWS),
+    ("merge-table", f"SELECT COUNT(*) FROM {MERGE_TABLE} WHERE id >= ?", SOURCE_ROWS + 2),
+    ("parenthesized", f"(SELECT COUNT(*) FROM {VIEW_TABLE} WHERE id >= ?)", SOURCE_ROWS),
+    (
+        "parenthesized-union",
+        f"(SELECT COUNT(*) FROM {VIEW_TABLE} WHERE id >= ?) UNION ALL (SELECT COUNT(*) FROM {LOCAL_TABLE})",
+        SOURCE_ROWS,
+    ),
+    (
+        "union-without-parentheses",
+        f"SELECT COUNT(*) FROM {VIEW_TABLE} WHERE id >= ? UNION ALL SELECT COUNT(*) FROM {LOCAL_TABLE}",
+        SOURCE_ROWS,
+    ),
+    ("cte", f"WITH c AS (SELECT id FROM {VIEW_TABLE} WHERE id >= ?) SELECT COUNT(*) FROM c", SOURCE_ROWS),
+    (
+        "nested-cte-over-nested-view",
+        f"WITH a AS (SELECT id FROM {DEEP_VIEW_TABLE} WHERE id >= ?), b AS (SELECT id FROM a) SELECT COUNT(*) FROM b",
+        SOURCE_ROWS,
+    ),
+    (
+        "cte-joined-to-local",
+        (
+            f"WITH c AS (SELECT id FROM {VIEW_TABLE} WHERE id >= ?) "
+            f"SELECT COUNT(*) FROM c JOIN {DIMENSION_TABLE} d ON c.id = d.id"
+        ),
+        SOURCE_ROWS,
+    ),
+    (
+        "in-subquery",
+        f"SELECT COUNT(*) FROM {DIMENSION_TABLE} WHERE id IN (SELECT id FROM {VIEW_TABLE} WHERE id >= ?)",
+        SOURCE_ROWS,
+    ),
+    (
+        "exists-subquery",
+        (
+            f"SELECT COUNT(*) FROM {DIMENSION_TABLE} d "
+            f"WHERE EXISTS (SELECT 1 FROM {VIEW_TABLE} r WHERE r.id = d.id AND r.id >= ?)"
+        ),
+        SOURCE_ROWS,
+    ),
+    ("derived-table", f"SELECT COUNT(*) FROM (SELECT id FROM {VIEW_TABLE} WHERE id >= ?) AS d", SOURCE_ROWS),
+)
+
+
 @pytest.mark.integration
-def test_prepared_parenthesized_remote_query_falls_back_without_aborting_transaction(
+@pytest.mark.parametrize(("sql", "expected"), [shape[1:] for shape in REMOTE_SHAPES], ids=[s[0] for s in REMOTE_SHAPES])
+def test_every_prepared_remote_shape_falls_back_without_aborting_transaction(
     remote_tables: tuple[str, str],
+    sql: str,
+    expected: int,
 ) -> None:
     _, master_uri = remote_tables
-    # A compound select has no leading keyword, which is the shape SQLAlchemy emits
-    # for a union of limited selects.
-    query = (
-        f"(SELECT AVG(measurement) FROM {VIEW_TABLE} WHERE observed_at >= ? AND observed_at < ?) "
-        f"UNION ALL (SELECT AVG(measurement) FROM {LOCAL_TABLE} WHERE id >= ?)"
-    )
-    parameters = (datetime.datetime(2024, 1, 1), datetime.datetime(2024, 1, 2), 0)
     statuses: list[dict[str, object]] = []
     with dbapi.connect(master_uri) as connection:
         for _ in range(2):
             with connection.cursor() as cursor:
-                assert cursor.adbc_prepare(query) is not None
-                cursor.execute(query, parameters)
-                assert sorted(cast("float", row[0]) for row in cursor.fetchall()) == [
-                    pytest.approx(499.5),
-                    pytest.approx(1_000.5),
-                ]
+                assert cursor.adbc_prepare(sql) is not None
+                cursor.execute(sql, (0,))
+                assert cursor.fetchall()[0][0] == expected
                 statuses.append(json.loads(cursor.adbc_statement.get_option(str(StatementOptions.PREPARE_STATUS))))
+        # The caller transaction survived the fallback.
         with connection.cursor() as cursor:
             cursor.execute("SELECT 1")
             assert cursor.fetchone() == (1,)
+        connection.rollback()
 
-    assert [status["path"] for status in statuses] == ["literal"] * 2
+    assert [status["path"] for status in statuses] == ["literal", "literal"]
     assert [status["negative_cache_hit"] for status in statuses] == [False, True]
+
+
+LOCAL_SHAPES: tuple[tuple[str, str], ...] = (
+    ("plain-select", f"SELECT COUNT(*) FROM {DIMENSION_TABLE} WHERE id >= ?"),
+    ("parenthesized", f"(SELECT COUNT(*) FROM {DIMENSION_TABLE} WHERE id >= ?)"),
+    ("cte", f"WITH c AS (SELECT id FROM {DIMENSION_TABLE} WHERE id >= ?) SELECT COUNT(*) FROM c"),
+    ("no-table", "SELECT CAST(? AS BIGINT)"),
+)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("sql", [shape[1] for shape in LOCAL_SHAPES], ids=[shape[0] for shape in LOCAL_SHAPES])
+def test_local_shapes_keep_the_prepared_path_after_verification(
+    remote_tables: tuple[str, str],
+    sql: str,
+) -> None:
+    # Verification must cost a probe, not the prepared fast path: a plan with no remote
+    # dependency stays prepared for every later execution.
+    _, master_uri = remote_tables
+    paths: list[object] = []
+    with dbapi.connect(master_uri) as connection:
+        for _ in range(3):
+            with connection.cursor() as cursor:
+                assert cursor.adbc_prepare(sql) is not None
+                cursor.execute(sql, (0,))
+                cursor.fetchall()
+                paths.append(json.loads(cursor.adbc_statement.get_option(str(StatementOptions.PREPARE_STATUS)))["path"])
+        connection.rollback()
+
+    assert paths == ["prepared", "prepared", "prepared"]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("sql", "message"),
+    [
+        (f"INSERT INTO {SOURCE_TABLE}(id) VALUES (?)", "cannot insert into remote table"),
+        (f"UPDATE {SOURCE_TABLE} SET payload = ? WHERE id = ?", "cannot update remote table"),
+        (f"DELETE FROM {SOURCE_TABLE} WHERE id = ?", "cannot delete from remote table"),
+    ],
+    ids=["insert", "update", "delete"],
+)
+def test_remote_dml_is_refused_before_execution(
+    remote_tables: tuple[str, str],
+    sql: str,
+    message: str,
+) -> None:
+    # DML is exempt from first-execution verification because MonetDB refuses to compile
+    # it against a remote table at all. This pins that premise.
+    _, master_uri = remote_tables
+    with (
+        dbapi.connect(master_uri, autocommit=True) as connection,
+        connection.cursor() as cursor,
+        pytest.raises(dbapi.ProgrammingError, match=message),
+    ):
+        cursor.execute(sql, (0, 0) if sql.count("?") == 2 else (0,))
 
 
 @pytest.mark.integration

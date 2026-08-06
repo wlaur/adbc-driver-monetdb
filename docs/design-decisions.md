@@ -280,9 +280,13 @@ requirements change their premises.
 - MonetDB can accept `PREPARE` over a remote table or a view that depends on one and then reject
   `EXECUTE` with its remote-server wrapper diagnostic. This can happen whether `PREPARE` returns an
   empty or complete result schema; its metadata does not expose the remote dependency. Every
-  row-returning `SELECT`, `WITH`, and `VALUES` plan therefore starts unverified, as does a
-  parenthesized query expression such as a compound select, which has no leading keyword at all and
-  which MonetDB's grammar admits for no other statement kind. Its first prepared
+  prepared plan therefore starts unverified except one whose leading keyword is `INSERT`, `UPDATE`,
+  `DELETE`, `MERGE`, or `TRUNCATE`: MonetDB refuses to compile those against a remote table at all
+  (`rel_updates.c`: "cannot %s remote table '%s' from this server at the moment"), verified against
+  the server, so they can never reach the remote `EXECUTE` failure and a one-row bound DML statement
+  keeps its direct path. Verification is not an allow-list of query-introducing keywords: a shape
+  the driver does not recognize — a parenthesized compound select has no leading keyword at all —
+  costs one probe rather than an unverified execution. Its first prepared
   execution uses an internal savepoint in a caller transaction. Success verifies the plan; the
   remote wrapper rolls back that savepoint, replaces only that normalized SQL shape with a negative
   cached typed-literal template after a successful retry, and avoids aborting caller work. A failed
@@ -415,8 +419,12 @@ requirements change their premises.
   null-fill is needed. Tightening the small route to positional exact-arity instead was rejected:
   it breaks working callers and discards server-side `DEFAULT` handling the small route already
   provided. Name matching prefers an exact spelling and then falls back to case-insensitive
-  matching, so quoted destination columns that differ only by case remain distinguishable. The
-  insert route re-prepares once with the catalog's spelling when fallback matching is required.
+  matching, so quoted destination columns that differ only by case remain distinguishable. A stream
+  name that folds onto more than one destination column and matches none of them exactly is
+  rejected rather than resolved: the candidates are indistinguishable, and picking one would place
+  data in an arbitrary column — the silent failure class the exact-first contract exists to
+  prevent. The insert route re-prepares once with the catalog's spelling when fallback matching is
+  required.
 - Append-schema reads use `sys._columns`/`sys._tables`, or their `tmp` counterparts when the ADBC
   temporary-table option is set. On the supported 11.55.1 release, a temporary-table preflight
   immediately before the public `sys.columns` view can misbind that view's internal `_columns`

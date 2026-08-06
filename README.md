@@ -255,7 +255,8 @@ destination has columns that differ only by case. The stream may therefore prese
 any order, and it may supply a subset of the table's columns: a column it does not supply takes its
 `DEFAULT`, or `NULL` when it has none — which the server rejects for a `NOT NULL` column. A stream
 column that names no destination column, two stream columns that name the same destination column,
-and a column whose type does not match its destination are all rejected before any data is sent.
+a column that matches two destination columns case-insensitively and neither of them exactly, and a
+column whose type does not match its destination are all rejected before any data is sent.
 Create, replace, and create-append modes that actually create the table still build it from the
 stream's own schema.
 
@@ -464,13 +465,16 @@ the normal database-error contract: roll back before retrying. One-row bound DML
 multi-row bound DML retains a savepoint so the whole parameter batch remains atomic.
 MonetDB can accept `PREPARE` for a remote-table query or a view that depends on one, then reject its
 `EXECUTE` on the remote server. Complete result metadata does not rule out this failure, so the
-driver verifies every row-returning prepared plan on its first execution, including a parenthesized
-compound select. A successful probe keeps the prepared fast path; this specific remote execution
-failure rolls back the internal probe savepoint and caches typed-literal execution for that SQL
-shape only after the retry is accepted. A failed retry restores the caller transaction and leaves
-the plan uncached for a later probe. In a caller transaction, the verification adds
-transaction-control round trips once per prepared SQL shape; later executions retain the ordinary
-prepared path. Statements beginning with a DML keyword remain verified at preparation.
+driver verifies every prepared plan on its first execution, whatever its shape — a view over a
+remote table, a nested view, a CTE, a subquery, a merge table, and a parenthesized compound select
+all fall back like a direct remote-table query. A successful probe keeps the prepared fast path;
+this specific remote execution failure rolls back the internal probe savepoint and caches
+typed-literal execution for that SQL shape only after the retry is accepted. A failed retry restores
+the caller transaction and leaves the plan uncached for a later probe. In a caller transaction, the
+verification adds transaction-control round trips once per prepared SQL shape; later executions
+retain the ordinary prepared path. Statements beginning with `INSERT`, `UPDATE`, `DELETE`, `MERGE`,
+or `TRUNCATE` are exempt and keep their direct path: MonetDB refuses to compile them against a
+remote table at all, so they cannot reach this failure.
 When a statement reaches its threshold and MonetDB refuses to `PREPARE` it with a server SQL
 diagnostic, the driver keeps using
 its typed literal-binding path for that statement. The decision depends on the PREPARE outcome,

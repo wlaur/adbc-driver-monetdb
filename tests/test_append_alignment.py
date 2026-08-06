@@ -109,6 +109,25 @@ def test_append_single_case_distinct_name_uses_exact_destination(monetdb_uri: st
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("rows", [INSERT_ROWS, COPY_ROWS])
+def test_append_refuses_a_name_matching_two_destination_columns_only_by_case(monetdb_uri: str, rows: int) -> None:
+    # "AB" folds onto both "aB" and "Ab" and matches neither exactly. Choosing either
+    # would put the data in an arbitrary column.
+    with dbapi.connect(monetdb_uri, autocommit=True) as connection, connection.cursor() as cursor:
+        cursor.execute("DROP TABLE IF EXISTS append_alignment_ambiguous_case")
+        cursor.execute('CREATE TABLE append_alignment_ambiguous_case("aB" INT, "Ab" INT)')
+        ambiguous = _repeat(rows, **{"AB": pa.array([7], type=pa.int32())})
+        with pytest.raises(adbc_driver_manager.ProgrammingError, match="case-insensitively"):
+            cursor.adbc_ingest("append_alignment_ambiguous_case", ambiguous, mode="append")
+
+        # An exact name still resolves against the same destination.
+        exact = _repeat(rows, **{"Ab": pa.array([7], type=pa.int32())})
+        assert cursor.adbc_ingest("append_alignment_ambiguous_case", exact, mode="append") == rows
+        cursor.execute('SELECT COUNT("aB"), MIN("Ab") FROM append_alignment_ambiguous_case')
+        assert cursor.fetchall() == [(0, 7)]
+
+
+@pytest.mark.integration
 @pytest.mark.parametrize(("rows", "path"), [(INSERT_ROWS, "insert"), (COPY_ROWS, "copy")])
 def test_case_mismatched_append_keeps_caller_transaction_work(monetdb_uri: str, rows: int, path: str) -> None:
     # Case alignment starts with a failing exact-name PREPARE. In a caller
