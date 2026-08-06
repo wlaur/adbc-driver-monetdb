@@ -465,13 +465,12 @@ multi-row bound DML retains a savepoint so the whole parameter batch remains ato
 MonetDB can accept `PREPARE` for a remote-table query or a view that depends on one, then reject its
 `EXECUTE` on the remote server. Complete result metadata does not rule out this failure, so the
 driver verifies every row-returning prepared plan on its first execution, including a parenthesized
-compound select. A successful probe keeps
-the prepared fast path; this specific remote execution failure rolls back the internal probe
-savepoint and caches typed-literal execution for that SQL shape only after the retry is accepted. A
-failed retry restores the caller transaction and leaves the plan uncached for a later probe. In a
-caller transaction, the verification adds transaction-control round trips once per prepared SQL
-shape; later executions retain the ordinary prepared path. Statements beginning with a DML keyword
-remain verified at preparation.
+compound select. A successful probe keeps the prepared fast path; this specific remote execution
+failure rolls back the internal probe savepoint and caches typed-literal execution for that SQL
+shape only after the retry is accepted. A failed retry restores the caller transaction and leaves
+the plan uncached for a later probe. In a caller transaction, the verification adds
+transaction-control round trips once per prepared SQL shape; later executions retain the ordinary
+prepared path. Statements beginning with a DML keyword remain verified at preparation.
 When a statement reaches its threshold and MonetDB refuses to `PREPARE` it with a server SQL
 diagnostic, the driver keeps using
 its typed literal-binding path for that statement. The decision depends on the PREPARE outcome,
