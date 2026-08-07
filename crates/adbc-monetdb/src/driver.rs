@@ -6155,19 +6155,37 @@ fn align_append_schema(
     let mut matched = vec![false; columns.len()];
     let mut targets = Vec::with_capacity(schema.fields().len());
     for field in schema.fields() {
-        let Some(index) = append_column_index(field.name(), columns) else {
-            return Err(error(
-                format!(
-                    "append column {:?} does not exist in the destination table; it has columns {}",
-                    field.name(),
-                    columns
-                        .iter()
-                        .map(|column| format!("{:?}", column.name))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-                mismatch_status,
-            ));
+        let index = match append_column_index(field.name(), columns) {
+            AppendColumnMatch::Exact(index) | AppendColumnMatch::CaseInsensitive(index) => index,
+            AppendColumnMatch::Ambiguous(candidates) => {
+                return Err(error(
+                    format!(
+                        "append column {:?} matches destination columns {} case-insensitively \
+                         and none of them exactly; rename the stream column to one of them",
+                        field.name(),
+                        candidates
+                            .iter()
+                            .map(|name| format!("{name:?}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    mismatch_status,
+                ));
+            }
+            AppendColumnMatch::None => {
+                return Err(error(
+                    format!(
+                        "append column {:?} does not exist in the destination table; it has columns {}",
+                        field.name(),
+                        columns
+                            .iter()
+                            .map(|column| format!("{:?}", column.name))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    mismatch_status,
+                ));
+            }
         };
         if std::mem::replace(&mut matched[index], true) {
             return Err(error(
@@ -6246,15 +6264,33 @@ fn append_monet_types_match(source: &MonetType, destination: &MonetType) -> bool
     source == destination || (string_wire(source) && string_wire(destination))
 }
 
-fn append_column_index(source: &str, columns: &[AppendColumn]) -> Option<usize> {
-    columns
+enum AppendColumnMatch {
+    Exact(usize),
+    CaseInsensitive(usize),
+    Ambiguous(Vec<String>),
+    None,
+}
+
+fn append_column_index(source: &str, columns: &[AppendColumn]) -> AppendColumnMatch {
+    if let Some(index) = columns.iter().position(|column| source == column.name) {
+        return AppendColumnMatch::Exact(index);
+    }
+    let mut folded = columns
         .iter()
-        .position(|column| source == column.name)
-        .or_else(|| {
-            columns
-                .iter()
-                .position(|column| source.eq_ignore_ascii_case(&column.name))
-        })
+        .enumerate()
+        .filter(|(_, column)| source.eq_ignore_ascii_case(&column.name));
+    let Some((index, _)) = folded.next() else {
+        return AppendColumnMatch::None;
+    };
+    // Destination columns that differ only by case cannot be told apart by a stream name that
+    // matches neither exactly. Picking the first would place data in an arbitrary column.
+    let rest: Vec<String> = folded.map(|(_, column)| column.name.clone()).collect();
+    if rest.is_empty() {
+        return AppendColumnMatch::CaseInsensitive(index);
+    }
+    let mut candidates = vec![columns[index].name.clone()];
+    candidates.extend(rest);
+    AppendColumnMatch::Ambiguous(candidates)
 }
 
 #[derive(Clone)]
@@ -6459,11 +6495,17 @@ fn remote_prepared_execution_failed(value: &Error) -> bool {
 }
 
 fn prepared_row_execution_needs_verification(query: &str) -> bool {
-    // PREPARE can return complete result metadata even when EXECUTE fails through a remote view.
-    leading_sql_keyword(query).is_some_and(|keyword| {
+    // PREPARE can return complete result metadata even when EXECUTE fails through a remote view,
+    // so a plan is trusted only after one EXECUTE succeeds. Exempt the statements MonetDB rejects
+    // against a remote table at compile time (rel_updates.c: "cannot %s remote table '%s' from
+    // this server at the moment"): those can never reach the remote EXECUTE failure, and a one-row
+    // bound DML statement must not pay the probe's transaction-control round trips. Everything
+    // else is verified, including shapes with no leading keyword such as a parenthesized compound
+    // select — an unrecognized statement costs one probe, never an unverified execution.
+    !leading_sql_keyword(query).is_some_and(|keyword| {
         matches!(
             keyword.to_ascii_uppercase().as_str(),
-            "SELECT" | "WITH" | "VALUES"
+            "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "TRUNCATE"
         )
     })
 }
@@ -9137,12 +9179,26 @@ mod tests {
             "SELECT ?",
             "WITH value AS (SELECT ?) SELECT * FROM value",
             "VALUES (?)",
+            "(SELECT ? LIMIT 1) UNION ALL (SELECT ? LIMIT 1)",
+            "  /* leading */ (SELECT ?)",
+            // No leading keyword and no recognized shape: verify rather than trust.
+            "?",
+            "",
         ] {
             assert!(prepared_row_execution_needs_verification(query));
         }
-        assert!(!prepared_row_execution_needs_verification(
-            "UPDATE values SET value = ?"
-        ));
+        // MonetDB rejects these against a remote table at compile time, so they never reach the
+        // remote EXECUTE failure and must not pay the probe.
+        for query in [
+            "UPDATE values SET value = ?",
+            "INSERT INTO values VALUES (?)",
+            "insert into values (value) values (?) RETURNING value",
+            "DELETE FROM values WHERE value = ?",
+            "TRUNCATE TABLE values",
+            "MERGE INTO values USING other ON values.id = other.id",
+        ] {
+            assert!(!prepared_row_execution_needs_verification(query));
+        }
     }
 
     #[test]
@@ -10995,12 +11051,35 @@ mod tests {
 
     #[test]
     fn append_column_lookup_falls_back_to_unquoted_identifier_case_folding() {
-        let columns = [AppendColumn {
-            name: "mixedcase".to_owned(),
+        let column = |name: &str| AppendColumn {
+            name: name.to_owned(),
             data_type: MonetType::Int,
             nullable: true,
-        }];
-        assert_eq!(append_column_index("MixedCase", &columns), Some(0));
-        assert_eq!(append_column_index("first", &columns), None);
+        };
+        let columns = [column("mixedcase")];
+        assert!(matches!(
+            append_column_index("MixedCase", &columns),
+            AppendColumnMatch::CaseInsensitive(0)
+        ));
+        assert!(matches!(
+            append_column_index("mixedcase", &columns),
+            AppendColumnMatch::Exact(0)
+        ));
+        assert!(matches!(
+            append_column_index("first", &columns),
+            AppendColumnMatch::None
+        ));
+
+        // Two destinations differing only by case: an exact stream name still resolves, but a
+        // name matching both only case-insensitively must not silently pick one.
+        let collided = [column("aB"), column("Ab")];
+        assert!(matches!(
+            append_column_index("Ab", &collided),
+            AppendColumnMatch::Exact(1)
+        ));
+        let AppendColumnMatch::Ambiguous(candidates) = append_column_index("AB", &collided) else {
+            panic!("expected an ambiguous match");
+        };
+        assert_eq!(candidates, ["aB".to_owned(), "Ab".to_owned()]);
     }
 }
