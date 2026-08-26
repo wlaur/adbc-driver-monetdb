@@ -64,8 +64,10 @@ requirements change their premises.
   estimate shows that one 131,072-row export granule fits within that memory guard and a 512 MiB
   ceiling, the automatic budget expands to that granule. Adaptive window endpoints use complete
   export granules when possible and power-of-two sub-granules otherwise. Variable-width schemas
-  start with a conservative allowance, update it from returned frames, and grow at most fourfold
-  per window. `read_batch_rows` is a diagnostic row override; non-zero values are normalized to
+  probe one row before sizing later windows, update the estimate from returned frames, and grow at
+  most fourfold per window. This prevents a declared-width estimate from making the first binary
+  response exceed both its byte budget and the configured protocol-message limit.
+  `read_batch_rows` is a diagnostic row override; non-zero values are normalized to
   the nearest export granule or sub-granule and the effective value remains exact. Zero selects
   byte scheduling. Copy-decoded frames reuse a small buffer pool,
   while adopted fixed-width frames shed capacity slack above one eighth before Arrow owns them.
