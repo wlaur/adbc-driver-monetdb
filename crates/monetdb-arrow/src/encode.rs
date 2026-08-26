@@ -375,7 +375,7 @@ pub fn encode_column(field: &Field, array: &dyn Array) -> Result<Vec<u8>, Encode
                     message: "NULL column is too large to encode",
                 })?;
             out.resize(encoded_len, 0);
-            for pair in out.chunks_exact_mut(2) {
+            for pair in out.as_chunks_mut::<2>().0 {
                 pair[0] = 0x80;
             }
         }

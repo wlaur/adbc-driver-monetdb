@@ -1533,7 +1533,7 @@ fn decode_uuid(bytes: &[u8], rows: usize) -> Result<FixedSizeBinaryArray, Decode
     // `gdk_atoms.h:is_uuid_nil` defines UUID nil as all-zero bytes.
     expect_fixed(bytes, rows, 16)?;
     let mut builder = FixedSizeBinaryBuilder::with_capacity(rows, 16);
-    for value in bytes.chunks_exact(16) {
+    for value in bytes.as_chunks::<16>().0 {
         if value.iter().all(|&byte| byte == 0) {
             builder.append_null();
         } else {
@@ -1548,7 +1548,7 @@ fn decode_date(bytes: &[u8], rows: usize) -> Result<Date32Array, DecodeError> {
     let mut values = Vec::with_capacity(rows);
     let mut validity = Vec::with_capacity(rows);
     let mut has_nulls = false;
-    for (row, value) in bytes.chunks_exact(4).enumerate() {
+    for (row, value) in bytes.as_chunks::<4>().0.iter().enumerate() {
         match date_value(value, row)? {
             Some(value) => {
                 values.push(value);
@@ -1633,7 +1633,7 @@ fn decode_time(bytes: &[u8], rows: usize) -> Result<Time64MicrosecondArray, Deco
     let mut values = Vec::with_capacity(rows);
     let mut validity = Vec::with_capacity(rows);
     let mut has_nulls = false;
-    for (row, value) in bytes.chunks_exact(8).enumerate() {
+    for (row, value) in bytes.as_chunks::<8>().0.iter().enumerate() {
         match time_value(value, row)? {
             Some(value) => {
                 values.push(value);
@@ -1687,7 +1687,7 @@ fn decode_timestamp(
     let mut values = Vec::with_capacity(rows);
     let mut validity = Vec::with_capacity(rows);
     let mut has_nulls = false;
-    for (row, value) in bytes.chunks_exact(12).enumerate() {
+    for (row, value) in bytes.as_chunks::<12>().0.iter().enumerate() {
         let time = time_value(&value[..8], row)?;
         let date = date_value(&value[8..], row)?;
         match (date, time) {
@@ -1783,7 +1783,9 @@ mod tests {
                 let hex = line.rsplit('|').next().expect("fixture line has hex bytes");
                 assert_eq!(hex.len() % 2, 0);
                 hex.as_bytes()
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|digits| {
                         u8::from_str_radix(
                             std::str::from_utf8(digits).expect("hex digits are ASCII"),

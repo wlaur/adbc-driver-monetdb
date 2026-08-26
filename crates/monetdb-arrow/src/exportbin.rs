@@ -103,7 +103,10 @@ pub fn parse_frame(frame: &[u8]) -> Result<ExportbinFrame<'_>, FrameError> {
     }
 
     let mut ranges = Vec::with_capacity(header.column_count);
-    for entry in frame[toc_pos..toc_pos + toc_len].chunks_exact(TOC_ENTRY_SIZE) {
+    for entry in frame[toc_pos..toc_pos + toc_len]
+        .as_chunks::<TOC_ENTRY_SIZE>()
+        .0
+    {
         let start = i64::from_le_bytes(entry[..8].try_into().expect("8 bytes"));
         let length = i64::from_le_bytes(entry[8..].try_into().expect("8 bytes"));
         ranges.push(column_range(start, length, body_start, toc_pos)?);
