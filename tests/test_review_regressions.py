@@ -357,6 +357,21 @@ def test_variable_width_read_windows_converge_to_the_byte_budget(monetdb_uri: st
 
 
 @pytest.mark.integration
+def test_variable_width_read_probes_before_sizing_the_first_window(monetdb_uri: str) -> None:
+    budget = 1024 * 1024
+    separator = "&" if "?" in monetdb_uri else "?"
+    bounded_uri = f"{monetdb_uri}{separator}max_response_size={16 * budget}&read_window_bytes={budget}"
+    with dbapi.connect(bounded_uri) as connection, connection.cursor() as cursor:
+        cursor.execute("SELECT CAST(value AS STRING) || repeat('x', 131072) AS value FROM sys.generate_series(1, 292)")
+        batches = list(cursor.fetch_record_batch())
+        stats = json.loads(cursor.adbc_statement.get_option(str(StatementOptions.READ_STATS)))
+
+    assert sum(batch.num_rows for batch in batches) == 291
+    assert stats["window_rows"][0] == 1
+    assert max(stats["window_bytes"]) <= 2 * budget
+
+
+@pytest.mark.integration
 def test_read_batch_rows_rounds_to_the_server_export_granule(
     monetdb_uri: str, capfd: pytest.CaptureFixture[str]
 ) -> None:

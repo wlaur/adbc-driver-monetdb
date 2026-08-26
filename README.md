@@ -227,8 +227,9 @@ and `DataFrame.write_database(..., engine_options=...)` supplies ingestion argum
 connection or timeout options. Result windows start at 64 MiB on local connections and 128 MiB
 when the measured round trip is at least 5 ms, capped by available host or cgroup memory. A
 fixed-width result may use a larger guarded budget for one complete export granule; variable-width
-estimates adapt from observed data. Set `adbc.monetdb.read_window_bytes` to choose another byte
-target, or use `adbc.monetdb.read_batch_rows` as a diagnostic row override that disables byte
+results probe one row before their byte estimates adapt from observed data. Set
+`adbc.monetdb.read_window_bytes` to choose another byte target, or use
+`adbc.monetdb.read_batch_rows` as a diagnostic row override that disables byte
 adaptation. Non-zero row overrides are rounded to a preferred export boundary with a warning, and
 the effective value is returned by `get_option`. Both options are available on connections and
 statements; `read_window_bytes` is also accepted in a URI.

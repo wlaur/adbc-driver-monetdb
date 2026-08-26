@@ -50,7 +50,7 @@ const MIN_READ_WINDOW_BYTES: usize = 1024 * 1024;
 const MAX_AUTOMATIC_READ_GRANULE_BYTES: usize = 512 * 1024 * 1024;
 const EXPORT_GRANULE_ROWS: usize = 131_072;
 const VARIABLE_READ_COLUMN_BYTES: usize = 1024;
-const INITIAL_VARIABLE_READ_ROWS: usize = 65_536;
+const INITIAL_VARIABLE_READ_ROWS: usize = 1;
 const MAX_READ_WINDOW_GROWTH: usize = 4;
 const DEFAULT_WRITE_WINDOW_BYTES: usize = 512 * 1024 * 1024;
 const LOCAL_PHYSICAL_WINDOW_BYTES: usize = 128 * 1024 * 1024;
@@ -7460,7 +7460,7 @@ fn query_result_with_timeouts(
     }
     let schema = schema_for_columns(&result.columns)?;
     let adopt_frame = monetdb_arrow::prefers_owned_frame(&result.columns);
-    let mut scheduler = ReadWindowScheduler::new(
+    let scheduler = ReadWindowScheduler::new(
         &result.columns,
         read_options.batch_rows,
         read_options.window_bytes,
@@ -7478,7 +7478,7 @@ fn query_result_with_timeouts(
             rows_affected,
         });
     }
-    let first_window_rows = scheduler.next_rows(total_rows);
+    let first_window_rows = scheduler.clone().next_rows(total_rows);
     let prefetch_engaged = read_options.prefetch && total_rows > first_window_rows as u64;
     if let Some(stats) = &read_options.stats {
         *stats
