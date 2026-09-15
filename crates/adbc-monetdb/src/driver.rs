@@ -700,6 +700,7 @@ struct DriverConnection {
     inner: Mutex<monetdb::Connection>,
     pending_deallocations: Mutex<Vec<u64>>,
     prepared_generation: AtomicU64,
+    transaction_modified: AtomicBool,
     ingest_poison: Mutex<Option<IngestPoison>>,
 }
 
@@ -709,6 +710,7 @@ impl DriverConnection {
             inner: Mutex::new(connection),
             pending_deallocations: Mutex::new(Vec::new()),
             prepared_generation: AtomicU64::new(0),
+            transaction_modified: AtomicBool::new(false),
             ingest_poison: Mutex::new(None),
         }
     }
@@ -759,6 +761,44 @@ struct IngestPoison {
 }
 
 type SharedConnection = Arc<DriverConnection>;
+
+struct TransactionWriteGuard {
+    connection: SharedConnection,
+    modifies: bool,
+}
+
+impl TransactionWriteGuard {
+    fn new(connection: &SharedConnection, query: Option<&str>) -> Result<Self> {
+        let modifies = match query {
+            Some(query) => parameterized_statements(query)?
+                .iter()
+                .map(|statement| parameters::statement_may_modify(statement))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .any(|modifies| modifies),
+            None => true,
+        };
+        if modifies {
+            connection
+                .transaction_modified
+                .store(true, Ordering::Release);
+        }
+        Ok(Self {
+            connection: Arc::clone(connection),
+            modifies,
+        })
+    }
+}
+
+impl Drop for TransactionWriteGuard {
+    fn drop(&mut self) {
+        if self.modifies {
+            self.connection
+                .transaction_modified
+                .store(true, Ordering::Release);
+        }
+    }
+}
 
 fn lock_connection(connection: &SharedConnection) -> Result<MutexGuard<'_, monetdb::Connection>> {
     let connection_guard = connection
@@ -1898,6 +1938,11 @@ impl Optionable for MonetdbConnection {
                         .set_autocommit_with_timeouts(enabled, self.timeouts)
                         .map_err(map_cursor_error)?;
                 }
+                if enabled || enabled != current {
+                    self.inner
+                        .transaction_modified
+                        .store(false, Ordering::Release);
+                }
                 self.options.set(key, enabled.to_string().into());
                 return Ok(());
             }
@@ -2560,6 +2605,7 @@ impl Statement for MonetdbStatement {
     }
 
     fn execute_with_rows_affected(&mut self) -> Result<StatementResult> {
+        let _writes = TransactionWriteGuard::new(&self.connection, self.query.as_deref())?;
         self.read_stats = None;
         if self.bound.is_some() {
             if self
@@ -2751,6 +2797,7 @@ impl Statement for MonetdbStatement {
     }
 
     fn execute_update(&mut self) -> Result<Option<i64>> {
+        let _writes = TransactionWriteGuard::new(&self.connection, self.query.as_deref())?;
         if self.bound.is_some()
             && self
                 .options
@@ -3053,6 +3100,15 @@ impl MonetdbStatement {
                 false,
             ));
             self.literal_fallback = Some(fallback);
+        } else if let Some(slot) = &self.prepared_entry {
+            let entry = slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.prepare_status = Some(if !entry.is_verified() {
+                PrepareStatus::literal(None, false)
+            } else {
+                PrepareStatus::prepared()
+            });
         }
     }
 
@@ -6627,6 +6683,18 @@ fn execute_unverified_prepared_result(
             Status::Internal,
         )
     })?;
+    if connection.transaction_modified.load(Ordering::Acquire)
+        && !lock_connection(connection)?
+            .server_info()
+            .map_err(map_cursor_error)?
+            .autocommit
+    {
+        let sql = invocation
+            .literal_sql
+            .as_deref()
+            .ok_or_else(|| error("prepared fallback SQL is unavailable", Status::Internal))?;
+        return query_result_with_timeouts(connection, sql, read_options, timeouts);
+    }
     let savepoint = begin_prepared_execution_savepoint(connection, timeouts)?;
     match query_result_with_timeouts(connection, &query.sql, read_options.clone(), timeouts) {
         Ok(result) => {
@@ -7645,6 +7713,11 @@ fn guard_transaction_commit(
 }
 
 fn apply_transaction_rollback(connection: &SharedConnection, effects: TransactionEffects) {
+    if effects.commit || effects.rollback {
+        connection
+            .transaction_modified
+            .store(false, Ordering::Release);
+    }
     if effects.rollback {
         connection.clear_ingest_poison();
     }

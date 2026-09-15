@@ -84,6 +84,11 @@ from the Arrow field so result schemas do not vary with parameter values. Parame
 row-count position (`LIMIT`, `OFFSET`, `FETCH FIRST`/`NEXT`, `SAMPLE`, `SEED`) render as bare
 integers because MonetDB's grammar rejects an expression there.
 
+In a modified caller transaction, the first execution of an unverified prepared plan uses typed
+literals to avoid a MonetDB 11.55.7 savepoint visibility defect. Explicit preparation still returns
+parameter metadata, and verified plans retain their prepared path. Commit or full rollback allows
+deferred plans to be verified in the next transaction.
+
 The read-only statement option `adbc.monetdb.prepare_status` reports the selected path, original
 diagnostic, and whether a refusal-cache entry was used. A failed literal execution remains the
 primary error and carries the original PREPARE diagnostic in `adbc.monetdb.prepare_error`.

@@ -473,7 +473,11 @@ this specific remote execution failure rolls back the internal probe savepoint a
 typed-literal execution for that SQL shape only after the retry is accepted. A failed retry restores
 the caller transaction and leaves the plan uncached for a later probe. In a caller transaction, the
 verification adds transaction-control round trips once per prepared SQL shape; later executions
-retain the ordinary prepared path. Statements beginning with `INSERT`, `UPDATE`, `DELETE`, `MERGE`,
+retain the ordinary prepared path. After a caller transaction modifies data, unverified plans use
+typed literals until commit or rollback; already verified plans retain their prepared path.
+This avoids a MonetDB 11.55.7 savepoint visibility defect that can expose deleted committed rows
+during the verification read. Schema introspection still prepares the statement, and this deferred
+verification also applies to explicitly prepared statements. Statements beginning with `INSERT`, `UPDATE`, `DELETE`, `MERGE`,
 or `TRUNCATE` are exempt and keep their direct path: MonetDB refuses to compile them against a
 remote table at all, so they cannot reach this failure.
 When a statement reaches its threshold and MonetDB refuses to `PREPARE` it with a server SQL

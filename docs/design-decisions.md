@@ -295,6 +295,15 @@ requirements change their premises.
   literal retry restores the savepoint and leaves the plan available for a later probe. This adds
   transaction-control round trips once per prepared row-query shape, while subsequent executions
   retain the ordinary prepared fast path.
+- MonetDB 11.55.7 can expose a deleted committed row during a savepoint-scoped projection, even
+  while `COUNT(*)` reports the correct count. A fresh committed single-table fixture reproduces
+  this with `DELETE`, `SAVEPOINT`, a projected `SELECT`, and `RELEASE SAVEPOINT`. Once a caller
+  transaction may have written, unverified plans execute through the existing typed-literal path
+  without a verification savepoint. They remain unverified until a later transaction can probe
+  safely. Tracking is conservative for unknown SQL and attempted writes; commit, full rollback,
+  and an actual autocommit transition clear it. Verified plans and direct DML keep their existing
+  execution paths. This changes prepared-read verification, not the atomicity contract of batch
+  writes or ingestion, and does not repair user-issued savepoints in the server.
 - `PREPARE` can narrow declared decimal widths from column statistics. The driver restores
   declared catalog types when MonetDB supplies an unambiguous table/column origin. Current server
   metadata omits the origin schema, so identical table and column names in multiple schemas are
