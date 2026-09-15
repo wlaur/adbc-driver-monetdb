@@ -270,6 +270,8 @@ struct ScannedSlot {
 struct QueryScan {
     statements: Vec<Range<usize>>,
     slots: Vec<ScannedSlot>,
+    first_keyword: Option<Range<usize>>,
+    has_data_change: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -419,6 +421,8 @@ fn scan_query(query: &str) -> Result<QueryScan> {
     let mut statement_has_code = false;
     let mut statements = Vec::new();
     let mut slots = Vec::new();
+    let mut first_keyword = None;
+    let mut has_data_change = false;
     let mut procedural = ProceduralScan::new();
     let mut bare_integer_parameter = false;
     let mut fetch_row_count = false;
@@ -549,6 +553,11 @@ fn scan_query(query: &str) -> Result<QueryScan> {
                         end += 1;
                     }
                     let word = &query[index..end];
+                    first_keyword.get_or_insert(index..end);
+                    has_data_change |= matches!(
+                        word.to_ascii_uppercase().as_str(),
+                        "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "TRUNCATE"
+                    );
                     procedural.observe_word(word);
                     bare_integer_parameter = is_bare_integer_keyword(word)
                         || fetch_row_count
@@ -636,7 +645,34 @@ fn scan_query(query: &str) -> Result<QueryScan> {
     if statement_has_code {
         statements.push(statement_start..query.len());
     }
-    Ok(QueryScan { statements, slots })
+    Ok(QueryScan {
+        statements,
+        slots,
+        first_keyword,
+        has_data_change,
+    })
+}
+
+pub(super) fn statement_may_modify(query: &str) -> Result<bool> {
+    let scan = scan_query(query)?;
+    Ok(scan.has_data_change
+        || !scan.first_keyword.is_some_and(|range| {
+            matches!(
+                query[range].to_ascii_uppercase().as_str(),
+                "SELECT"
+                    | "WITH"
+                    | "VALUES"
+                    | "TABLE"
+                    | "EXPLAIN"
+                    | "PLAN"
+                    | "COMMIT"
+                    | "ROLLBACK"
+                    | "SAVEPOINT"
+                    | "RELEASE"
+                    | "START"
+                    | "BEGIN"
+            )
+        }))
 }
 
 pub(super) fn unbound_statements(query: &str) -> Result<Vec<&str>> {
@@ -1240,6 +1276,33 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+
+    #[test]
+    fn distinguishes_read_expressions_from_transaction_writes() {
+        for query in [
+            "SELECT ?",
+            "((SELECT ?))",
+            "WITH c AS (SELECT ?) SELECT * FROM c",
+            "WITH c AS (SELECT 'DELETE' AS value) SELECT * FROM c",
+            "SELECT \"UPDATE\" FROM t /* DELETE */ -- INSERT\n",
+            "VALUES (?)",
+            "ROLLBACK TO SAVEPOINT previous",
+        ] {
+            assert!(!statement_may_modify(query).unwrap(), "{query}");
+        }
+        for query in [
+            "DELETE FROM t WHERE id = ?",
+            "WITH c AS (SELECT ?) DELETE FROM t WHERE id IN (SELECT * FROM c)",
+            "WITH c AS (SELECT ?) UPDATE t SET id = 1",
+            "WITH c AS (SELECT ?) INSERT INTO t SELECT * FROM c",
+            "CREATE TABLE t(id INTEGER)",
+            "CALL mutate_rows()",
+            "COPY INTO t FROM STDIN",
+            "unknown_statement",
+        ] {
+            assert!(statement_may_modify(query).unwrap(), "{query}");
+        }
+    }
 
     #[test]
     fn renders_only_real_qmark_parameters() {
