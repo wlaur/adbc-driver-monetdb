@@ -935,6 +935,13 @@ fn sqlstate_status(sqlstate: Option<&str>, message: &str) -> Status {
     let Some(sqlstate) = sqlstate.map(str::as_bytes) else {
         return Status::Unknown;
     };
+    if matches!(sqlstate, b"42000" | b"25000")
+        && message
+            .trim_end()
+            .ends_with("failed due to conflict with another transaction")
+    {
+        return Status::Unknown;
+    }
     if sqlstate == b"42000" && message.contains("access denied") {
         return Status::Unauthorized;
     }
@@ -9631,6 +9638,35 @@ mod tests {
     fn maps_sqlstate_families_to_adbc_statuses() {
         for (message, expected) in [
             ("42000!syntax error", Status::InvalidArguments),
+            (
+                "42000!Update failed due to conflict with another transaction",
+                Status::Unknown,
+            ),
+            (
+                "42000!Append failed due to conflict with another transaction",
+                Status::Unknown,
+            ),
+            (
+                "42000!Delete failed due to conflict with another transaction",
+                Status::Unknown,
+            ),
+            (
+                "42000!Table clear failed due to conflict with another transaction",
+                Status::Unknown,
+            ),
+            (
+                "25000!Create table failed due to conflict with another transaction",
+                Status::Unknown,
+            ),
+            (
+                "40001!COMMIT: transaction is aborted because of concurrency conflicts, will ROLLBACK instead",
+                Status::Unknown,
+            ),
+            ("42000!Update failed", Status::InvalidArguments),
+            (
+                "42000!syntax error near 'due to conflict with another transaction'",
+                Status::InvalidArguments,
+            ),
             (
                 "42000!SELECT: access denied for user to table 'sys.private'",
                 Status::Unauthorized,

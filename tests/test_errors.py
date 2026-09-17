@@ -126,3 +126,38 @@ def test_authentication_channels_and_password_readback(monetdb_uri: str) -> None
     finally:
         with dbapi.connect(monetdb_uri, autocommit=True) as admin:
             admin.execute(f"DROP USER IF EXISTS {username}")
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("operation", ["update", "delete", "truncate"])
+def test_write_conflict_is_operational_and_recovers_after_rollback(monetdb_uri: str, operation: str) -> None:
+    table = f"adbc_conflict_{uuid4().hex}"
+    statements = {
+        "update": f"UPDATE {table} SET value=30 WHERE id=1",
+        "delete": f"DELETE FROM {table} WHERE id=1",
+        "truncate": f"TRUNCATE TABLE {table}",
+    }
+    expected_rows = {"update": [(1, 30), (2, 2)], "delete": [(2, 2)], "truncate": []}
+    with dbapi.connect(monetdb_uri, autocommit=True) as admin:
+        admin.execute(f"CREATE TABLE {table}(id INT PRIMARY KEY, value INT)")
+        admin.execute(f"INSERT INTO {table} VALUES (1, 1), (2, 2)")
+        try:
+            with dbapi.connect(monetdb_uri) as reader, dbapi.connect(monetdb_uri) as writer:
+                assert reader.execute(f"SELECT value FROM {table} WHERE id=1").fetchone() == (1,)
+                writer.execute(f"UPDATE {table} SET value=20 WHERE id=1")
+                writer.commit()
+                with pytest.raises(
+                    adbc_driver_manager.OperationalError, match="conflict with another transaction"
+                ) as conflict:
+                    reader.execute(statements[operation])
+                assert conflict.value.status_code == adbc_driver_manager.AdbcStatusCode.UNKNOWN
+                assert conflict.value.sqlstate == "42000"
+                assert ("adbc.monetdb.connection_terminal", b"true") not in conflict.value.details
+                reader.rollback()
+                reader.execute(statements[operation])
+                reader.commit()
+                assert (
+                    reader.execute(f"SELECT id, value FROM {table} ORDER BY id").fetchall() == expected_rows[operation]
+                )
+        finally:
+            admin.execute(f"DROP TABLE IF EXISTS {table}")
