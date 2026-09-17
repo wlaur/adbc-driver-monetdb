@@ -156,6 +156,16 @@ CREATE USER reader WITH PASSWORD 'secret' NAME 'Reporting' SCHEMA sys;
 GRANT SELECT ON sys.trades TO reader;
 ```
 
+## Transaction conflicts
+
+MonetDB can report a write conflict with SQLSTATE `42000` or `25000` and a diagnostic
+ending in `failed due to conflict with another transaction`. These recognized conflicts
+use ADBC status `UNKNOWN`, which the Python driver manager exposes as `OperationalError`,
+while preserving the original SQLSTATE and message. ADBC has no dedicated serialization-conflict
+status. Ordinary syntax, permission and invalid-transaction-state errors keep their existing
+classifications. A conflict does not mark the connection terminal: roll back the failed
+transaction before retrying the complete transaction. The driver does not retry writes automatically.
+
 ## Configuration and timeouts
 
 Timeout values are integer seconds. The default connection deadline is 30 seconds and the default

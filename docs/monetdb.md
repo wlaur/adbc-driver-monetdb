@@ -52,6 +52,16 @@ without matching message text. A server SQLSTATE timeout or cancellation has no 
 and remains reusable when MonetDB keeps the session open. Cancellation is connection-scoped and
 may interrupt whichever statement currently owns the connection.
 
+## Transaction conflicts
+
+MonetDB can report a write conflict with SQLSTATE `42000` or `25000` and a diagnostic
+ending in `failed due to conflict with another transaction`. These recognized conflicts
+use ADBC status `UNKNOWN`, which the Python driver manager exposes as `OperationalError`,
+while preserving the original SQLSTATE and message. ADBC has no dedicated serialization-conflict
+status. Ordinary syntax, permission and invalid-transaction-state errors keep their existing
+classifications. A conflict does not mark the connection terminal: roll back the failed
+transaction before retrying the complete transaction. The driver does not retry writes automatically.
+
 ## Result reads
 
 Server-resident results use adaptive byte-sized windows. The automatic target starts at 64 MiB
