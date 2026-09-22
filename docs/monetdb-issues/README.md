@@ -27,16 +27,19 @@ release line the issue was first reported against.
 | [`binary-export-abort-on-client-disconnect`](binary-export-abort-on-client-disconnect.md) | crash | 11.55.7 | not reproduced this pass; offending code unchanged |
 | [`concurrent-json-workload-server-exit`](concurrent-json-workload-server-exit.md) | crash | 11.55.7 | not re-tested — no standalone reproduction exists |
 | [`parquet-reader-defects`](parquet-reader-defects.md) | wrong data, failed reads | 56.0.0 | partly fixed, `DECIMAL` still unreadable |
-| [`pipeline-binary-result-size-mismatch`](pipeline-binary-result-size-mismatch.md) | protocol error | 56.0.0 | not re-tested — needs a loaded TPC-DS database |
-| [`pipeline-disables-mitosis`](pipeline-disables-mitosis.md) | design, large slowdown | 56.0.0 | not re-tested — measurement, not a pass/fail check |
+| [`pipeline-corrupt-binary-results`](pipeline-corrupt-binary-results.md) | corrupt results, silent-wrong-answer class | 56.0.0 | **reproduces** — deterministic on TPC-DS Q98 |
+| [`pipeline-disables-mitosis`](pipeline-disables-mitosis.md) | design, large slowdown | 56.0.0 | re-measured 2026-09-22 |
 | [`monetdbd-fresh-database-second-boot`](monetdbd-fresh-database-second-boot.md) | startup failure | 56.0.0 | **fixed** |
 | [`prepared-statement-loses-temporary-table`](prepared-statement-loses-temporary-table.md) | lost DDL | 11.55.0–11.55.6 | **fixed** in 11.55.7 |
 | [`tmp-schema-catalog-misbinding`](tmp-schema-catalog-misbinding.md) | wrong catalog rows | 11.55.1 | not reproduced |
 
-Four entries were not re-verified in this pass. Each says why in its own file, and what
-would be needed to settle it. They are the expensive ones: a populated TPC-DS database, a
-multi-gigabyte Parquet ingest, a concurrent multi-client workload, and a whole-suite
-performance comparison.
+Two entries were not re-verified. Each says why in its own file, and what would be needed to
+settle it: a multi-gigabyte Parquet ingest for the full-ingest crash, and a concurrent
+multi-client workload for the wide-JSON server exit.
+
+A full seven-suite campaign on 2026-09-22 settled the two that had been deferred for needing a
+populated database. It also found that the pipeline engine corrupts binary results — an issue
+previously scoped only to one TPC-DS query, now seen on three queries across three suites.
 
 ## Reproducing
 
