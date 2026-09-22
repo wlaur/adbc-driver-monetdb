@@ -439,13 +439,17 @@ requirements change their premises.
   temporary-table option is set. On the supported 11.55.1 release, a temporary-table preflight
   immediately before the public `sys.columns` view can misbind that view's internal `_columns`
   reference to the temporary schema. The base catalogs provide the same metadata without that
-  server-side binder defect; the minimum-version integration job covers the sequence.
+  server-side binder defect; the minimum-version integration job covers the sequence. The
+  defect is recorded in
+  [monetdb-issues/tmp-schema-catalog-misbinding.md](monetdb-issues/tmp-schema-catalog-misbinding.md).
 - MonetDB 11.55.0–11.55.6 can acknowledge a local temporary-table definition without retaining it
   when a prepared statement has already run in the caller transaction. Constrained append staging
   therefore uses a transaction-scoped, uniquely named `UNLOGGED` table in the target schema on
   those versions and a session-local table from 11.55.7 onward. Both are dropped after a successful
   final move and rolled back with the ingest savepoint on failure. Temporary-table targets stay on
   the direct path on the affected versions because persistent tables cannot be created in `tmp`.
+  The server behavior is recorded in
+  [monetdb-issues/prepared-statement-loses-temporary-table.md](monetdb-issues/prepared-statement-loses-temporary-table.md).
 - Server-side LZ4 is selected from observed bytes, not from another latency heuristic. The `auto`
   default sends plain frames only when every column in a window cleared the savings threshold; an
   incompressible or shuffled column keeps the whole window on the ordinary upload path. `none`
