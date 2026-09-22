@@ -1,8 +1,8 @@
 # Enabling the pipeline engine disables mitosis for every client
 
 **Status:** a design consequence rather than a defect, recorded because it makes the flag
-unusable as a global switch. Source checked against `master`; the performance figures come
-from a `56.0.0` build at `bbc2d72f02` and were **not** re-measured at `ee305e491c`.
+unusable as a global switch. Re-measured on `master` at `ee305e491c` (56.0.0) on 2026-09-22
+against a Dec2025-SP3 baseline on the same machine.
 
 ## What happens
 
@@ -28,10 +28,26 @@ It loses all intra-query parallelism, rather than falling back to what it had be
 
 ## Observed effect
 
-Across a mixed analytical workload, the declined queries clustered at almost exactly 0.3× the
-throughput of the same queries on 11.55.7 — a flat ~3× penalty, which is what losing mitosis
-looks like. Individual queries the pipeline *does* accept were up to 23× faster, so the engine
-is doing what it claims on its target shapes; the problem is the all-or-nothing switch.
+Warm-query totals at `ee305e491c`, common queries only, against Dec2025-SP3 on the same
+machine. `off` is MonetDB's shipped default; `on` sets `-d524288`:
+
+| suite | SP3 | pipeline off | pipeline on | off vs SP3 | on vs SP3 |
+|---|---:|---:|---:|---:|---:|
+| kaggle_airbnb | 145.07 s | 363.12 s | 39.95 s | 0.40× | **3.63×** |
+| clickbench | 109.05 s | 95.21 s | 69.47 s | 1.15× | 1.57× |
+| chat_threads | 33.60 s | 28.35 s | 41.04 s | 1.19× | **0.82×** |
+| time_series | 0.93 s | 1.00 s | 1.07 s | 0.93× | 0.86× |
+
+The engine is violently bimodal: a 3.63× win on the suite whose shapes it targets, and a loss
+on two of the other three. RTABench, TPC-H and TPC-DS are absent because with the engine
+enabled each hit a corrupt result — see
+[pipeline-corrupt-binary-results](pipeline-corrupt-binary-results.md) — so their query sets no
+longer match and the totals are not comparable.
+
+An earlier campaign on `bbc2d72f02` measured the declined queries clustering at almost exactly
+0.3× the throughput of the same queries on 11.55.7 — a flat ~3× penalty, which is what losing
+mitosis looks like — while individual accepted queries ran up to 23× faster. The engine does
+what it claims on its target shapes; the problem is the all-or-nothing switch.
 
 `SQLrunning` is declared in `sql_scenario.h:15` as
 `// dev. debug var, 2 remove once the code is ~stable`, which is consistent with the flag not
