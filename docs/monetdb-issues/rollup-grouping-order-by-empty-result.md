@@ -16,10 +16,11 @@ Silently returning nothing is the worst-case failure mode here: a caller cannot 
 it from a genuinely empty table, so it corrupts results rather than failing the query.
 
 This is not a synthetic pattern. It is exactly the shape of **TPC-DS queries 70 and 86**,
-both of which carry it verbatim, and both of which return nothing on MonetDB.
+both of which carry it verbatim, and both of which return nothing on MonetDB while returning
+3 and 100 rows respectively on DuckDB.
 
-Seen through this driver, which reports it as a zero-column result, and confirmed through
-`mclient`.
+Seen through this driver at 0.12.0, which reports it as a zero-column result, and confirmed
+through `mclient`.
 
 ## Reproduction
 
@@ -69,8 +70,9 @@ Both `CASE`-over-`grouping()` expressions must be present. Each alone is fine.
 
 ## Where it was hit
 
-TPC-DS **q86** and **q70**. Both are affected because the TPC-DS reporting-hierarchy pattern
-puts a `CASE` over `grouping()` in both the window partition and the final sort. q86 in full:
+TPC-DS **q86** and **q70**, taken verbatim from the DuckDB `tpcds` extension's query set.
+Both are affected because the TPC-DS reporting-hierarchy pattern puts a `CASE` over
+`grouping()` in both the window partition and the final sort. q86 in full:
 
 ```sql
 SELECT sum(ws_net_paid) AS total_sum, i_category, i_class,
@@ -89,10 +91,14 @@ ORDER BY lochierarchy DESC NULLS FIRST,
 LIMIT 100;
 ```
 
-q70 is the same pattern over `store_sales` with `rollup(s_state, s_county)`. On TPC-DS SF1,
-q70 should return 3 rows and q86 100 rows; both return 0 rows and no error.
+q70 is the same pattern over `store_sales` with `rollup(s_state, s_county)`. On TPC-DS SF1:
 
-Removing the `CASE` term from the final `ORDER BY` makes both return rows.
+| Query | DuckDB | MonetDB |
+| --- | --- | --- |
+| q70 | 3 rows | 0 rows, no error |
+| q86 | 100 rows | 0 rows, no error |
+
+Removing the `CASE` term from the final `ORDER BY` makes both return rows on MonetDB.
 
 ## Workaround
 

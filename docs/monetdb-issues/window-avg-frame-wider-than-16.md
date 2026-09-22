@@ -74,8 +74,8 @@ ORDER BY time
 LIMIT 10000;
 ```
 
-Rows 0-15 matched an independent implementation exactly; row 16 onward diverged. Verified
-against a NumPy float64 computation over the same values.
+Rows 0-15 matched DuckDB exactly; row 16 onward diverged. Verified against an independent
+NumPy float64 computation over the same values: DuckDB is correct, MonetDB is not.
 
 | Row | True mean | MonetDB |
 | --- | --- | --- |
