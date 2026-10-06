@@ -18,6 +18,11 @@ covers the conventions that are easy to get wrong.
   generated ADBC validation documentation and the standalone DBC release package.
   Keep both current when installation, connection options, support policy,
   feature/type coverage, or packaging behavior changes.
+- [docs/monetdb-issues/](docs/monetdb-issues/README.md) holds draft bug reports for the
+  **MonetDB server**, each with a self-contained `mclient` reproduction, plus `repro/` for
+  building a server from an arbitrary MonetDB commit and re-running the checks. A server
+  defect the driver works around belongs there, with the workaround's rationale staying in
+  `docs/design-decisions.md`. Nothing in that directory is a driver defect.
 
 ## Hard support policy — no compatibility code
 
