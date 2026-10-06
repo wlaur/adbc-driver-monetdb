@@ -191,7 +191,13 @@ def test_append_leaves_absent_not_null_columns_to_the_server_on_every_route(mone
 @pytest.mark.integration
 @pytest.mark.parametrize(("rows", "path"), [(INSERT_ROWS, "insert"), (COPY_ROWS, "staged_copy")])
 def test_constrained_append_stages_a_reordered_subset(monetdb_uri: str, rows: int, path: str) -> None:
-    with dbapi.connect(monetdb_uri, autocommit=True) as connection, connection.cursor() as cursor:
+    options: dict[str, object] = {}
+    if path == "staged_copy":
+        options[str(StatementOptions.WRITE_BATCH_ROWS)] = rows
+    with (
+        dbapi.connect(monetdb_uri, autocommit=True) as connection,
+        connection.cursor(adbc_stmt_kwargs=options) as cursor,
+    ):
         cursor.execute("DROP TABLE IF EXISTS append_alignment_pk")
         cursor.execute('CREATE TABLE append_alignment_pk("id" INT, "a" INT, "b" INT, PRIMARY KEY ("id"))')
         keyed = pa.table(

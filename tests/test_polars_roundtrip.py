@@ -1420,6 +1420,11 @@ def test_append_to_delete_on_commit_temporary_table_stays_in_caller_transaction(
         cursor.execute("SELECT COUNT(*) FROM ingest_preserve_on_commit")
         assert cursor.fetchone() == (3,)
 
+        conn.commit()
+        assert cursor.execute("SELECT COUNT(*) FROM ingest_delete_on_commit").fetchone() == (0,)
+        assert cursor.execute("SELECT COUNT(*) FROM ingest_preserve_on_commit").fetchone() == (3,)
+        cursor.execute("INSERT INTO ingest_delete_on_commit VALUES (4)")
+
         with pytest.raises(adbc_driver_manager.DataError, match="non-finite"):
             cursor.adbc_ingest(
                 "ingest_failure_with_temporary_rows",
@@ -1427,9 +1432,10 @@ def test_append_to_delete_on_commit_temporary_table_stays_in_caller_transaction(
                 mode="replace",
             )
         cursor.execute("SELECT COUNT(*) FROM ingest_delete_on_commit")
-        assert cursor.fetchone() == (4,)
-
-        conn.commit()
+        assert cursor.fetchone() == (1,)
+        with pytest.raises(adbc_driver_manager.ProgrammingError, match="ROLLBACK is required"):
+            conn.commit()
+        conn.rollback()
 
         cursor.execute("SELECT COUNT(*) FROM ingest_delete_on_commit")
         assert cursor.fetchone() == (0,)
@@ -1569,7 +1575,9 @@ def test_generated_sql_escapes_hostile_identifiers_and_metadata_filters(
                 db_schema_filter="sys' OR 1=1 --",
                 table_name_filter="missing' OR 1=1 --",
             ).read_all()
-            assert rows.to_pylist() == [{"catalog_name": "test", "catalog_db_schemas": []}]
+            assert rows.to_pylist() == [
+                {"catalog_name": conn.adbc_connection.get_option("adbc.connection.catalog"), "catalog_db_schemas": []}
+            ]
             cursor.execute("SELECT COUNT(*) FROM injection_identifier_guard")
             assert cursor.fetchone() == (0,)
         finally:

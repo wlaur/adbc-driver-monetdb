@@ -176,17 +176,22 @@ requirements change their premises.
   coalescing also removed repeated COPY round trips. On a 160 MB, 20-column random-REAL upload,
   replacing copied framing with scatter framing reduced the median of five warmed runs from
   168.6 to 161.2 ms (4.4%) and removed one message-sized allocation.
-- Unconstrained appends to an existing table inside a caller-managed transaction execute directly
-  for every COPY window. Operation savepoints caused MonetDB to retain and materialize
-  disproportionate storage for large, wide streams even after release. A client-side error after
-  a completed target window marks the connection rollback-only: reads remain available, but
-  connection APIs and raw SQL both block commit until a successful rollback clears the state.
-  Staged constrained appends write no target rows before the final move and retain an operation
-  savepoint, so producer and constraint failures can preserve earlier caller work without risking
-  a partial target. Explicit savepoint and partial-commit modes remain advanced opt-ins for the
-  direct path. Autocommit wraps the complete stream in an internal transaction; create and replace
-  modes retain their operation savepoint because their DDL must be recovered without discarding
-  unrelated caller work.
+- Operation savepoints are restricted to caller transactions without prior writes. Native SQL on
+  MonetDB 11.55.7 reproduces the failure independently of ADBC: prepare an UPDATE, update the first
+  two committed rows inside a savepoint, release it, then update the remaining rows inside another
+  savepoint. The second batch restores the first rows to their committed values. A committed DELETE
+  followed by savepoint-scoped INSERT also sees false primary-key conflicts. Repreparing or using
+  literal UPDATE inside the scopes does not repair the row versions. The existing transaction-write
+  guard captures prior writes before marking the current operation; batch and ingest scopes reuse
+  that state and avoid a second transaction tracker. Preparation-only probes still complete before
+  DML and remain available for prepare-error recovery. User-issued savepoints are not repaired.
+  Failed write operations without an operation savepoint reuse one transaction rollback-only guard
+  for connection commit, autocommit enablement, and raw SQL COMMIT. Successful rollback clears it.
+  Preflight errors before writes do not poison the transaction. Server constraint failures in a dirty
+  transaction require full rollback instead of promising unsafe preservation of earlier caller
+  writes. Clean operation scopes and internal autocommit transactions retain failure recovery.
+  Explicit savepoint ingestion rejects dirty transactions before writes. Partial-commit opt-in is
+  confined to direct COPY append; prepared INSERT, staged append, create, and replace cannot opt out.
 - Constrained staging is intentionally a speed/server-storage trade. On a generic BIGINT-primary-key
   plus 512-byte-BLOB stream at 100,000, 400,000, and 1,600,000 rows, staged caller-transaction server
   RSS peaked at 186.0, 564.4, and 2,884.5 MiB, versus 145.4, 255.0, and 883.6 MiB for direct COPY.
@@ -195,7 +200,7 @@ requirements change their premises.
   truncating 512 MiB generations inside the same atomic transaction was rejected: it measured
   2,934.8 MiB RSS, 3,027.5 MiB disk, and 2.548 seconds because MonetDB retains rollback state until
   commit. `constrained_append=direct` remains the honest memory escape hatch; create/replace in a
-  caller transaction retains its savepoint to preserve earlier work.
+  clean caller transaction uses an operation savepoint; a dirty transaction requires rollback after failure.
 - Post-ingest RSS is not live driver or Arrow state in the measured macOS case. Arrow accounting
   returned to zero, while the retained pages appeared as empty large malloc regions and were
   released gradually by the platform allocator. A PyArrow-only replay retained the same class of
@@ -302,8 +307,8 @@ requirements change their premises.
   without a verification savepoint. They remain unverified until a later transaction can probe
   safely. Tracking is conservative for unknown SQL and attempted writes; commit, full rollback,
   and an actual autocommit transition clear it. Verified plans and direct DML keep their existing
-  execution paths. This changes prepared-read verification, not the atomicity contract of batch
-  writes or ingestion, and does not repair user-issued savepoints in the server.
+  execution paths. This defers prepared-read verification; operation scopes also avoid savepoints after prior writes,
+  and neither path repairs user-issued savepoints in the server.
 - `PREPARE` can narrow declared decimal widths from column statistics. The driver restores
   declared catalog types when MonetDB supplies an unambiguous table/column origin. Current server
   metadata omits the origin schema, so identical table and column names in multiple schemas are
@@ -362,10 +367,10 @@ requirements change their premises.
   the cache-only path and kept the result below the 0.50 ms acceptance threshold.
 - The review's remaining repeated-DML regression was three wire round trips caused by wrapping
   every parameter batch in a savepoint. One-row DML now executes directly, because there is no
-  partial batch to recover; multi-row batches retain the atomic scope. The other structural
+  partial batch to recover; multi-row batches retain failure atomicity through clean operation scopes or mandatory transaction rollback. The other structural
   regression was a one-row login reply window, which forced every result of at least two rows into
   an extra fetch. The driver now keeps MonetDB's normal 100-row inline window.
-- Multi-row ExecuteUpdate keeps its atomic transaction/savepoint but sends rendered `EXECUTE`
+- Multi-row ExecuteUpdate keeps its safe transaction scope but sends rendered `EXECUTE`
   statements in bounded batches of at most 1,024 rows or 8 MiB. The first row remains an
   individual stale-plan probe so a missing prepared statement can be retried without buffering
   an arbitrary Arrow stream. On the local 4,096-row benchmark, batching reduced median time from
@@ -446,7 +451,7 @@ requirements change their premises.
   when a prepared statement has already run in the caller transaction. Constrained append staging
   therefore uses a transaction-scoped, uniquely named `UNLOGGED` table in the target schema on
   those versions and a session-local table from 11.55.7 onward. Both are dropped after a successful
-  final move and rolled back with the ingest savepoint on failure. Temporary-table targets stay on
+  final move and recovered through the safe operation scope on failure. Temporary-table targets stay on
   the direct path on the affected versions because persistent tables cannot be created in `tmp`.
   The server behavior is recorded in
   [monetdb-issues/prepared-statement-loses-temporary-table.md](monetdb-issues/prepared-statement-loses-temporary-table.md).

@@ -336,7 +336,7 @@ once. MonetDB 11.55.7 and newer use a session-local table. Versions 11.55.0–11
 named transactional `UNLOGGED` table in the target schema because those releases can lose a local
 temporary-table definition after a prepared statement; that compatibility path requires
 `CREATE TABLE` in the target schema. The staging table is dropped on success and its ingest
-savepoint removes it on failure. Temporary-table targets on those older releases remain direct.
+transaction recovery removes it on failure. Temporary-table targets on those older releases remain direct.
 Upgrade to 11.55.7 or set `adbc.monetdb.constrained_append=direct` when schema creation is not
 available. Unconstrained targets and the small prepared-INSERT route remain direct. Set
 `adbc.monetdb.constrained_append=direct` only to diagnose server behavior or when independent
@@ -432,27 +432,29 @@ make it strictly bounded; prefer `ParquetArrowStream` for Parquet until Polars e
 memory budget ([Polars issue #28569](https://github.com/pola-rs/polars/issues/28569)). The base
 driver remains importable without either optional dependency.
 
-An unconstrained append to an existing table inside an explicit transaction executes directly for
-every Arrow stream window. This avoids MonetDB retaining and replaying a full table version for an
-operation savepoint. If a client-side stream or encoding error occurs after one or more completed
-target COPY windows, subsequent reads remain available but `commit()` raises `InvalidState` until
-`rollback()` removes the partial append. The same guard applies to raw SQL `COMMIT`, and a
-successful raw SQL `ROLLBACK` clears it. A staged constrained append changes the target only in its
-final move, so producer and constraint failures roll back to the ingest savepoint and preserve
-earlier caller work. Server errors retain their DB-API exception and SQLSTATE. Autocommit
-ingestion wraps the complete stream in an internal transaction, rolls it back on error, and
-restores the connection.
+In a caller-managed transaction, an operation savepoint is safe only before the transaction has
+written data. MonetDB 11.55.7 can restore earlier committed row versions when a later write executes
+inside an internal savepoint. This can discard preceding updates or expose deleted primary keys;
+the same SQL reproduces through pymonetdb. The driver therefore executes later bound batches and
+ingests without an operation savepoint. Successful operations remain in the caller's transaction
+until commit or rollback, including repeated updates and delete-then-insert appends.
 
-Create and replace ingests inside a caller-managed transaction retain an operation savepoint so a
-failure can preserve earlier caller work. MonetDB may retain more server storage for that safety;
-use autocommit for an independent bulk load when it does not need to share the caller's transaction.
+After a failed operation attempts writes without an operation savepoint, the transaction is
+rollback-only: `commit()`, enabling autocommit, and raw SQL `COMMIT` raise `InvalidState` until
+`rollback()` or successful raw SQL `ROLLBACK` clears the state. Client-side failures can leave
+partial rows visible to reads; server errors can abort the transaction and prevent reads too.
+Validation failures detected before writing do not mark the transaction rollback-only. Server
+errors retain their DB-API exception and SQLSTATE. Autocommit ingestion wraps the complete stream
+in an internal transaction, rolls it back on error, and restores the connection. An operation
+savepoint in a transaction without earlier writes also recovers the failed operation.
 
-Two advanced statement or connection options change that contract. Setting
-`adbc.monetdb.ingest_atomicity` to `"savepoint"` preserves earlier caller work and rolls back only
-the failed ingest, but MonetDB Dec2025 may write an extra full copy of a sub-million-row append to
-its WAL. The default `"transaction"` scope avoids that amplification and blocks commit after a
-partial client-side failure. Setting `adbc.monetdb.ingest_partial` to `"allow"` permits committing
-completed windows after such a failure; the default `"block"` is the safe behavior.
+`adbc.monetdb.ingest_atomicity="savepoint"` requests operation recovery and is rejected before
+writing when a caller transaction already contains writes. Commit or roll back first, or use an
+independent autocommit connection. The default `"transaction"` scope executes in that transaction
+and requires rollback after failure. `adbc.monetdb.ingest_partial="allow"` remains an explicit
+escape hatch for direct COPY appends: it permits committing completed windows after a client-side
+failure. It does not permit partial commits for prepared INSERT, staged constrained append, create,
+or replace ingestion.
 
 Positional statement outcomes are cached per connection by normalized SQL text, so consumers such as
 SQLAlchemy can create a fresh cursor for each execution without losing reuse information. A
@@ -473,7 +475,8 @@ the connection invalidate the cache, and externally invalidated plans are prepar
 retried once when MonetDB can recover without rolling back user work. MonetDB aborts an explicit
 transaction when `EXECUTE` reports a missing prepared plan, so a stale plan in that state follows
 the normal database-error contract: roll back before retrying. One-row bound DML executes directly;
-multi-row bound DML retains a savepoint so the whole parameter batch remains atomic.
+multi-row bound DML uses an operation savepoint only before earlier writes; otherwise a failed
+batch requires transaction rollback and cannot be partially committed.
 MonetDB can accept `PREPARE` for a remote-table query or a view that depends on one, then reject its
 `EXECUTE` on the remote server. Complete result metadata does not rule out this failure, so the
 driver verifies every prepared plan on its first execution, whatever its shape — a view over a
@@ -527,7 +530,7 @@ measurement; statement scope is preferable when one operation is exceptional.
 | `ingest_insert_rows` | 100, latency-adaptive | database, connection, statement, URI | Set `0` to compare/force COPY or raise a floor for measured high-latency tiny writes |
 | `wire_compression` | `auto` | database, connection, statement, URI | Use `lz4` for bandwidth-bound links or `none` to rule out server decompression while keeping client storage compression |
 | `constrained_append` | `auto` | database, connection, statement, URI | Use `direct` only to diagnose or benchmark repeated target COPY behavior |
-| `ingest_atomicity` | `transaction` | connection, statement | Use `savepoint` for direct unconstrained appends when preserving prior caller work outweighs MonetDB WAL amplification |
+| `ingest_atomicity` | `transaction` | connection, statement | Use `savepoint` only before transaction writes; later failures require transaction rollback |
 | `ingest_partial` | `block` | connection, statement | Use `allow` only when committing completed direct target windows after a producer failure is intentional |
 | `prepared_cache_capacity` | 512 | database, connection, URI | Adjust for a measured working set of distinct prepared SQL statements |
 | `prepare_threshold` | 2 | database, connection, statement, URI | Use `1` for known-reused SQL or `0` to keep every parameter execution on typed literals; explicit schema introspection and multi-row updates still prepare |
@@ -537,7 +540,8 @@ measurement; statement scope is preferable when one operation is exceptional.
 
 The Arrow-native path is designed for columnar reads and bulk ingestion. A one-row parameterized
 DML execution follows the connection's prepare threshold; parameter batches with two or more rows
-prepare immediately and use a savepoint so the complete batch stays atomic. The login keeps
+prepare immediately; clean transactions use an operation savepoint, while failed batches after
+prior writes require rollback. The login keeps
 MonetDB's normal inline reply window, so small result sets are decoded from the initial response
 instead of forcing another fetch.
 

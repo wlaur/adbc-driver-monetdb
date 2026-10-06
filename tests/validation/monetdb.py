@@ -1,4 +1,6 @@
+import os
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 from adbc_drivers_validation import model  # pyright: ignore[reportMissingTypeStubs]
 from server_version import MONETDB_SERVER_VERSION
@@ -82,4 +84,10 @@ class MonetdbQuirks(model.DriverQuirks):
 
 
 def get_quirks() -> MonetdbQuirks:
-    return MonetdbQuirks()
+    quirks = MonetdbQuirks()
+    if uri := os.environ.get("MONETDB_TEST_URI"):
+        catalog = unquote(urlsplit(uri).path.removeprefix("/"))
+        if not catalog:
+            raise ValueError("MONETDB_TEST_URI requires an explicit database")
+        quirks.features = quirks.features.with_values(current_catalog=catalog)
+    return quirks

@@ -701,7 +701,7 @@ struct DriverConnection {
     pending_deallocations: Mutex<Vec<u64>>,
     prepared_generation: AtomicU64,
     transaction_modified: AtomicBool,
-    ingest_poison: Mutex<Option<IngestPoison>>,
+    transaction_poison: Mutex<Option<String>>,
 }
 
 impl DriverConnection {
@@ -711,34 +711,34 @@ impl DriverConnection {
             pending_deallocations: Mutex::new(Vec::new()),
             prepared_generation: AtomicU64::new(0),
             transaction_modified: AtomicBool::new(false),
-            ingest_poison: Mutex::new(None),
+            transaction_poison: Mutex::new(None),
+        }
+    }
+
+    fn poison_transaction(&self, reason: String) {
+        let mut poison = self
+            .transaction_poison
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if poison.is_none() {
+            *poison = Some(reason);
         }
     }
 
     fn poison_ingest(&self, target: &str, windows: usize) {
-        let mut poison = self
-            .ingest_poison
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if poison.is_none() {
-            *poison = Some(IngestPoison {
-                target: target.to_owned(),
-                windows,
-            });
-        }
+        self.poison_transaction(format!(
+            "ingest into {target} failed after {windows} COPY windows; the transaction may contain partial writes"
+        ));
     }
 
     fn commit_error(&self) -> Option<Error> {
-        self.ingest_poison
+        self.transaction_poison
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .map(|poison| {
                 let mut result = error(
-                    format!(
-                        "ingest into {} failed after {} COPY windows; the transaction contains a partial append; ROLLBACK is required",
-                        poison.target, poison.windows
-                    ),
+                    format!("{poison}; ROLLBACK is required"),
                     Status::InvalidState,
                 );
                 result.sqlstate =
@@ -747,17 +747,12 @@ impl DriverConnection {
             })
     }
 
-    fn clear_ingest_poison(&self) {
+    fn clear_transaction_poison(&self) {
         *self
-            .ingest_poison
+            .transaction_poison
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
-}
-
-struct IngestPoison {
-    target: String,
-    windows: usize,
 }
 
 type SharedConnection = Arc<DriverConnection>;
@@ -765,6 +760,7 @@ type SharedConnection = Arc<DriverConnection>;
 struct TransactionWriteGuard {
     connection: SharedConnection,
     modifies: bool,
+    prior_writes: bool,
 }
 
 impl TransactionWriteGuard {
@@ -778,14 +774,15 @@ impl TransactionWriteGuard {
                 .any(|modifies| modifies),
             None => true,
         };
-        if modifies {
-            connection
-                .transaction_modified
-                .store(true, Ordering::Release);
-        }
+        let prior_writes = if modifies {
+            connection.transaction_modified.swap(true, Ordering::AcqRel)
+        } else {
+            connection.transaction_modified.load(Ordering::Acquire)
+        };
         Ok(Self {
             connection: Arc::clone(connection),
             modifies,
+            prior_writes,
         })
     }
 }
@@ -2612,7 +2609,7 @@ impl Statement for MonetdbStatement {
     }
 
     fn execute_with_rows_affected(&mut self) -> Result<StatementResult> {
-        let _writes = TransactionWriteGuard::new(&self.connection, self.query.as_deref())?;
+        let writes = TransactionWriteGuard::new(&self.connection, self.query.as_deref())?;
         self.read_stats = None;
         if self.bound.is_some() {
             if self
@@ -2688,8 +2685,12 @@ impl Statement for MonetdbStatement {
                         }
                         queries.pending.push_front(query);
                     }
-                    let rows_affected =
-                        execute_updates_atomic(&self.connection, &mut queries, self.timeouts)?;
+                    let rows_affected = execute_updates_atomic(
+                        &self.connection,
+                        &mut queries,
+                        self.timeouts,
+                        writes.prior_writes,
+                    )?;
                     return Ok(StatementResult {
                         reader: Box::new(EmptyReader::default()),
                         rows_affected,
@@ -2739,8 +2740,12 @@ impl Statement for MonetdbStatement {
                         None => self.execute_schema()?,
                     };
                     if schema.fields().is_empty() {
-                        let rows_affected =
-                            execute_updates_atomic(&self.connection, &mut queries, self.timeouts)?;
+                        let rows_affected = execute_updates_atomic(
+                            &self.connection,
+                            &mut queries,
+                            self.timeouts,
+                            writes.prior_writes,
+                        )?;
                         self.prepared_result_schema = Some(schema);
                         return Ok(StatementResult {
                             reader: Box::new(EmptyReader::default()),
@@ -2804,14 +2809,14 @@ impl Statement for MonetdbStatement {
     }
 
     fn execute_update(&mut self) -> Result<Option<i64>> {
-        let _writes = TransactionWriteGuard::new(&self.connection, self.query.as_deref())?;
+        let writes = TransactionWriteGuard::new(&self.connection, self.query.as_deref())?;
         if self.bound.is_some()
             && self
                 .options
                 .optional_string(OptionStatement::TargetTable)
                 .is_some()
         {
-            return self.ingest();
+            return self.ingest(writes.prior_writes);
         }
         if self.bound.is_some() {
             let query = self
@@ -2825,7 +2830,12 @@ impl Statement for MonetdbStatement {
             let multi_row = self.bound_batch_exceeds_one_row()?;
             self.resolve_deferred_for_execution(multi_row)?;
             let mut queries = self.take_bound_queries()?;
-            let result = execute_updates_atomic(&self.connection, &mut queries, self.timeouts);
+            let result = execute_updates_atomic(
+                &self.connection,
+                &mut queries,
+                self.timeouts,
+                writes.prior_writes,
+            );
             if invalidates_cache {
                 clear_prepared_cache(&self.prepared_cache);
             }
@@ -3296,7 +3306,7 @@ impl MonetdbStatement {
         })
     }
 
-    fn ingest(&mut self) -> Result<Option<i64>> {
+    fn ingest(&mut self, prior_writes: bool) -> Result<Option<i64>> {
         self.ingest_stats = None;
         let reader = self
             .bound
@@ -3443,10 +3453,23 @@ impl MonetdbStatement {
         } else {
             CallerTransactionScope::Savepoint
         };
+        if prior_writes
+            && self.ingest_atomicity == IngestAtomicity::Savepoint
+            && !connection
+                .server_info()
+                .map_err(map_cursor_error)?
+                .autocommit
+        {
+            return Err(error(
+                "ingest_atomicity=savepoint requires a transaction without prior writes; commit or rollback before ingesting",
+                Status::InvalidState,
+            ));
+        }
         let (mut cursor, atomic_scope) = begin_atomic(
             &connection,
             "ingest",
             caller_scope,
+            prior_writes,
             temporary_state.map(|state| state.any),
             self.timeouts,
         )?;
@@ -3485,6 +3508,7 @@ impl MonetdbStatement {
                 table,
                 temporary,
             };
+            let mut writes_started = mode != "adbc.ingest.mode.append";
             let setup = execute_ingest_target_mode(&mut cursor, &target);
             let mut prepared_cache_hit = false;
             let inserted = setup.and_then(|()| {
@@ -3561,6 +3585,7 @@ impl MonetdbStatement {
                     .collect::<Vec<_>>();
                 let mut total = 0i64;
                 let mut has_count = false;
+                writes_started = true;
                 execute_update_batch(&mut cursor, &queries, &mut total, &mut has_count)?;
                 has_count
                     .then_some(total)
@@ -3585,6 +3610,10 @@ impl MonetdbStatement {
                         Ok(rows)
                     })
             });
+            if inserted.is_err() && caller_transaction && writes_started {
+                self.connection.poison_ingest(&operation_target, 0);
+                stats.poisoned = true;
+            }
             let result = finish_atomic(
                 &connection,
                 &mut cursor,
@@ -3605,6 +3634,7 @@ impl MonetdbStatement {
             }
             return result;
         }
+        let mut writes_started = mode != "adbc.ingest.mode.append";
         let result = (|| {
             let target = IngestTarget {
                 mode,
@@ -3638,6 +3668,7 @@ impl MonetdbStatement {
                     local,
                     persistent_schema.as_deref(),
                 )?;
+                writes_started = true;
                 cursor.execute(&stage.create).map_err(map_cursor_error)?;
                 stats.path = "staged_copy";
                 Some(stage)
@@ -3700,6 +3731,7 @@ impl MonetdbStatement {
                             );
                             (Some(request), Some(receiver), Some(encoder))
                         };
+                    writes_started = true;
                     let upload_result = cursor
                     .execute_with_streaming_uploads(
                         if wire_lz4 { &copy_lz4 } else { &copy },
@@ -3934,6 +3966,11 @@ impl MonetdbStatement {
         })();
         cursor.set_timeouts(self.timeouts);
         let operation_failed = result.is_err();
+        let partial_allowed = self.ingest_partial == IngestPartial::Allow
+            && !staged_constrained_append
+            && mode == "adbc.ingest.mode.append"
+            && stats.target_copy_count > 0
+            && result.as_ref().is_err_and(|value| value.sqlstate == [0; 5]);
         let result = finish_atomic(
             &connection,
             &mut cursor,
@@ -3942,11 +3979,7 @@ impl MonetdbStatement {
             self.timeouts,
         )
         .map(Some);
-        if operation_failed
-            && caller_transaction
-            && stats.target_copy_count > 0
-            && self.ingest_partial == IngestPartial::Block
-        {
+        if operation_failed && writes_started && caller_transaction && !partial_allowed {
             self.connection
                 .poison_ingest(&operation_target, stats.target_copy_count);
             stats.poisoned = true;
@@ -7726,7 +7759,7 @@ fn apply_transaction_rollback(connection: &SharedConnection, effects: Transactio
             .store(false, Ordering::Release);
     }
     if effects.rollback {
-        connection.clear_ingest_poison();
+        connection.clear_transaction_poison();
     }
 }
 
@@ -7922,6 +7955,7 @@ fn begin_atomic(
     connection: &monetdb::Connection,
     purpose: &str,
     caller_scope: CallerTransactionScope,
+    prior_writes: bool,
     transaction_scoped_temporary_exists: Option<bool>,
     timeouts: Timeouts,
 ) -> Result<(monetdb::Cursor, AtomicScope)> {
@@ -7939,7 +7973,7 @@ fn begin_atomic(
     }
     let mut cursor = connection.cursor();
     cursor.set_timeouts(timeouts);
-    if matches!(caller_scope, CallerTransactionScope::Direct) {
+    if prior_writes || matches!(caller_scope, CallerTransactionScope::Direct) {
         return Ok((cursor, AtomicScope::CallerTransaction));
     }
     let retain_until_transaction_end = match transaction_scoped_temporary_exists {
@@ -8235,6 +8269,7 @@ fn execute_updates_atomic(
     connection: &SharedConnection,
     queries: &mut BoundQueryStream,
     timeouts: Timeouts,
+    prior_writes: bool,
 ) -> Result<Option<i64>> {
     let Some(first) = queries.next().transpose()? else {
         return Ok(Some(0));
@@ -8242,7 +8277,7 @@ fn execute_updates_atomic(
     if queries.is_empty()? {
         return execute_single_bound_update(connection, &first, timeouts);
     }
-    execute_updates_atomic_from_first(connection, queries, first, timeouts, true)
+    execute_updates_atomic_from_first(connection, queries, first, timeouts, true, prior_writes)
 }
 
 fn execute_single_bound_update(
@@ -8271,6 +8306,7 @@ fn execute_updates_atomic_from_first(
     first: BoundQuery,
     timeouts: Timeouts,
     allow_retry: bool,
+    prior_writes: bool,
 ) -> Result<Option<i64>> {
     let first = current_bound_query(connection, &first, timeouts)?;
     let connection_guard = lock_connection(connection)?;
@@ -8278,15 +8314,25 @@ fn execute_updates_atomic_from_first(
         &connection_guard,
         "parameter_batch",
         CallerTransactionScope::Savepoint,
+        prior_writes,
         None,
         timeouts,
     )?;
+    let caller_transaction = matches!(&atomic_scope, AtomicScope::CallerTransaction);
     if let Err(root) =
         with_bound_query_diagnostic(cursor.execute(&first.sql).map_err(map_cursor_error), &first)
     {
-        let retryable =
-            allow_retry && first.prepared.is_some() && prepared_statement_missing(&root);
+        let retryable = allow_retry
+            && !caller_transaction
+            && first.prepared.is_some()
+            && prepared_statement_missing(&root);
         let root_message = root.message.clone();
+        if caller_transaction {
+            connection.poison_transaction(
+                "parameter batch failed in a caller transaction that may contain partial writes"
+                    .into(),
+            );
+        }
         let result = finish_atomic(
             &connection_guard,
             &mut cursor,
@@ -8299,7 +8345,14 @@ fn execute_updates_atomic_from_first(
         return match result {
             Err(value) if retryable && value.message == root_message => {
                 let retry = retry_bound_query(connection, &first, timeouts)?;
-                execute_updates_atomic_from_first(connection, queries, retry, timeouts, false)
+                execute_updates_atomic_from_first(
+                    connection,
+                    queries,
+                    retry,
+                    timeouts,
+                    false,
+                    prior_writes,
+                )
             }
             result => result,
         };
@@ -8335,6 +8388,11 @@ fn execute_updates_atomic_from_first(
         }
         Ok(has_count.then_some(total))
     })();
+    if result.is_err() && caller_transaction {
+        connection.poison_transaction(
+            "parameter batch failed in a caller transaction that may contain partial writes".into(),
+        );
+    }
     finish_atomic(
         &connection_guard,
         &mut cursor,
