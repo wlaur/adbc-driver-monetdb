@@ -114,7 +114,7 @@ def test_raw_transaction_sql_obeys_and_clears_ingest_poison(monetdb_uri: str) ->
 
 
 @pytest.mark.integration
-def test_savepoint_atomicity_preserves_prior_caller_work(monetdb_uri: str) -> None:
+def test_savepoint_atomicity_rejects_prior_writes_before_ingesting(monetdb_uri: str) -> None:
     with dbapi.connect(monetdb_uri, autocommit=True) as setup:
         setup.execute("DROP TABLE IF EXISTS ingest_savepoint_append")
         setup.execute("CREATE TABLE ingest_savepoint_append(value INT)")
@@ -127,7 +127,7 @@ def test_savepoint_atomicity_preserves_prior_caller_work(monetdb_uri: str) -> No
         }
         with dbapi.connect(monetdb_uri) as connection, connection.cursor(adbc_stmt_kwargs=options) as cursor:
             cursor.execute("INSERT INTO ingest_savepoint_append VALUES (1)")
-            with pytest.raises(Exception, match="intentional upstream failure"):
+            with pytest.raises(adbc_driver_manager.ProgrammingError, match="transaction without prior writes"):
                 cursor.adbc_ingest(
                     "ingest_savepoint_append",
                     _reader_that_fails_after(batch),
@@ -293,7 +293,7 @@ def test_repeated_wide_appends_have_bounded_transaction_storage(monetdb_uri: str
 
 
 @pytest.mark.integration
-def test_staged_single_copy_constraint_error_preserves_the_caller_transaction(
+def test_staged_single_copy_constraint_error_requires_caller_rollback(
     monetdb_uri: str,
 ) -> None:
     with dbapi.connect(monetdb_uri, autocommit=True) as setup:
@@ -314,14 +314,16 @@ def test_staged_single_copy_constraint_error_preserves_the_caller_transaction(
                 cursor.adbc_ingest("ingest_constraint_error", duplicate, mode="append")
             assert caught.value.status_code == adbc_driver_manager.AdbcStatusCode.INTEGRITY
             assert caught.value.sqlstate == "40002"
-            cursor.execute("SELECT value FROM ingest_constraint_error ORDER BY value")
-            assert cursor.fetchall() == [(1,), (2,)]
             stats = json.loads(cursor.adbc_statement.get_option(str(StatementOptions.INGEST_STATS)))
             assert stats["path"] == "staged_copy"
             assert stats["staging_copy_count"] == 1
             assert stats["target_copy_count"] == 0
             assert stats["final_move_count"] == 0
-            assert stats["poisoned"] is False
+            assert stats["poisoned"] is True
+            with pytest.raises(adbc_driver_manager.ProgrammingError, match="ROLLBACK is required"):
+                connection.commit()
+            connection.rollback()
+            assert cursor.execute("SELECT value FROM ingest_constraint_error ORDER BY value").fetchall() == [(1,)]
             cursor.execute("INSERT INTO ingest_constraint_error VALUES (4)")
             cursor.execute("CREATE TABLE ingest_after_constraint_error(value INT)")
             cursor.execute("DROP TABLE ingest_after_constraint_error")
@@ -330,7 +332,6 @@ def test_staged_single_copy_constraint_error_preserves_the_caller_transaction(
         with dbapi.connect(monetdb_uri, autocommit=True) as audit:
             assert audit.execute("SELECT value FROM ingest_constraint_error ORDER BY value").fetchall() == [
                 (1,),
-                (2,),
                 (4,),
             ]
     finally:
@@ -360,7 +361,7 @@ def test_single_copy_append_server_error_rolls_back_internal_autocommit_transact
 
 
 @pytest.mark.integration
-def test_staged_multi_batch_constraint_error_preserves_the_caller_transaction(
+def test_staged_multi_batch_constraint_error_requires_caller_rollback(
     monetdb_uri: str,
 ) -> None:
     with dbapi.connect(monetdb_uri, autocommit=True) as setup:
@@ -379,16 +380,15 @@ def test_staged_multi_batch_constraint_error_preserves_the_caller_transaction(
                 cursor.adbc_ingest("ingest_stream_error", reader, mode="append")
             assert caught.value.status_code == adbc_driver_manager.AdbcStatusCode.INTEGRITY
             assert caught.value.sqlstate == "40002"
-            cursor.execute("SELECT value FROM ingest_stream_error")
-            assert cursor.fetchall() == [(1,)]
+            with pytest.raises(adbc_driver_manager.ProgrammingError, match="ROLLBACK is required"):
+                connection.commit()
+            connection.rollback()
+            assert cursor.execute("SELECT value FROM ingest_stream_error").fetchall() == []
             cursor.execute("INSERT INTO ingest_stream_error VALUES (4)")
             connection.commit()
 
         with dbapi.connect(monetdb_uri, autocommit=True) as audit:
-            assert audit.execute("SELECT value FROM ingest_stream_error ORDER BY value").fetchall() == [
-                (1,),
-                (4,),
-            ]
+            assert audit.execute("SELECT value FROM ingest_stream_error ORDER BY value").fetchall() == [(4,)]
     finally:
         with dbapi.connect(monetdb_uri, autocommit=True) as cleanup:
             cleanup.execute("DROP TABLE IF EXISTS ingest_stream_error")

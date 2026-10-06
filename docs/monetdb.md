@@ -172,17 +172,20 @@ for a measured server/workload exception or a diagnostic comparison. Ingest stat
 
 Staging holds incoming rows separately until the final move, so server memory and disk peaks can
 grow with the append. `constrained_append=direct` removes that duplication but may be substantially
-slower because constraints are maintained for every COPY window. Create and replace ingests inside
-a caller-managed transaction also retain an operation savepoint; use an independent autocommit
-load when preserving unrelated work in the same transaction is unnecessary.
+slower because constraints are maintained for every COPY window.
 
-In a caller-managed transaction, a client-side failure after completed direct target COPY windows
-makes commit fail until rollback, including through raw transaction SQL, so a partial append is
-not accidentally committed. Staged constrained appends change the target only in the final move;
-producer or constraint failure rolls back to the ingest savepoint and preserves earlier caller
-work. Advanced callers may set
-`adbc.monetdb.ingest_atomicity=savepoint` to roll back only the ingest, or
-`adbc.monetdb.ingest_partial=allow` to permit a partial commit. Statement option
+Operation savepoints are used only before a caller transaction has written data. MonetDB 11.55.7
+can restore older row versions when later DML executes inside an internal savepoint, losing earlier
+updates or exposing deleted primary keys. Later ingests and bound batches execute directly in the
+caller's transaction. A failure after writes are attempted makes the transaction rollback-only:
+commit through the connection API, enabling autocommit, and raw SQL all fail until rollback.
+Client failures may leave partial rows visible to reads; server errors may abort the transaction.
+Preflight validation before writes leaves prior caller work committable. Autocommit operation
+failures are rolled back internally, and clean caller-transaction savepoints recover the operation.
+`adbc.monetdb.ingest_atomicity=savepoint` rejects a transaction with prior writes before changing
+anything. `adbc.monetdb.ingest_partial=allow` permits explicit partial commits only for direct COPY
+appends after a client-side failure; prepared INSERT, staged append, create, and replace remain
+protected. Statement option
 `adbc.monetdb.ingest_stats` returns post-execution JSON including the chosen path, measured round
 trip, effective thresholds, physical stored, staging, retained-Arrow pinned, scratch, and overlap
 high-water bytes, per-window storage and wire modes, prepared-cache hits, and

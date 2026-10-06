@@ -51,8 +51,12 @@ def test_ingest_routes_single_small_batch_by_rows_and_bytes(monetdb_uri: str) ->
         assert cursor.adbc_ingest("ingest_route", hundred, mode="append") == 100
         assert _stats(cursor)["path"] == "insert"
 
-        hundred_one = pa.record_batch({"value": pa.array(range(100, 201), type=pa.int32())})
-        assert cursor.adbc_ingest("ingest_route", hundred_one, mode="append") == 101
+        effective_insert_rows = _stats(cursor)["insert_rows_threshold"]
+        assert isinstance(effective_insert_rows, int)
+        beyond_insert_limit = pa.record_batch(
+            {"value": pa.array(range(100, 101 + effective_insert_rows), type=pa.int32())}
+        )
+        assert cursor.adbc_ingest("ingest_route", beyond_insert_limit, mode="append") == effective_insert_rows + 1
         assert _stats(cursor)["path"] == "copy"
 
         large = pa.record_batch({"value": pa.array(["x" * (9 * 1024 * 1024)])})
