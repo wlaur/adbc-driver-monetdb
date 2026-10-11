@@ -315,7 +315,10 @@ def test_statement_write_timeout_bounds_stalled_copy_upload() -> None:
     [
         ({"endian": "BIG"}, "only little-endian"),
         ({"advertise_binary": False}, "does not advertise BINARY=1"),
-        ({"version": "11.55.8"}, "11.55.8 is unsupported"),
+        (
+            {"version": "11.55.8"},
+            r"MonetDB 11\.55\.8 is unsupported; Dec2025-SP4 \(11\.55\.9\) or newer is required",
+        ),
     ],
 )
 def test_connect_rejects_unsupported_server_capabilities(

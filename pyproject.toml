@@ -37,7 +37,7 @@ dev = [
     "ruff",
     "pytest>=9",
     "pyright",
-    "polars>=1.43.1",
+    "polars>=2.0",
     "pymonetdb>=1.9",
     "pyarrow>=25.0.0",
     "adbc-drivers-validation",

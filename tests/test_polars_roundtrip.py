@@ -1970,7 +1970,7 @@ def test_extension_parameters_and_hugeint_timetz_append_back(monetdb_uri: str) -
 
 
 @pytest.mark.integration
-def test_polars_future_unknown_extension_behavior(monetdb_uri: str) -> None:
+def test_polars_default_extension_behavior(monetdb_uri: str) -> None:
     code = textwrap.dedent(
         """
         import os
@@ -1979,45 +1979,54 @@ def test_polars_future_unknown_extension_behavior(monetdb_uri: str) -> None:
 
         with dbapi.connect(os.environ["MONETDB_TEST_URI"], autocommit=True) as connection:
             with connection.cursor() as cursor:
-                cursor.execute("DROP TABLE IF EXISTS polars_future_extension_source")
-                cursor.execute("DROP TABLE IF EXISTS polars_future_extension_target")
+                cursor.execute("DROP TABLE IF EXISTS polars_extension_source")
+                cursor.execute("DROP TABLE IF EXISTS polars_extension_target")
                 cursor.execute(
-                    "CREATE TABLE polars_future_extension_source(h HUGEINT, t TIME WITH TIME ZONE)"
+                    "CREATE TABLE polars_extension_source(h HUGEINT, t TIME WITH TIME ZONE, j JSON)"
                 )
                 cursor.execute(
-                    "CREATE TABLE polars_future_extension_target(h HUGEINT, t TIME WITH TIME ZONE)"
+                    "CREATE TABLE polars_extension_target(h HUGEINT, t TIME WITH TIME ZONE, j JSON)"
                 )
                 cursor.execute(
-                    "INSERT INTO polars_future_extension_source "
-                    "VALUES (123456789012345678901234567890, TIMETZ '12:34:56.123456+00:00')"
+                    "INSERT INTO polars_extension_source "
+                    "VALUES (123456789012345678901234567890, TIMETZ '12:34:56.123456+00:00', CAST(? AS JSON))",
+                    ('{"id":1,"label":"one"}',),
                 )
             try:
                 frame = pl.read_database(
-                    "SELECT h, t FROM polars_future_extension_source", connection
+                    "SELECT h, t, j FROM polars_extension_source", connection
                 )
                 assert "monetdb.hugeint" in str(frame.schema["h"])
                 assert "monetdb.timetz" in str(frame.schema["t"])
+                assert frame.schema["j"] == pl.Extension("arrow.json", pl.String)
+                decoded = frame.select(
+                    pl.col("j").ext.storage().str.json_decode(
+                        dtype=pl.Struct({"id": pl.Int64, "label": pl.String}),
+                    )
+                )
+                assert decoded.to_dicts() == [{"j": {"id": 1, "label": "one"}}]
                 assert frame.write_database(
-                    "polars_future_extension_target",
+                    "polars_extension_target",
                     connection,
                     if_table_exists="append",
                     engine="adbc",
                 ) == 1
                 back = pl.read_database(
-                    "SELECT CAST(h AS STRING) AS h FROM polars_future_extension_target",
+                    "SELECT CAST(h AS STRING) AS h, j FROM polars_extension_target",
                     connection,
                 )
                 assert back.get_column("h").to_list() == ["123456789012345678901234567890"]
+                assert back.select(pl.col("j").ext.storage()).to_series().to_list() == ['{"id":1,"label":"one"}']
             finally:
                 with connection.cursor() as cursor:
-                    cursor.execute("DROP TABLE IF EXISTS polars_future_extension_target")
-                    cursor.execute("DROP TABLE IF EXISTS polars_future_extension_source")
-        print("future extension behavior passed")
+                    cursor.execute("DROP TABLE IF EXISTS polars_extension_target")
+                    cursor.execute("DROP TABLE IF EXISTS polars_extension_source")
+        print("default extension behavior passed")
         """
     )
     environment = os.environ.copy()
     environment["MONETDB_TEST_URI"] = monetdb_uri
-    environment["POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR"] = "load_as_extension"
+    environment.pop("POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR", None)
     completed = subprocess.run(
         [sys.executable, "-c", code],
         check=True,
@@ -2026,7 +2035,7 @@ def test_polars_future_unknown_extension_behavior(monetdb_uri: str) -> None:
         timeout=30,
         env=environment,
     )
-    assert "future extension behavior passed" in completed.stdout
+    assert "default extension behavior passed" in completed.stdout
 
 
 @pytest.mark.integration

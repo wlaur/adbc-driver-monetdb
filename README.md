@@ -665,7 +665,7 @@ or argument error.
 
 The reusable ADBC validation suite currently passes against Dec2025-SP4. Its skips cover
 explicitly waived cross-catalog/statistics behavior and negative-scale decimals that MonetDB
-itself does not support. Polars' announced future unknown-extension behavior is exercised in CI;
+itself does not support. Polars 2.0's default extension-type behavior is exercised in CI;
 HUGEINT and TIMETZ remain round-trippable when loaded as extension types. The
 `monetdb.hugeint` extension uses Arrow `Decimal128(38, 0)`, so its supported domain is
 −(10^38−1) through 10^38−1; wider values in MonetDB's signed 128-bit domain return a bounded
@@ -677,14 +677,16 @@ MonetDB `JSON` query results use Arrow's canonical
 means the Arrow field carries extension metadata identifying JSON while each value remains
 physical UTF-8 text; it does not mean the driver has converted the column to an Arrow `Struct`.
 Arrow-aware consumers can preserve that JSON identity, while consumers that do not interpret the
-extension can use its string storage. Polars 1.x exposes that storage as `pl.String` and may warn
-about the unknown extension unless its extension policy is configured. Keeping string storage is
+extension can use its string storage. Polars 2.0 preserves JSON as `pl.Extension("arrow.json", pl.String)`;
+use `.ext.storage()` to access the text for string operations. Keeping string storage is
 necessary because one MonetDB JSON column can contain objects, arrays, scalars, and JSON `null`
 with different shapes. Applications that know an object schema can opt in:
 
 ```python
 decoded = df.with_columns(
-    pl.col("payload").str.json_decode(
+    pl.col("payload")
+    .ext.storage()
+    .str.json_decode(
         dtype=pl.Struct({"id": pl.Int64, "label": pl.String}),
     )
 )

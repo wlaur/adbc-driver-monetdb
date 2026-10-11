@@ -406,7 +406,7 @@ jobs:
         run: |
           wheel=$(find "$GITHUB_WORKSPACE/wheelhouse" -maxdepth 1 -name 'adbc_driver_monetdb-*.whl' -print -quit)
           uv run --isolated --no-project --python '${{ matrix.python }}' \
-            --with "$wheel" --with 'pytest>=9' --with 'polars>=1.42' --with 'pandas>=3.0' \
+            --with "$wheel" --with 'pytest>=9' --with 'polars>=2.0' --with 'pandas>=3.0' \
             --with pymonetdb --with 'pyarrow>=25' --with 'sqlalchemy>=2.0' --with cryptography \
             python -m pytest "$GITHUB_WORKSPACE/tests" -m 'not integration and not local_only' \
               --ignore "$GITHUB_WORKSPACE/tests/validation" -q
@@ -502,7 +502,7 @@ jobs:
           test -n "$MONETDB_TEST_URI"
           wheel=$(find "$GITHUB_WORKSPACE/wheelhouse" -maxdepth 1 -name 'adbc_driver_monetdb-*.whl' -print -quit)
           uv run --isolated --no-project --python 3.13 \
-            --with "$wheel" --with 'pytest>=9' --with 'polars>=1.42' --with 'pandas>=3.0' \
+            --with "$wheel" --with 'pytest>=9' --with 'polars>=2.0' --with 'pandas>=3.0' \
             --with pymonetdb --with 'pyarrow>=25' --with 'sqlalchemy>=2.0' --with cryptography \
             python -m pytest "$GITHUB_WORKSPACE/tests" -m 'integration and not local_only' \
               --ignore "$GITHUB_WORKSPACE/tests/validation" -q
@@ -639,7 +639,7 @@ jobs:
           test -n "$MONETDB_TEST_URI"
           wheel=$(find "$GITHUB_WORKSPACE/wheelhouse" -maxdepth 1 -name 'adbc_driver_monetdb-*.whl' -print -quit)
           uv run --isolated --no-project --python 3.13 \
-            --with "$wheel" --with 'pytest>=9' --with 'polars>=1.42' --with 'pandas>=3.0' \
+            --with "$wheel" --with 'pytest>=9' --with 'polars>=2.0' --with 'pandas>=3.0' \
             --with pymonetdb --with 'pyarrow>=25' --with 'sqlalchemy>=2.0' --with cryptography \
             python -m pytest "$GITHUB_WORKSPACE/tests" -m 'integration and not local_only' \
               --ignore "$GITHUB_WORKSPACE/tests/validation" -q
