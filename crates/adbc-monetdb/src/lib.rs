@@ -2,7 +2,7 @@
 //!
 //! The driver speaks MAPI (via the forked `monetdb` submodule) and converts
 //! between MonetDB's binary wire formats and Arrow via `monetdb-arrow`.
-//! Supported servers: MonetDB Dec2025 (11.55) and newer, little-endian only.
+//! Supported servers: MonetDB Dec2025-SP4 (11.55.9) and newer, little-endian only.
 
 mod driver;
 

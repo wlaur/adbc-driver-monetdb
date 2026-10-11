@@ -16,17 +16,13 @@ RUN apt-get update \
         ca-certificates \
         cmake \
         curl \
-        libbrotli-dev \
         libbz2-dev \
         libgeos-dev \
         liblz4-dev \
         liblzma-dev \
         libpcre2-dev \
         libproj-dev \
-        libsnappy-dev \
         libssl-dev \
-        libxxhash-dev \
-        libzstd-dev \
         pkg-config \
         python3 \
         zlib1g-dev \
@@ -39,11 +35,6 @@ RUN mkdir source \
         --directory source --strip-components=1 \
     && rm MonetDB-src.tar.gz
 
-WORKDIR /tmp/monetdb/source
-ARG APPLY_PATCH=1
-COPY apply-patch.py /tmp/apply-patch.py
-RUN if [ "$APPLY_PATCH" = "1" ]; then python3 /tmp/apply-patch.py; else echo "apply-patch.py skipped (APPLY_PATCH=$APPLY_PATCH)"; fi
-
 WORKDIR /tmp/monetdb/source/build
 RUN cmake .. \
         -DASSERT=OFF \
@@ -54,9 +45,6 @@ RUN cmake .. \
         -DRINTEGRATION=OFF \
         -DSTRICT=OFF \
         -DWITH_OPENSSL=ON \
-        -DWITH_SNAPPY=ON \
-        -DWITH_ZSTD=ON \
-        -DWITH_BROTLI=ON \
     && cmake --build . --parallel "${BUILD_THREADS}" \
     && cmake --install .
 
@@ -70,17 +58,13 @@ RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
         bash \
         ca-certificates \
-        libbrotli1 \
         libbz2-1.0 \
         libgeos-c1t64 \
         liblz4-1 \
         liblzma5 \
         libpcre2-8-0 \
         libproj25 \
-        libsnappy1v5 \
         libssl3t64 \
-        libxxhash0 \
-        libzstd1 \
         zlib1g \
     && rm -rf /var/lib/apt/lists/*
 
@@ -93,8 +77,8 @@ RUN groupadd --gid 5000 monetdb \
     && chown --recursive monetdb:monetdb /var/monetdb5 \
     && find /usr/bin /usr/sbin -xdev -type f -perm /6000 -exec chmod a-s {} +
 
-LABEL org.opencontainers.image.title="Unofficial MonetDB container (master build)" \
-      org.opencontainers.image.description="Native Linux ARM64 build of MonetDB master (pp_hashjoin pipeline merge)" \
+LABEL org.opencontainers.image.title="Unofficial MonetDB container (source build)" \
+      org.opencontainers.image.description="Native Linux ARM64 build of MonetDB" \
       org.opencontainers.image.licenses="MPL-2.0" \
       org.opencontainers.image.vendor="wlaur (unofficial build)"
 

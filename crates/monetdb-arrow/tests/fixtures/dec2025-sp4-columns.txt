@@ -1,6 +1,6 @@
-# Captured from monetdb/monetdb:Dec2025-SP3 on a little-endian server.
+# Captured from wlaur/monetdb-container:11.55.9-1 (Dec2025-SP4), little-endian.
 # Each buffer contains one non-NULL value followed by the type's NULL sentinel.
-# name|MAPI type|precision|scale|COPY BINARY column bytes (hex)
+# name|MAPI type|precision|scale|Xexportbin column bytes (hex)
 bool_v|boolean|0|0|0180
 i8_v|tinyint|0|0|0780
 i16_v|smallint|0|0|2c010080

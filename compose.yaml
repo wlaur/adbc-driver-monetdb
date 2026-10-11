@@ -1,7 +1,7 @@
 services:
   monetdb:
-    # Native ARM64 Dec2025-SP3 image recipe: https://github.com/wlaur/monetdb-container
-    image: wlaur/monetdb-container:11.55.7-2@sha256:22dd41bd10fd7136ca1ef6afaec5cf0c1670f16a84b80785a5fee12aac480eb4
+    # Native ARM64 Dec2025-SP4 image recipe: https://github.com/wlaur/monetdb-container
+    image: wlaur/monetdb-container:11.55.9-1@sha256:b7238498164cd26a0b7bd9391d51948dca5c69f490f888186d3204320abaecf7
     platform: linux/arm64
     ports:
       - "50000:50000"
@@ -12,7 +12,7 @@ services:
       - /var/monetdb5/dbfarm:rw,size=${MONETDB_DISK_LIMIT:-4g},mode=0777
 
   monetdb-remote:
-    image: wlaur/monetdb-container:11.55.7-2@sha256:22dd41bd10fd7136ca1ef6afaec5cf0c1670f16a84b80785a5fee12aac480eb4
+    image: wlaur/monetdb-container:11.55.9-1@sha256:b7238498164cd26a0b7bd9391d51948dca5c69f490f888186d3204320abaecf7
     platform: linux/arm64
     ports:
       - "50002:50000"

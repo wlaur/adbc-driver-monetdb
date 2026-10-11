@@ -1776,7 +1776,7 @@ mod tests {
     use super::*;
 
     fn golden_columns() -> Vec<Vec<u8>> {
-        include_str!("../tests/fixtures/dec2025-sp3-columns.txt")
+        include_str!("../tests/fixtures/dec2025-sp4-columns.txt")
             .lines()
             .filter(|line| !line.starts_with('#'))
             .map(|line| {

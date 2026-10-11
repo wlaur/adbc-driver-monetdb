@@ -21,7 +21,7 @@ uv sync --locked
 docker compose up -d
 ```
 
-The Compose service pins the native ARM64 Dec2025-SP3 image built from the public
+The Compose service pins the native ARM64 Dec2025-SP4 image built from the public
 [`wlaur/monetdb-container`](https://github.com/wlaur/monetdb-container) recipe.
 Set `MONETDB_TEST_URI=monetdb://monetdb:monetdb@localhost:50000/test` for integration tests.
 Protocol-generic MAPI changes belong in the `monetdb-rust` submodule; Arrow- or ADBC-specific

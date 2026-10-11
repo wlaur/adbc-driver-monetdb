@@ -1,6 +1,6 @@
 # Wrong `avg()` over a `ROWS` window frame wider than 16
 
-**Status:** reproduces on `master` at `ee305e491c` (56.0.0) and on 11.55.7 (Dec2025-SP3).
+**Status:** reproduces on Dec2025-SP4 (11.55.9), verified 2026-10-11 on native ARM64.
 
 ## Summary
 
@@ -21,7 +21,7 @@ Self-contained, integers 1..41, so every expected average is checkable by hand:
 
 ```sql
 CREATE TABLE mdb_window_repro (i INTEGER, v DOUBLE);
-INSERT INTO mdb_window_repro SELECT value, cast(value as double) FROM sys.generate_series(1, 41);
+INSERT INTO mdb_window_repro SELECT value, cast(value as double) FROM sys.generate_series(1, 42);
 
 SELECT i, v,
        avg(v) OVER (ORDER BY i ROWS BETWEEN 16 PRECEDING AND CURRENT ROW) AS ra
@@ -38,7 +38,7 @@ At `i = 17` the frame is rows 1..17, so the average must be `(1+17)/2 = 9.0`:
 | **17** | **12.75** | **9.00** |
 | 18 | 10.00 | 10.00 |
 
-Verbatim output on `master` at `ee305e491c`:
+Output on Dec2025-SP4:
 
 ```
 15,8
@@ -55,7 +55,7 @@ Same table, varying only the frame:
 | --- | --- | --- |
 | `15 PRECEDING` (max 16 rows) | 0 | — |
 | `16 PRECEDING` (max 17 rows) | 3 | i=17, got 12.75, want 9.00 |
-| `59 PRECEDING` (max 60 rows) | 23 | i=17, got 12.75, want 9.00 |
+| `59 PRECEDING` (max 60 rows) | 24 | i=17, got 12.75, want 9.00 |
 
 Casting the column, ordering in a subquery, and omitting `ORDER BY` inside the window all
 make no difference. It is not a float-precision effect: the errors are far larger than any

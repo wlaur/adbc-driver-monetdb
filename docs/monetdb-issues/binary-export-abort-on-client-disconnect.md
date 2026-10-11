@@ -1,75 +1,57 @@
-# Server aborts when a client disconnects during binary result export
+# Server aborts when a client resets a connection during binary result export
 
-**Status:** observed on 11.55.7 (Dec2025-SP3). **Not reproduced** in the 2026-09-22 pass
-against `master` at `ee305e491c`, but the same pass also failed to reproduce it on 11.55.7,
-so the negative result is inconclusive. The offending free is unchanged in the source at
-`ee305e491c`.
-
-## Environment where it was first seen
-
-- MonetDB 11.55.7 (Dec2025-SP3), official `monetdb/monetdb:Dec2025-SP3` container
-- Fresh database, 4 GiB available to the container, no memory pressure
+**Status:** reproduces on Dec2025-SP4 (11.55.9), verified 2026-10-11 on native ARM64.
+Twenty consecutive binary-export resets produced `free(): invalid pointer` and `SIGABRT`.
 
 ## Reproduction
 
-Start MonetDB with a published port:
+Start a disposable server with a published port and a memory limit:
 
 ```sh
-docker run --rm --name monetdb-export-repro \
-  -p 50000:50000 --memory 4g \
-  monetdb/monetdb:Dec2025-SP3
+docker run -d --name monetdb-export-repro -p 50004:50000 \
+  --memory=4g --memory-swap=4g \
+  -e MDB_DB_ADMIN_PASS=monetdb -e MDB_CREATE_DBS=probes \
+  wlaur/monetdb-container:11.55.9-1
 ```
 
-Create a result large enough that it is still being transferred when the client is stopped,
-and kill the client mid-transfer. Repeat; the timing depends on the machine:
+Once the database is ready:
 
 ```sh
-for attempt in $(seq 1 20); do
-  mclient -h localhost -p 50000 -d demo -u monetdb \
-    -s "SELECT value, value * 2, value * 3 FROM generate_series(1, 20000001) AS g(value)" \
-    >/dev/null &
-  client_pid=$!
-  sleep 0.2
-  kill -KILL "$client_pid" 2>/dev/null || true
-  wait "$client_pid" 2>/dev/null || true
-done
+uv run docs/monetdb-issues/repro/binary-export-disconnect.py \
+  'monetdb://monetdb:monetdb@localhost:50004/probes?replysize=1'
+docker exec monetdb-export-repro sh -c \
+  "grep -E 'invalid pointer|SIGABRT|has crashed' /var/monetdb5/dbfarm/merovingian.log"
+docker rm -fv monetdb-export-repro
 ```
 
-The important condition is that the connection is closed while MonetDB is writing a binary
-result chunk. A client using binary result transfer negotiates that mode on the connection;
-no table or pre-existing data is required.
+The script uses pymonetdb's MAPI connection directly, without ADBC. It requests
+`Xexportbin` for a 20-million-row generated result, waits until it receives the
+binary `&6` header and initial column data, then closes the TCP socket with
+`SO_LINGER` set to zero, sending a reset. No tables or external data are needed.
 
 ## Observed result
 
-The database process aborts. Its log contains:
+The database subprocess aborts:
 
 ```text
-MALException:sql.export_bin_column:42000!no error
-mvc_export_bin_chunk: ERROR: MALException:sql.export_bin_column:42000!no error
 free(): invalid pointer
-database 'demo' has crashed with signal SIGABRT (dumped core)
+database 'probes' was killed by signal SIGABRT
 ```
 
-Other connections to the same database are dropped while it restarts.
+Other connections to that database are lost while the farm restarts it. A surviving
+container does not mean the database subprocess survived.
 
 ## Expected result
 
-Closing a client connection during result transfer should cancel that transfer and clean up
-the result. It should not abort the database process or affect other clients.
+A client disconnect should cancel the transfer and clean up its result without
+terminating the database or other sessions.
 
 ## Source
 
-The abort follows a write failure in the binary export path. `mvc_export_bin_chunk()`
-receives an error from `dump_binary_column()` and frees the returned message with
-`GDKfree()`. The message is created through the query context's error allocator, so freeing
-it directly appears to be the invalid free. The unhelpful `42000!no error` text also suggests
-that the outer byte-counting stream is not retaining the error from the wrapped stream when
-the write fails.
-
-At `ee305e491c` this is `sql/backends/monet5/sql_result.c`, around line 2043, unchanged:
+[`mvc_export_bin_chunk()` in SP4's `sql_result.c`](https://github.com/MonetDB/MonetDB/blob/Dec2025_SP4_release/sql/backends/monet5/sql_result.c#L2024-L2030)
+handles a failed `dump_binary_column()` with:
 
 ```c
-str msg = dump_binary_column(info->type_rec, info->bat, offset, end_row - offset, false, countstream);
 if (msg != MAL_SUCCEED) {
         GDKerror("%s", msg);
         GDKfree(msg);
@@ -78,18 +60,6 @@ if (msg != MAL_SUCCEED) {
 }
 ```
 
-## What the 2026-09-22 re-verification did, and why it is inconclusive
-
-Thirty `kill -KILL` attempts at disconnect delays of 0.05 s to 1.5 s, run both from inside
-the container and from the host against a published port, against `master` at `ee305e491c`.
-No abort, no `SIGABRT`, nothing in `merovingian.log`.
-
-The same harness, run as a control against `wlaur/monetdb-container:11.55.7-2` — the release
-line where the abort was originally observed — also produced no abort. So the harness does
-not reproduce the original conditions, and it cannot distinguish "fixed upstream" from
-"not triggered".
-
-Settling this needs the trigger identified rather than approximated: `dump_binary_column()`
-must actually return an error, which means the write to the wrapped stream must fail at the
-right moment. A client that forces an RST rather than a clean FIN, or a proxy that drops the
-connection mid-chunk, is a more promising harness than killing `mclient`.
+The error message comes from the query context's error allocator. Freeing it
+directly with `GDKfree()` appears to cause the invalid free. This is a source-level
+explanation consistent with the reproduced abort; a server patch has not been tested.

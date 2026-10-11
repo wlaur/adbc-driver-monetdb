@@ -59,7 +59,7 @@ class _BlackHoleServer:
         behavior: Literal["blackhole", "slow_drip", "write_stall", "connect_only"] = "blackhole",
         endian: Literal["LIT", "BIG"] = "LIT",
         advertise_binary: bool = True,
-        version: str = "11.55.3",
+        version: str = "11.55.9",
     ) -> None:
         self._initialize = initialize
         self._behavior = behavior
@@ -118,7 +118,7 @@ class _BlackHoleServer:
                     stream,
                     _text_result(1, ("name", "value"), ("monet_version", self._version)),
                 )
-                if tuple(map(int, self._version.split("."))) < (11, 55, 0):
+                if tuple(map(int, self._version.split("."))) < (11, 55, 9):
                     while stream.recv(1):
                         pass
                     return
@@ -201,7 +201,7 @@ class _FailureServer:
                 assert b"sys.environment" in _read_message(stream)
                 _write_message(
                     stream,
-                    _text_result(1, ("name", "value"), ("monet_version", "11.55.3")),
+                    _text_result(1, ("name", "value"), ("monet_version", "11.55.9")),
                 )
                 assert b"current_schema" in _read_message(stream)
                 _write_message(stream, _text_result(2, ("__adbc_current_schema",), ("sys",)))
@@ -315,7 +315,7 @@ def test_statement_write_timeout_bounds_stalled_copy_upload() -> None:
     [
         ({"endian": "BIG"}, "only little-endian"),
         ({"advertise_binary": False}, "does not advertise BINARY=1"),
-        ({"version": "11.54.99"}, "11.54.99 is unsupported"),
+        ({"version": "11.55.8"}, "11.55.8 is unsupported"),
     ],
 )
 def test_connect_rejects_unsupported_server_capabilities(

@@ -36,7 +36,7 @@ connection = dbapi.connect(
 )
 ```
 
-The driver supports MonetDB Dec2025 (11.55) and newer on little-endian servers. URI credentials
+The driver supports MonetDB Dec2025-SP4 (11.55.9) and newer on little-endian servers. URI credentials
 may be replaced or overridden with the standard `username` and `password` database options.
 
 ## Timeouts and cancellation
@@ -95,7 +95,7 @@ row-count position (`LIMIT`, `OFFSET`, `FETCH FIRST`/`NEXT`, `SAMPLE`, `SEED`) r
 integers because MonetDB's grammar rejects an expression there.
 
 In a modified caller transaction, the first execution of an unverified prepared plan uses typed
-literals to avoid a MonetDB 11.55.7 savepoint visibility defect. Explicit preparation still returns
+literals to avoid a MonetDB 11.55.9 savepoint visibility defect. Explicit preparation still returns
 parameter metadata, and verified plans retain their prepared path. Commit or full rollback allows
 deferred plans to be verified in the next transaction.
 
@@ -158,14 +158,11 @@ destination has columns that differ only by case. The stream may present its col
 and may supply a subset of them; a column it omits takes its `DEFAULT`, or `NULL` when it has none.
 Unknown, duplicated, and mistyped stream columns are rejected before any data is sent.
 
-COPY-sized appends to an existing constrained table use an unconstrained staging table. MonetDB
-11.55.7 and newer use a session-local table. Versions 11.55.0–11.55.6 use a uniquely named
-transactional `UNLOGGED` table in the target schema, and therefore require `CREATE TABLE` there,
-because those server releases can lose a local temporary-table definition after a prepared
-statement. Temporary-table targets remain direct on those older releases. Bounded windows write
-to staging, followed by one target `INSERT … SELECT`, so MonetDB validates a growing primary or
-unique key once instead of once per client window. Upgrade to 11.55.7 or select `direct` if schema
-creation is unavailable. Unconstrained targets and tiny prepared INSERTs remain direct. The default
+COPY-sized appends to an existing constrained table use an unconstrained session-local
+staging table. Bounded windows write to staging, followed by one target `INSERT … SELECT`,
+so MonetDB validates a growing primary or unique key once instead of once per client window.
+The staging table is dropped on success and removed by ingest transaction recovery on failure.
+Unconstrained targets and tiny prepared INSERTs remain direct. The default
 `adbc.monetdb.constrained_append=auto` is suitable for general workloads; set it to `direct` only
 for a measured server/workload exception or a diagnostic comparison. Ingest stats distinguish
 `staging_copy_count`, `target_copy_count`, and `final_move_count`.
@@ -174,7 +171,7 @@ Staging holds incoming rows separately until the final move, so server memory an
 grow with the append. `constrained_append=direct` removes that duplication but may be substantially
 slower because constraints are maintained for every COPY window.
 
-Operation savepoints are used only before a caller transaction has written data. MonetDB 11.55.7
+Operation savepoints are used only before a caller transaction has written data. MonetDB 11.55.9
 can restore older row versions when later DML executes inside an internal savepoint, losing earlier
 updates or exposing deleted primary keys. Later ingests and bound batches execute directly in the
 caller's transaction. A failure after writes are attempted makes the transaction rollback-only:

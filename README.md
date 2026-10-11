@@ -332,13 +332,9 @@ physical memory.
 COPY-sized appends to an existing table with a primary-key, unique, foreign-key, or check
 constraint use an unconstrained staging table. Bounded windows are copied into that table, then
 one `INSERT … SELECT` applies the complete stream to the real target and validates its constraints
-once. MonetDB 11.55.7 and newer use a session-local table. Versions 11.55.0–11.55.6 use a uniquely
-named transactional `UNLOGGED` table in the target schema because those releases can lose a local
-temporary-table definition after a prepared statement; that compatibility path requires
-`CREATE TABLE` in the target schema. The staging table is dropped on success and its ingest
-transaction recovery removes it on failure. Temporary-table targets on those older releases remain direct.
-Upgrade to 11.55.7 or set `adbc.monetdb.constrained_append=direct` when schema creation is not
-available. Unconstrained targets and the small prepared-INSERT route remain direct. Set
+once. Staging uses a session-local temporary table, dropped on success and removed by ingest
+transaction recovery on failure. Unconstrained targets and the small prepared-INSERT route
+remain direct. Set
 `adbc.monetdb.constrained_append=direct` only to diagnose server behavior or when independent
 measurements show that repeated target COPYs are preferable; `auto` is the general-purpose
 default. The option is accepted at database, connection, and statement scope and as
@@ -433,7 +429,7 @@ memory budget ([Polars issue #28569](https://github.com/pola-rs/polars/issues/28
 driver remains importable without either optional dependency.
 
 In a caller-managed transaction, an operation savepoint is safe only before the transaction has
-written data. MonetDB 11.55.7 can restore earlier committed row versions when a later write executes
+written data. MonetDB 11.55.9 can restore earlier committed row versions when a later write executes
 inside an internal savepoint. This can discard preceding updates or expose deleted primary keys;
 the same SQL reproduces through pymonetdb. The driver therefore executes later bound batches and
 ingests without an operation savepoint. Successful operations remain in the caller's transaction
@@ -488,7 +484,7 @@ the caller transaction and leaves the plan uncached for a later probe. In a call
 verification adds transaction-control round trips once per prepared SQL shape; later executions
 retain the ordinary prepared path. After a caller transaction modifies data, unverified plans use
 typed literals until commit or rollback; already verified plans retain their prepared path.
-This avoids a MonetDB 11.55.7 savepoint visibility defect that can expose deleted committed rows
+This avoids a MonetDB 11.55.9 savepoint visibility defect that can expose deleted committed rows
 during the verification read. Schema introspection still prepares the statement, and this deferred
 verification also applies to explicitly prepared statements. Statements beginning with `INSERT`, `UPDATE`, `DELETE`, `MERGE`,
 or `TRUNCATE` are exempt and keep their direct path: MonetDB refuses to compile them against a
@@ -626,7 +622,7 @@ df = pl.read_database(
 
 ## Support policy
 
-- MonetDB **Dec2025 (11.55) and newer**, little-endian servers only
+- MonetDB **Dec2025-SP4 (11.55.9) and newer**, little-endian servers only
 - Python **3.13+** (one abi3 wheel per platform), polars **1.42+**, pandas **3.0+**,
   adbc-driver-manager **1.11+**
 - Platforms: Linux x86_64 + aarch64 (manylinux), macOS arm64, Windows x86_64
@@ -664,7 +660,7 @@ or argument error.
 | Read-only `true` and isolation-level options | The server rejects read-only transactions (`42000!Readonly transactions not supported`), so there is no per-connection control to map; read-only `false` is accepted. Use a `SELECT`-only user instead (see Credentials) |
 | Setting the current catalog and cross-catalog ingest | A MAPI session is attached to one database; the current catalog remains readable |
 
-The reusable ADBC validation suite currently passes against Dec2025-SP3. Its skips cover
+The reusable ADBC validation suite currently passes against Dec2025-SP4. Its skips cover
 explicitly waived cross-catalog/statistics behavior and negative-scale decimals that MonetDB
 itself does not support. Polars' announced future unknown-extension behavior is exercised in CI;
 HUGEINT and TIMETZ remain round-trippable when loaded as extension types. The
@@ -789,7 +785,7 @@ uv run pytest -m "not integration and not local_only"  # python tests (no server
 cargo test --workspace                 # rust tests
 
 # integration tests against a real server:
-# compose.yaml pins the native ARM64 Dec2025-SP3 wlaur/monetdb-container image
+# compose.yaml pins the native ARM64 Dec2025-SP4 wlaur/monetdb-container image
 docker compose -f compose.yaml up -d
 MONETDB_TEST_URI=monetdb://monetdb:monetdb@localhost:50000/test \
     uv run pytest -m "integration and not local_only"
