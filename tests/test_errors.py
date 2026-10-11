@@ -161,3 +161,54 @@ def test_write_conflict_is_operational_and_recovers_after_rollback(monetdb_uri: 
                 )
         finally:
             admin.execute(f"DROP TABLE IF EXISTS {table}")
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("operation", ["column", "default"])
+def test_catalog_write_conflict_is_operational(monetdb_uri: str, operation: str) -> None:
+    table = f"adbc_ddl_conflict_{uuid4().hex}"
+    with dbapi.connect(monetdb_uri, autocommit=True) as admin:
+        admin.execute(f"CREATE TABLE {table}(id INT)")
+        try:
+            with dbapi.connect(monetdb_uri) as first, dbapi.connect(monetdb_uri) as second:
+                first.execute(f"SELECT * FROM {table}").fetchall()
+                second.execute(f"SELECT * FROM {table}").fetchall()
+                query = (
+                    f"ALTER TABLE {table} ADD COLUMN value INT"
+                    if operation == "column"
+                    else f"ALTER TABLE {table} ALTER COLUMN id SET DEFAULT 7"
+                )
+                first.execute(query)
+                with pytest.raises(adbc_driver_manager.OperationalError, match="conflict") as conflict:
+                    second.execute(query)
+                assert conflict.value.sqlstate == "42000"
+                assert ("adbc.monetdb.connection_terminal", b"true") not in conflict.value.details
+                second.rollback()
+                first.rollback()
+                second.execute(query)
+                second.commit()
+        finally:
+            admin.execute(f"DROP TABLE {table}")
+
+
+@pytest.mark.integration
+def test_commit_conflict_preserves_winner_and_allows_whole_transaction_retry(monetdb_uri: str) -> None:
+    table = f"adbc_commit_conflict_{uuid4().hex}"
+    with dbapi.connect(monetdb_uri, autocommit=True) as admin:
+        admin.execute(f"CREATE TABLE {table}(id INT PRIMARY KEY, value INT)")
+        try:
+            with dbapi.connect(monetdb_uri) as first, dbapi.connect(monetdb_uri) as second:
+                first.execute(f"INSERT INTO {table} VALUES(1,10)")
+                second.execute(f"INSERT INTO {table} VALUES(1,20)")
+                second.execute(f"INSERT INTO {table} VALUES(2,20)")
+                first.commit()
+                with pytest.raises(adbc_driver_manager.OperationalError) as conflict:
+                    second.commit()
+                assert conflict.value.sqlstate == "40001"
+                assert admin.execute(f"SELECT * FROM {table}").fetchall() == [(1, 10)]
+                second.rollback()
+                second.execute(f"INSERT INTO {table} VALUES(2,30)")
+                second.commit()
+                assert admin.execute(f"SELECT * FROM {table} ORDER BY id").fetchall() == [(1, 10), (2, 30)]
+        finally:
+            admin.execute(f"DROP TABLE {table}")

@@ -190,7 +190,10 @@ requirements change their premises.
   Preflight errors before writes do not poison the transaction. Server constraint failures in a dirty
   transaction require full rollback instead of promising unsafe preservation of earlier caller
   writes. Clean operation scopes and internal autocommit transactions retain failure recovery.
-  Explicit savepoint ingestion rejects dirty transactions before writes. Partial-commit opt-in is
+  Commit guards are checked while holding the connection operation lock, including after waiting
+  for an ingest to finish. SQL rollback parsing distinguishes the optional WORK/CHAIN forms of
+  savepoint rollback from full rollback. Explicit savepoint ingestion rejects dirty transactions
+  before writes. Partial-commit opt-in is
   confined to direct COPY append; prepared INSERT, staged append, create, and replace cannot opt out.
 - Constrained staging is intentionally a speed/server-storage trade. On a generic BIGINT-primary-key
   plus 512-byte-BLOB stream at 100,000, 400,000, and 1,600,000 rows, staged caller-transaction server
@@ -317,7 +320,8 @@ requirements change their premises.
   positions and can add or change diagnostics as its type propagator evolves. Diagnostic text is
   therefore not a stable capability boundary. Any completed server SQL diagnostic from `PREPARE`
   selects the typed-literal path; transport, timeout, and cancellation failures remain terminal.
-  So do connection-state diagnostics (SQLSTATE classes 25, 40, and HY): an aborted transaction
+  So do connection-state diagnostics (SQLSTATE classes 25, 40, and HY, and recognized
+  concurrency-conflict diagnostics): an aborted transaction
   fails the probe's `SAVEPOINT` before MonetDB parses the statement, which says nothing about
   whether the statement can be prepared. Treating those as a refusal cached a verdict that pinned
   a pooled connection to literals for the rest of its life, so they now fail the execution that
@@ -326,6 +330,11 @@ requirements change their premises.
   schema probe cannot establish that distinction, the original `PREPARE` diagnostic is returned;
   if concrete execution fails, its diagnostic remains primary and the prepare diagnostic is
   attached as `adbc.monetdb.prepare_error` detail.
+- Prepared-handle cleanup uses MAPI `Xrelease`, whose SP4 implementation ignores an absent
+  handle without entering SQL transaction processing. SQL `DEALLOCATE` can abort the caller's
+  transaction when another session's DDL has invalidated a cached handle, even if its diagnostic
+  is discarded. Autocommit mode changes are idempotent in the protocol fork; the cached mode
+  follows SP4's mode change even when the implicit commit returns a concurrency conflict.
 - The connection's single bounded LRU stores deferred templates, accepted prepared handles, and
   rejected literal templates. The default prepare threshold is two executions: a one-row
   parameterized statement executes once as a typed literal, the second execution probes PREPARE,

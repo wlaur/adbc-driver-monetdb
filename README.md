@@ -158,8 +158,10 @@ GRANT SELECT ON sys.trades TO reader;
 
 ## Transaction conflicts
 
-MonetDB can report a write conflict with SQLSTATE `42000` or `25000` and a diagnostic
-ending in `failed due to conflict with another transaction`. These recognized conflicts
+MonetDB can detect optimistic concurrency conflicts during a write or at commit. Commit
+conflicts use SQLSTATE `40001`; DML and catalog writes also use `42000`, `25000`, or
+`25S01` with diagnostics such as `conflicts with another transaction` or
+`transaction conflict detected`. These recognized conflicts
 use ADBC status `UNKNOWN`, which the Python driver manager exposes as `OperationalError`,
 while preserving the original SQLSTATE and message. ADBC has no dedicated serialization-conflict
 status. Ordinary syntax, permission and invalid-transaction-state errors keep their existing
@@ -437,7 +439,8 @@ until commit or rollback, including repeated updates and delete-then-insert appe
 
 After a failed operation attempts writes without an operation savepoint, the transaction is
 rollback-only: `commit()`, enabling autocommit, and raw SQL `COMMIT` raise `InvalidState` until
-`rollback()` or successful raw SQL `ROLLBACK` clears the state. Client-side failures can leave
+`rollback()` or successful full SQL `ROLLBACK` clears the state. Rolling back to a
+savepoint does not clear it. Client-side failures can leave
 partial rows visible to reads; server errors can abort the transaction and prevent reads too.
 Validation failures detected before writing do not mark the transaction rollback-only. Server
 errors retain their DB-API exception and SQLSTATE. Autocommit ingestion wraps the complete stream

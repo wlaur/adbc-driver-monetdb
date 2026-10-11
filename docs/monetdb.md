@@ -54,8 +54,10 @@ may interrupt whichever statement currently owns the connection.
 
 ## Transaction conflicts
 
-MonetDB can report a write conflict with SQLSTATE `42000` or `25000` and a diagnostic
-ending in `failed due to conflict with another transaction`. These recognized conflicts
+MonetDB can detect optimistic concurrency conflicts during a write or at commit. Commit
+conflicts use SQLSTATE `40001`; DML and catalog writes also use `42000`, `25000`, or
+`25S01` with diagnostics such as `conflicts with another transaction` or
+`transaction conflict detected`. These recognized conflicts
 use ADBC status `UNKNOWN`, which the Python driver manager exposes as `OperationalError`,
 while preserving the original SQLSTATE and message. ADBC has no dedicated serialization-conflict
 status. Ordinary syntax, permission and invalid-transaction-state errors keep their existing
