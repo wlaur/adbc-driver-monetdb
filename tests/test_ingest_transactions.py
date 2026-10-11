@@ -2,6 +2,8 @@ import json
 import os
 import subprocess
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 
 import adbc_driver_manager
 import pyarrow as pa
@@ -553,3 +555,95 @@ def test_prepared_transaction_retains_temporary_table_and_catalogs(monetdb_uri: 
         )
         assert cursor.fetchall() == [("a",), ("b",)]
         connection.rollback()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "rollback",
+    [
+        "ROLLBACK TO SAVEPOINT after_failure",
+        "ROLLBACK WORK TO SAVEPOINT after_failure",
+        "ROLLBACK WORK AND NO CHAIN TO SAVEPOINT after_failure",
+        "ROLLBACK /* scope */ WORK /* mode */ AND CHAIN TO SAVEPOINT after_failure",
+    ],
+)
+def test_savepoint_rollback_cannot_clear_partial_ingest_guard(monetdb_uri: str, rollback: str) -> None:
+    table = "ingest_rollback_work_guard"
+    with dbapi.connect(monetdb_uri, autocommit=True) as admin:
+        admin.execute(f"CREATE TABLE {table}(value INT)")
+        try:
+            with dbapi.connect(monetdb_uri) as connection:
+                batch = pa.record_batch({"value": pa.array([1], type=pa.int32())})
+                with (
+                    connection.cursor(adbc_stmt_kwargs={StatementOptions.WRITE_BATCH_ROWS: "1"}) as cursor,
+                    pytest.raises(Exception, match="intentional upstream failure"),
+                ):
+                    cursor.adbc_ingest(table, _reader_that_fails_after(batch), mode="append")
+                connection.execute("SAVEPOINT after_failure")
+                connection.execute(rollback)
+                with pytest.raises(adbc_driver_manager.ProgrammingError, match="ROLLBACK is required"):
+                    connection.commit()
+                connection.rollback()
+                assert connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone() == (0,)
+        finally:
+            admin.execute(f"DROP TABLE {table}")
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("commit_path", ["api", "sql", "autocommit"])
+def test_commit_waiting_for_failed_ingest_rechecks_rollback_guard(monetdb_uri: str, commit_path: str) -> None:
+    table = "ingest_waiting_commit"
+    paused = Event()
+    release = Event()
+    commit_started = Event()
+    batch = pa.record_batch({"value": pa.array([1], type=pa.int32())})
+
+    def batches() -> Iterator[pa.RecordBatch]:
+        yield batch
+        yield batch
+        paused.set()
+        assert release.wait(10), "test did not release the producer"
+        raise RuntimeError("intentional upstream failure")
+
+    with dbapi.connect(monetdb_uri, autocommit=True) as admin:
+        admin.execute(f"CREATE TABLE {table}(value INT)")
+        try:
+            with dbapi.connect(monetdb_uri) as connection:
+
+                def ingest() -> None:
+                    with connection.cursor(adbc_stmt_kwargs={StatementOptions.WRITE_BATCH_ROWS: "1"}) as cursor:
+                        with pytest.raises(Exception, match="intentional upstream failure"):
+                            cursor.adbc_ingest(
+                                table, pa.RecordBatchReader.from_batches(batch.schema, batches()), mode="append"
+                            )
+                        stats = json.loads(cursor.adbc_statement.get_option(str(StatementOptions.INGEST_STATS)))
+                        assert stats["target_copy_count"] >= 1
+
+                def commit() -> None:
+                    commit_started.set()
+                    if commit_path == "api":
+                        connection.commit()
+                    elif commit_path == "autocommit":
+                        connection.adbc_connection.set_autocommit(True)
+                    else:
+                        with connection.cursor() as cursor:
+                            cursor.execute("COMMIT")
+
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    upload = pool.submit(ingest)
+                    try:
+                        assert paused.wait(10)
+                        pending = pool.submit(commit)
+                        assert commit_started.wait(10)
+                        with pytest.raises(TimeoutError):
+                            pending.result(timeout=0.1)
+                    finally:
+                        release.set()
+                    upload.result(timeout=10)
+                    with pytest.raises(adbc_driver_manager.ProgrammingError, match="ROLLBACK is required"):
+                        pending.result(timeout=10)
+                connection.rollback()
+            assert admin.execute(f"SELECT COUNT(*) FROM {table}").fetchone() == (0,)
+        finally:
+            release.set()
+            admin.execute(f"DROP TABLE {table}")

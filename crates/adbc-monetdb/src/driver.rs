@@ -843,6 +843,7 @@ fn map_cursor_error(value: CursorError) -> Error {
             | CursorError::IO(_)
             | CursorError::Framing(_)
             | CursorError::BadReply(_)
+            | CursorError::Poisoned
     );
     let status = match value {
         CursorError::Closed | CursorError::NoResultSet => Status::InvalidState,
@@ -927,15 +928,34 @@ fn attach_prepare_diagnostic(execution: Error, prepare: &Error) -> Error {
     )
 }
 
+fn is_transaction_conflict(sqlstate: &[u8], message: &str) -> bool {
+    // SP4 uses several non-40 SQLSTATEs for OCC failures in sql.c, sql_cat.c,
+    // sql_user.c and rel_schema.c:
+    // https://github.com/MonetDB/MonetDB/tree/Dec2025_SP4_release/sql
+    matches!(sqlstate, b"42000" | b"25000" | b"25S01")
+        && (message
+            .trim_end()
+            .ends_with("conflict with another transaction")
+            || message
+                .trim_end()
+                .ends_with("conflicts with another transaction")
+            || message
+                .trim_end()
+                .ends_with("transaction conflict detected")
+            || message
+                .trim_end()
+                .ends_with("transaction conflict detected while setting default value")
+            || message
+                .trim_end()
+                .ends_with("failed due to transaction conflict")
+            || message.starts_with("TRANSACTION CONFLICT in storage_api."))
+}
+
 fn sqlstate_status(sqlstate: Option<&str>, message: &str) -> Status {
     let Some(sqlstate) = sqlstate.map(str::as_bytes) else {
         return Status::Unknown;
     };
-    if matches!(sqlstate, b"42000" | b"25000")
-        && message
-            .trim_end()
-            .ends_with("failed due to conflict with another transaction")
-    {
+    if is_transaction_conflict(sqlstate, message) {
         return Status::Unknown;
     }
     if sqlstate == b"42000" && message.contains("access denied") {
@@ -1923,10 +1943,10 @@ impl Optionable for MonetdbConnection {
         match &key {
             OptionConnection::AutoCommit => {
                 let enabled = option_bool(&value)?;
+                let connection = lock_connection(&self.inner)?;
                 if enabled && let Some(poison) = self.inner.commit_error() {
                     return Err(poison);
                 }
-                let connection = lock_connection(&self.inner)?;
                 let current = connection
                     .server_info()
                     .map_err(map_cursor_error)?
@@ -2241,9 +2261,6 @@ impl Connection for MonetdbConnection {
     }
 
     fn commit(&mut self) -> Result<()> {
-        if let Some(poison) = self.inner.commit_error() {
-            return Err(poison);
-        }
         execute_update(&self.inner, "COMMIT", self.timeouts).map(|_| ())
     }
 
@@ -7011,6 +7028,10 @@ fn permits_literal_parameter_fallback(value: &Error) -> bool {
 fn transient_prepare_diagnostic(value: &Error) -> bool {
     let class = [value.sqlstate[0] as u8, value.sqlstate[1] as u8];
     matches!(&class, b"25" | b"40" | b"HY")
+        || is_transaction_conflict(
+            &value.sqlstate.map(|character| character as u8),
+            &value.message,
+        )
 }
 
 fn prepare_cached(
@@ -7444,8 +7465,8 @@ fn query_result_with_timeouts(
         ));
     }
     let transaction_effects = transaction_effects(query)?;
-    guard_transaction_commit(connection, transaction_effects)?;
     let connection_guard = lock_connection(connection)?;
+    guard_transaction_commit(connection, transaction_effects)?;
     let mut cursor = connection_guard.cursor();
     cursor.set_timeouts(timeouts);
     cursor.execute(query).map_err(map_cursor_error)?;
@@ -7671,8 +7692,20 @@ fn is_transaction_rollback(statement: &str) -> bool {
         return false;
     }
     let keyword_end = keyword.as_ptr() as usize - statement.as_ptr() as usize + keyword.len();
-    !leading_sql_keyword(&statement[keyword_end..])
-        .is_some_and(|next| next.eq_ignore_ascii_case("to"))
+    let mut remaining = &statement[keyword_end..];
+    // SP4 grammar: ROLLBACK [WORK] [AND [NO] CHAIN] [TO SAVEPOINT name].
+    // https://github.com/MonetDB/MonetDB/blob/Dec2025_SP4_release/sql/server/sql_parser.y
+    while let Some(next) = leading_sql_keyword(remaining) {
+        if !matches!(
+            next.to_ascii_uppercase().as_str(),
+            "WORK" | "AND" | "NO" | "CHAIN"
+        ) {
+            return !next.eq_ignore_ascii_case("to");
+        }
+        let end = next.as_ptr() as usize - remaining.as_ptr() as usize + next.len();
+        remaining = &remaining[end..];
+    }
+    true
 }
 
 fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
@@ -7812,8 +7845,8 @@ fn execute_update(
         ));
     }
     let transaction_effects = transaction_effects(query)?;
-    guard_transaction_commit(connection, transaction_effects)?;
     let connection_guard = lock_connection(connection)?;
+    guard_transaction_commit(connection, transaction_effects)?;
     let mut cursor = connection_guard.cursor();
     cursor.set_timeouts(timeouts);
     cursor.execute(query).map_err(map_cursor_error)?;
@@ -7838,8 +7871,8 @@ fn execute_update_script(
         ));
     }
     let transaction_effects = transaction_effects(query)?;
-    guard_transaction_commit(connection, transaction_effects)?;
     let connection_guard = lock_connection(connection)?;
+    guard_transaction_commit(connection, transaction_effects)?;
     let mut cursor = connection_guard.cursor();
     cursor.set_timeouts(timeouts);
     let mut affected_rows = None;
@@ -9316,6 +9349,11 @@ mod tests {
         };
 
         for (message, sqlstate) in [
+            ("ALTER TABLE: transaction conflict detected", "42000"),
+            (
+                "ALTER TABLE: sys_t_c conflicts with another transaction",
+                "42000",
+            ),
             (
                 "SAVEPOINT: (adbc_prepare_probe_1) transaction is aborted",
                 "40000",
@@ -9644,6 +9682,30 @@ mod tests {
                 "40001!COMMIT: transaction is aborted because of concurrency conflicts, will ROLLBACK instead",
                 Status::Unknown,
             ),
+            (
+                "42000!ALTER TABLE: sys_t_c conflicts with another transaction",
+                Status::Unknown,
+            ),
+            (
+                "42000!ALTER TABLE: transaction conflict detected",
+                Status::Unknown,
+            ),
+            (
+                "42000!DEFAULT: transaction conflict detected while setting default value",
+                Status::Unknown,
+            ),
+            (
+                "42000!Create user schema failed due to transaction conflict",
+                Status::Unknown,
+            ),
+            (
+                "25S01!TRANSACTION CONFLICT in storage_api.vacuum_col sys.t.c",
+                Status::Unknown,
+            ),
+            (
+                "42000!syntax error near 'transaction conflict detected'",
+                Status::InvalidArguments,
+            ),
             ("42000!Update failed", Status::InvalidArguments),
             (
                 "42000!syntax error near 'due to conflict with another transaction'",
@@ -9715,6 +9777,13 @@ mod tests {
         let producer = map_cursor_error(CursorError::FileTransfer("reader failed".into()));
         assert_eq!(producer.status, Status::InvalidData);
         assert!(producer.details.is_none());
+
+        let poisoned = map_cursor_error(CursorError::Poisoned);
+        assert_eq!(poisoned.status, Status::Internal);
+        assert_eq!(
+            poisoned.details,
+            Some(vec![(TERMINAL_ERROR_DETAIL.to_owned(), b"true".to_vec())])
+        );
     }
 
     #[test]
@@ -10289,6 +10358,9 @@ mod tests {
 
         for statement in [
             "ROLLBACK TO SAVEPOINT s",
+            "ROLLBACK WORK TO SAVEPOINT s",
+            "ROLLBACK AND CHAIN TO SAVEPOINT s",
+            "ROLLBACK WORK AND NO CHAIN TO SAVEPOINT s",
             "/* recover scope */ rollback /* target */ to savepoint s",
         ] {
             assert!(!transaction_effects(statement).unwrap().rollback);
