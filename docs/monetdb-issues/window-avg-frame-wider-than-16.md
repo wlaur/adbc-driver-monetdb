@@ -21,7 +21,7 @@ Self-contained, integers 1..41, so every expected average is checkable by hand:
 
 ```sql
 CREATE TABLE mdb_window_repro (i INTEGER, v DOUBLE);
-INSERT INTO mdb_window_repro SELECT value, cast(value as double) FROM sys.generate_series(1, 41);
+INSERT INTO mdb_window_repro SELECT value, cast(value as double) FROM sys.generate_series(1, 42);
 
 SELECT i, v,
        avg(v) OVER (ORDER BY i ROWS BETWEEN 16 PRECEDING AND CURRENT ROW) AS ra
@@ -55,7 +55,7 @@ Same table, varying only the frame:
 | --- | --- | --- |
 | `15 PRECEDING` (max 16 rows) | 0 | — |
 | `16 PRECEDING` (max 17 rows) | 3 | i=17, got 12.75, want 9.00 |
-| `59 PRECEDING` (max 60 rows) | 23 | i=17, got 12.75, want 9.00 |
+| `59 PRECEDING` (max 60 rows) | 24 | i=17, got 12.75, want 9.00 |
 
 Casting the column, ordering in a subquery, and omitting `ORDER BY` inside the window all
 make no difference. It is not a float-precision effect: the errors are far larger than any
