@@ -218,10 +218,10 @@ MonetDB `JSON` query results use Arrow's canonical
 [`arrow.json`](https://arrow.apache.org/docs/format/CanonicalExtensions.html#json) extension. The
 Arrow field carries JSON extension metadata over physical UTF-8 string values; it is not an Arrow
 `Struct` and the driver does not parse every document into one. Arrow-aware consumers can preserve
-the JSON identity. Polars 1.x exposes the storage as `String` and may warn about the unknown
-extension unless its extension policy is configured. Rows may contain objects, arrays, scalars,
+the JSON identity. Polars 2.0 preserves JSON as `pl.Extension("arrow.json", pl.String)`;
+use `.ext.storage()` to access the text for string operations. Rows may contain objects, arrays, scalars,
 and JSON `null` with different shapes; applications that know one object schema can explicitly use
-`str.json_decode(dtype=pl.Struct(...))`.
+`ext.storage().str.json_decode(dtype=pl.Struct(...))`.
 
 Functions declared to return JSON—including `json.filter`, `json.keyarray`, and
 `json.valuearray`—preserve `arrow.json`. Functions declared to return strings, numbers, integers,
