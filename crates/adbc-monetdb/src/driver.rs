@@ -12,7 +12,7 @@ use std::{
         mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel},
     },
     thread::{self, JoinHandle},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use adbc_core::error::{Error, Result, Status};
@@ -103,8 +103,7 @@ const CLIENT_REMARK_OPTION: &str = "adbc.monetdb.client_remark";
 const CLIENT_INFO_OPTION: &str = "adbc.monetdb.client_info";
 const TERMINAL_ERROR_DETAIL: &str = "adbc.monetdb.connection_terminal";
 const PREPARE_ERROR_DETAIL: &str = "adbc.monetdb.prepare_error";
-const MINIMUM_VERSION: (u16, u16, u16) = (11, 55, 0);
-const LOCAL_TEMP_STAGING_MINIMUM_VERSION: (u16, u16, u16) = (11, 55, 7);
+const MINIMUM_VERSION: (u16, u16, u16) = (11, 55, 9);
 static SAVEPOINT_ID: AtomicU64 = AtomicU64::new(0);
 static RESERVED_INGEST_MEMORY_BYTES: AtomicUsize = AtomicUsize::new(0);
 thread_local! {
@@ -1341,7 +1340,7 @@ impl Database for MonetdbDatabase {
         }
         if server_info.binary_level < 1 {
             return Err(error(
-                "MonetDB server does not advertise BINARY=1; Dec2025 or newer is required",
+                "MonetDB server does not advertise BINARY=1; Dec2025-SP4 (11.55.9) or newer is required",
                 Status::NotImplemented,
             ));
         }
@@ -1355,7 +1354,7 @@ impl Database for MonetdbDatabase {
         if version < MINIMUM_VERSION {
             return Err(error(
                 format!(
-                    "MonetDB {}.{}.{} is unsupported; Dec2025 (11.55) or newer is required",
+                    "MonetDB {}.{}.{} is unsupported; Dec2025-SP4 (11.55.9) or newer is required",
                     version.0, version.1, version.2
                 ),
                 Status::NotImplemented,
@@ -2124,7 +2123,6 @@ impl Connection for MonetdbConnection {
             ingest_partial: self.ingest_partial,
             ingest_atomicity: self.ingest_atomicity,
             constrained_append: self.constrained_append,
-            server_version: self.version,
             ingest_stats: None,
             read_stats: None,
             prepare_status: None,
@@ -2301,7 +2299,6 @@ pub struct MonetdbStatement {
     ingest_partial: IngestPartial,
     ingest_atomicity: IngestAtomicity,
     constrained_append: ConstrainedAppend,
-    server_version: (u16, u16, u16),
     ingest_stats: Option<String>,
     read_stats: Option<SharedReadStats>,
     prepare_status: Option<PrepareStatus>,
@@ -3429,8 +3426,7 @@ impl MonetdbStatement {
                 )?);
         let constrained_append_candidate = insert_candidate.is_none()
             && append_to_existing
-            && self.constrained_append == ConstrainedAppend::Auto
-            && (!temporary || self.server_version >= LOCAL_TEMP_STAGING_MINIMUM_VERSION);
+            && self.constrained_append == ConstrainedAppend::Auto;
         let constraint_state = if constrained_append_candidate {
             let mut metadata_cursor = connection.cursor();
             metadata_cursor.set_timeouts(self.timeouts);
@@ -3652,22 +3648,7 @@ impl MonetdbStatement {
                         Status::Internal,
                     )
                 })?;
-                let local = self.server_version >= LOCAL_TEMP_STAGING_MINIMUM_VERSION;
-                let persistent_schema = if local {
-                    None
-                } else {
-                    Some(match schema_name {
-                        Some(value) => value.to_owned(),
-                        None => current_schema_name(&mut cursor)?,
-                    })
-                };
-                let stage = constrained_append_stage(
-                    &schema,
-                    destination,
-                    &operation_target,
-                    local,
-                    persistent_schema.as_deref(),
-                )?;
+                let stage = constrained_append_stage(&schema, destination, &operation_target)?;
                 writes_started = true;
                 cursor.execute(&stage.create).map_err(map_cursor_error)?;
                 stats.path = "staged_copy";
@@ -4038,40 +4019,10 @@ fn constrained_append_stage(
     schema: &SchemaRef,
     destination: &[String],
     operation_target: &str,
-    local: bool,
-    persistent_schema: Option<&str>,
 ) -> Result<ConstrainedAppendStage> {
-    let name = if local {
-        savepoint_name("ingest_stage")
-    } else {
-        format!(
-            "{}_{}",
-            savepoint_name("ingest_stage"),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        )
-    };
+    let name = savepoint_name("ingest_stage");
     let quoted_name = quote_identifier(&name)?;
-    let qualified_name = qualified_name(
-        if local {
-            Some("tmp")
-        } else {
-            Some(persistent_schema.ok_or_else(|| {
-                error(
-                    "persistent constrained append staging requires a schema",
-                    Status::Internal,
-                )
-            })?)
-        },
-        &name,
-    )?;
-    let create_target = if local {
-        quoted_name
-    } else {
-        qualified_name.clone()
-    };
+    let qualified_name = qualified_name(Some("tmp"), &name)?;
     let source_columns = schema
         .fields()
         .iter()
@@ -4081,18 +4032,8 @@ fn constrained_append_stage(
     let destination_columns = quoted_column_list(destination)?;
     Ok(ConstrainedAppendStage {
         create: format!(
-            "CREATE {}TABLE {create_target} ({}){}",
-            if local {
-                "LOCAL TEMPORARY "
-            } else {
-                "UNLOGGED "
-            },
+            "CREATE LOCAL TEMPORARY TABLE {quoted_name} ({}) ON COMMIT PRESERVE ROWS",
             ingest_column_definitions(schema, false)?.join(", "),
-            if local {
-                " ON COMMIT PRESERVE ROWS"
-            } else {
-                ""
-            }
         ),
         move_to_target: format!(
             "INSERT INTO {operation_target} ({destination_columns}) \
@@ -7993,23 +7934,6 @@ fn begin_atomic(
     ))
 }
 
-fn current_schema_name(cursor: &mut monetdb::Cursor) -> Result<String> {
-    cursor
-        .execute("SELECT current_schema")
-        .map_err(map_cursor_error)?;
-    if !cursor.next_row().map_err(map_cursor_error)? {
-        return Err(error(
-            "current-schema query returned no row",
-            Status::InvalidData,
-        ));
-    }
-    cursor
-        .get_str(0)
-        .map_err(map_cursor_error)?
-        .map(str::to_owned)
-        .ok_or_else(|| error("current schema is NULL", Status::InvalidData))
-}
-
 fn table_exists(
     connection: &monetdb::Connection,
     schema_name: Option<&str>,
@@ -8092,7 +8016,7 @@ fn table_constraint_state(
 
 /// Whether a temporary table exists whose lifetime ends with the transaction.
 ///
-/// MonetDB source: [`ca_t`](https://github.com/MonetDB/MonetDB/blob/Dec2025_7/sql/include/sql_catalog.h#L186-L191).
+/// MonetDB source: [`ca_t`](https://github.com/MonetDB/MonetDB/blob/Dec2025_SP4_release/sql/include/sql_catalog.h#L186-L191).
 /// `sys.tables.commit_action` encodes the temporary-table commit action:
 /// 1 = ON COMMIT DELETE ROWS, 2 = ON COMMIT PRESERVE ROWS, 3 = ON COMMIT DROP.
 /// Both 1 and 3 are transaction-scoped: ending the transaction, including
@@ -10416,7 +10340,7 @@ mod tests {
 
     #[test]
     fn builds_canonical_info_batches() {
-        let batch = info_batch((11, 55, 7), None).unwrap();
+        let batch = info_batch((11, 55, 9), None).unwrap();
         assert_eq!(batch.schema(), GET_INFO_SCHEMA.clone());
         assert_eq!(batch.num_rows(), 11);
         let names = batch
@@ -10426,7 +10350,7 @@ mod tests {
             .unwrap();
         assert_eq!(names.value(0), u32::from(&InfoCode::VendorName));
 
-        let empty = info_batch((11, 55, 7), Some(HashSet::new())).unwrap();
+        let empty = info_batch((11, 55, 9), Some(HashSet::new())).unwrap();
         assert_eq!(empty.schema(), GET_INFO_SCHEMA.clone());
         assert_eq!(empty.num_rows(), 0);
     }

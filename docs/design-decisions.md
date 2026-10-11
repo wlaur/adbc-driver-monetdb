@@ -177,7 +177,7 @@ requirements change their premises.
   replacing copied framing with scatter framing reduced the median of five warmed runs from
   168.6 to 161.2 ms (4.4%) and removed one message-sized allocation.
 - Operation savepoints are restricted to caller transactions without prior writes. Native SQL on
-  MonetDB 11.55.7 reproduces the failure independently of ADBC: prepare an UPDATE, update the first
+  MonetDB 11.55.9 reproduces the failure independently of ADBC: prepare an UPDATE, update the first
   two committed rows inside a savepoint, release it, then update the remaining rows inside another
   savepoint. The second batch restores the first rows to their committed values. A committed DELETE
   followed by savepoint-scoped INSERT also sees false primary-key conflicts. Repreparing or using
@@ -226,11 +226,9 @@ requirements change their premises.
 
 ## Semantics and test strategy
 
-- The canonical local Dec2025-SP3 test service is the pinned native ARM64
-  `wlaur/monetdb-container` image built from its public recipe. CI retains the official amd64
-  images only for the x86_64 wheel job and the 11.55.1 minimum-server gate: an ARM64-only image
-  cannot run those architecture/version checks, and no 11.55.1 tag exists in the ARM64 image
-  repository.
+- Local and ARM64 CI tests use the pinned native Dec2025-SP4 `wlaur/monetdb-container`
+  image. x86_64 CI builds the same checksum-verified release source from the pinned public
+  container recipe and tests the installed x86_64 wheel against it.
 - Savepoint-scoped temporary-table ingest needs both the target's commit action and whether any
   transaction-scoped temporary table exists. One catalog query returns both facts and is reused by
   atomic-scope selection, avoiding a duplicate round trip without weakening temporary-table
@@ -300,7 +298,7 @@ requirements change their premises.
   literal retry restores the savepoint and leaves the plan available for a later probe. This adds
   transaction-control round trips once per prepared row-query shape, while subsequent executions
   retain the ordinary prepared fast path.
-- MonetDB 11.55.7 can expose a deleted committed row during a savepoint-scoped projection, even
+- MonetDB 11.55.9 can expose a deleted committed row during a savepoint-scoped projection, even
   while `COUNT(*)` reports the correct count. A fresh committed single-table fixture reproduces
   this with `DELETE`, `SAVEPOINT`, a projected `SELECT`, and `RELEASE SAVEPOINT`. Once a caller
   transaction may have written, unverified plans execute through the existing typed-literal path
@@ -440,21 +438,11 @@ requirements change their premises.
   data in an arbitrary column — the silent failure class the exact-first contract exists to
   prevent. The insert route re-prepares once with the catalog's spelling when fallback matching is
   required.
-- Append-schema reads use `sys._columns`/`sys._tables`, or their `tmp` counterparts when the ADBC
-  temporary-table option is set. On the supported 11.55.1 release, a temporary-table preflight
-  immediately before the public `sys.columns` view can misbind that view's internal `_columns`
-  reference to the temporary schema. The base catalogs provide the same metadata without that
-  server-side binder defect; the minimum-version integration job covers the sequence. The
-  defect is recorded in
-  [monetdb-issues/tmp-schema-catalog-misbinding.md](monetdb-issues/tmp-schema-catalog-misbinding.md).
-- MonetDB 11.55.0–11.55.6 can acknowledge a local temporary-table definition without retaining it
-  when a prepared statement has already run in the caller transaction. Constrained append staging
-  therefore uses a transaction-scoped, uniquely named `UNLOGGED` table in the target schema on
-  those versions and a session-local table from 11.55.7 onward. Both are dropped after a successful
-  final move and recovered through the safe operation scope on failure. Temporary-table targets stay on
-  the direct path on the affected versions because persistent tables cannot be created in `tmp`.
-  The server behavior is recorded in
-  [monetdb-issues/prepared-statement-loses-temporary-table.md](monetdb-issues/prepared-statement-loses-temporary-table.md).
+- Append-schema reads select the persistent `sys._columns`/`sys._tables` catalogs or the
+  session-local `tmp` counterparts according to the ADBC temporary-table option.
+- Constrained append staging uses a session-local temporary table for persistent and temporary
+  targets. It is dropped after a successful final move and recovered through the operation's
+  transaction scope on failure.
 - Server-side LZ4 is selected from observed bytes, not from another latency heuristic. The `auto`
   default sends plain frames only when every column in a window cleared the savings threshold; an
   incompressible or shuffled column keeps the whole window on the ordinary upload path. `none`

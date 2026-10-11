@@ -1,7 +1,6 @@
 # Narrowing a `VARCHAR` column silently leaves over-long data in place
 
-**Status:** reproduces on `master` at `ee305e491c` (56.0.0), 11.55.7 and 11.55.5.
-**Found:** 2026-08-05, migrating a schema to the width its ORM declares.
+**Status:** reproduces on Dec2025-SP4 (11.55.9), verified 2026-10-11 on native ARM64.
 
 ## Summary
 
@@ -17,16 +16,6 @@ database would refuse to accept.
 This is not merely cosmetic. The inconsistent value propagates into other tables through
 ordinary `INSERT ... SELECT`, and `msqldump` produces a dump that the server cannot restore —
 the affected table is missing from the restored database.
-
-## Affected versions
-
-| Image | `monet_version` | `revision` |
-|---|---|---|
-| `monetdb/monetdb:Dec2025-SP2` | 11.55.5 | `691e862e16ce` |
-| `monetdb/monetdb:Dec2025-SP3` | 11.55.7 | `1d742c123cb0` |
-| built from `master` | 56.0.0 | `ee305e491c` |
-
-Reproduced through `mclient` only — no application driver involved.
 
 ## Reproduction
 

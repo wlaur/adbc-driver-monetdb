@@ -1,6 +1,6 @@
 # `sys.sessions` NULL dereference crashes mserver5 for any non-admin user
 
-**Status:** reproduces on `master` at `ee305e491c` (56.0.0) and on 11.55.7 (Dec2025-SP3).
+**Status:** reproduces on Dec2025-SP4 (11.55.9), verified 2026-10-11 on native ARM64.
 Deterministic, 100% reproducible with two `mclient` sessions and one `SELECT`.
 
 `sql_sessions_wrap()` dereferences `Client->sqlcontext` without checking it for `NULL`.
@@ -20,13 +20,6 @@ Two situations produce a `RUNCLIENT` client with `sqlcontext == NULL`:
    authentication handshake. Every incoming connection passes through that window, so on a
    busy server the crash happens on its own.
 
-## Affected versions
-
-Introduced by `ac5f521dc8de` ("Use proper sqlid to decide which sessions rows to show",
-2024-07-12), which replaced a `strcmp` on `Client->username` with a dereference through
-`Client->sqlcontext`. Present in every release from `Aug2024` (11.51.x) onwards, including
-`Dec2025-SP3` (11.55.7), and still present on `master` at `ee305e491c`.
-
 ## Reproduction
 
 Deterministic, on the stock image, with nothing but `mclient`:
@@ -34,11 +27,11 @@ Deterministic, on the stock image, with nothing but `mclient`:
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
-IMAGE=monetdb/monetdb:latest
+IMAGE=wlaur/monetdb-container:11.55.9-1
 NAME=mdb-sessions-segv
 
 docker rm -f "$NAME" >/dev/null 2>&1 || true
-docker run -d --name "$NAME" --platform linux/amd64 \
+docker run -d --name "$NAME" --platform linux/arm64 \
     -e MDB_DB_ADMIN_PASS=monetdb -e MDB_CREATE_DBS=benchmark "$IMAGE" >/dev/null
 
 printf 'waiting for the database'
@@ -76,7 +69,7 @@ grep -E 'SIGSEGV|has crashed' /var/monetdb5/dbfarm/merovingian.log || echo "NO C
 IN_CONTAINER
 ```
 
-Output, on `master` at `ee305e491c`:
+Output on Dec2025-SP4:
 
 ```
 --- sys.sessions as monetdb (admin: the deref is short-circuited) ---
@@ -87,55 +80,15 @@ ACTION= read_into_cache
 QUERY = SELECT COUNT(*) FROM sys.sessions;
 ERROR = !unexpected end of file
 --- merovingian.log ---
-2026-09-22 09:25:37 MSG merovingian[1]: database 'chk' (74) was killed by signal SIGSEGV
+2026-10-11 07:02:00 MSG merovingian[1]: database 'chk' (74) was killed by signal SIGSEGV
 ```
 
 The admin `SELECT` on the line above lists the MAL session (`0,monetdb,mal`) without
 incident; the same catalogue read as `alice` kills the server.
 
-### The same crash without a MAL session
-
-The connection-setup window is enough on its own — no `-l mal`, ordinary SQL sessions only.
-Four shell loops opening and closing `mclient -s "SELECT 1;"` connections, plus one
-non-admin session executing `SELECT COUNT(*) FROM sys.sessions;` in a loop:
-
-| poller identity | `sys.sessions` executions | result |
-|---|---:|---|
-| `monetdb` (`user_id == USER_MONETDB`) | 200,000 | no crash |
-| `alice`, default role | **88** | **SIGSEGV** |
-| `alice`, after `SET ROLE sysadmin` | 200,000 | no crash |
-
-Same user, same statement, same churn in rows 2 and 3 — only the value of `admin` differs,
-and `admin` is exactly what gates the dereference.
-
-## Backtrace
-
-Debug build (`-O0 -g`, `ASSERT=ON`), crash triggered by the deterministic recipe above:
-
-```
-Thread 24 "client0024" received signal SIGSEGV, Segmentation fault.
-0x0000ffffb4196454 in sql_sessions_wrap (cntxt=0xe1b5da8, mb=..., stk=..., pci=...)
-    at sql/backends/monet5/sql.c:3711
-3711            bool allowed_to_see = admin || c == cntxt ||  their_be->mvc->user_id == user_id;
-        their_be = 0x0
-        username = 0x0
-        admin = false
-#1  runMALsequence (...) at monetdb5/mal/mal_interpreter.c:701
-#2  runMAL (...) at monetdb5/mal/mal_interpreter.c:367
-#3  SQLrun (...) at sql/backends/monet5/sql_execute.c:80
-#4  SQLengine_ (c=0xe1b5da8) at sql/backends/monet5/sql_scenario.c:1744
-#5  SQLengine (c=0xe1b5da8) at sql/backends/monet5/sql_scenario.c:1764
-#6  runScenarioBody (c=0xe1b5da8) at monetdb5/mal/mal_scenario.c:282
-#7  runScenario (c=0xe1b5da8) at monetdb5/mal/mal_scenario.c:297
-#8  MSserveClient (c=0xe1b5da8) at monetdb5/modules/mal/mal_mapi.c:213
-#9  MSscheduleClient (...) at monetdb5/modules/mal/mal_mapi.c:428
-#10 doChallenge (data=0xffff70027c70) at monetdb5/modules/mal/mal_mapi.c:519
-```
-
 ## Where it is
 
-`sql/backends/monet5/sql.c`, in `sql_sessions_wrap()` — line 3711 in 11.55.7, line 3756 on
-`master` at `ee305e491c`, unchanged:
+[`sql_sessions_wrap()` in the SP4 source](https://github.com/MonetDB/MonetDB/blob/Dec2025_SP4_release/sql/backends/monet5/sql.c):
 
 ```c
 MT_lock_set(&mal_contextLock);
@@ -180,10 +133,3 @@ Unrelated but adjacent: `MCsetClientInfo()` (`monetdb5/mal/mal_client.c:583`) wr
 holding `mal_contextLock`, while `sql_sessions_wrap()` reads them under it. It only ever
 allocates from the client's own allocator and never frees, so today the reader can only
 observe a stale-but-valid pointer, but the write side should probably take the lock.
-
-## Note on an earlier "fixed" verdict
-
-An earlier check against `master` reported this as fixed. That check created a non-admin
-user and read `sys.sessions`, but never created a client record without a SQL context, so
-it could not fire. A re-verification must include either the `-l mal` session or heavy
-connection churn.

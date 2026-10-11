@@ -1,6 +1,6 @@
 # Native `JSON` cast exhausts memory on a small document
 
-**Status:** reproduces on `master` at `ee305e491c` (56.0.0) and on 11.55.7 (Dec2025-SP3).
+**Status:** reproduces on Dec2025-SP4 (11.55.9), verified 2026-10-11 on native ARM64.
 
 A single 289,086-byte JSON document exhausts a disposable database container's 4 GiB memory
 limit when cast to native `JSON`. Casting the identical value to `TEXT` completes in
@@ -8,22 +8,17 @@ milliseconds. No table and no insert are involved.
 
 ## Captured result
 
-Re-verified 2026-09-22 against a `master` build, executing
-[`repro/json-cast.sql`](repro/json-cast.sql) through `mclient` in a 4 GiB container:
+Verified 2026-10-11, executing [`repro/json-cast.sql`](repro/json-cast.sql)
+through `mclient` in a 4 GiB container:
 
 | Operation | Result |
 | --- | --- |
 | `SELECT LENGTH(CAST('<document>' AS TEXT))` | `289086`, immediate |
-| `SELECT LENGTH(CAST('<document>' AS JSON))` | database process killed, about one second in |
+| `SELECT LENGTH(CAST('<document>' AS JSON))` | database process killed |
 | Container `memory.peak` | `4294967296` bytes |
-| Container `memory.events` | `oom 159`, `oom_kill 1` |
+| Container `memory.events` | `oom 1`, `oom_kill 1` |
 
 The client sees `ERROR = !unexpected end of file`.
-
-The first observation, on 11.55.7, came through a SQLAlchemy bound parameter rather than a
-SQL literal, establishing that the native JSON conversion triggers the failure without a
-batch insert or accumulated rows. An earlier run against a database with no memory limit was
-killed by the host OOM killer at approximately 59.3 GiB anonymous RSS.
 
 ## Reproduction
 
@@ -39,7 +34,7 @@ Use a disposable database with a hard memory limit and no swap:
 docker run --detach --name monetdb-json-repro \
   --memory=4g --memory-swap=4g --pids-limit=256 \
   -e MDB_DB_ADMIN_PASS=monetdb -e MDB_CREATE_DBS=jsonrepro \
-  monetdb/monetdb:Dec2025-SP3
+  wlaur/monetdb-container:11.55.9-1
 
 docker exec monetdb-json-repro sh -c \
   'cat /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory.swap.max'
@@ -76,17 +71,6 @@ docker exec monetdb-json-repro sh -c \
 docker logs --tail 100 monetdb-json-repro
 docker rm --force monetdb-json-repro
 ```
-
-## Not explained by token density alone
-
-This smaller control returns `100003` and peaks at about 49 MB with all OOM counters zero:
-
-```sql
-SELECT LENGTH(CAST('[' || REPEAT('0,', 50000) || '0]' AS TEXT));
-```
-
-Changing `TEXT` to `JSON` there would test token density independently of nesting; that
-variant has not been executed.
 
 ## Expected behavior
 

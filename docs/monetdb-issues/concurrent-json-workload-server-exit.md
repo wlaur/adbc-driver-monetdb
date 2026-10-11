@@ -1,57 +1,47 @@
-# mserver5 exits under a concurrent wide-JSON workload
+# Concurrent wide-JSON workload: memory exhaustion under investigation
 
-**Status: not filable.** No backtrace and no standalone reproduction. Not re-tested against
-`master` at `ee305e491c`, because there is nothing to run: the only known trigger is a
-multi-client application workload, not a script.
+**Status:** unresolved on Dec2025-SP4 (11.55.9), tested 2026-10-11 on native ARM64.
+A synthetic concurrent workload loses its database process to the container OOM
+killer. An independent server crash mechanism is not confirmed, and this is not
+yet a report of a proven server defect.
 
-## What happens
+## SP4 observations
 
-Several reader connections plus a concurrent ADBC writer, against a table with a large `JSON`
-column, terminate the server mid-query. Clients see `IO: unexpected end of file`; the
-container is gone afterwards.
+The disposable server uses `wlaur/monetdb-container:11.55.9-1` with a 4 GiB memory
+limit and no swap. Seed a table with 10,000 JSON documents containing an 8,000-byte
+string:
 
-Observed on MonetDB 11.55.7 with this driver at 0.12.0, three attempts out of three, so it is
-deterministic rather than a race that occasionally trips. Earlier notes recorded it as
-intermittent and unexplained; neither the server release nor the driver version current at the
-time fixed it.
+```sql
+CREATE TABLE concurrent_json (id BIGINT, content JSON);
+INSERT INTO concurrent_json
+SELECT value, CAST('{"parts":[{"text":"' || repeat('x', 8000) || '"}]}' AS JSON)
+FROM sys.generate_series(1, 10001);
+```
 
-The ingredients appear to be concurrent readers, a concurrent ADBC writer, and a wide `JSON`
-column. Building a synthetic case is the next step before reporting.
+Readers repeatedly execute:
 
-## Not the same bug as the `sys.sessions` crash
+```sql
+SELECT sum(length(json.text(json.filter(json.filter(json.filter(content, '$.parts'), 0), '$.text'))))
+FROM concurrent_json;
+```
 
-[`sessions-catalog-null-dereference`](sessions-catalog-null-dereference.md) was found while
-investigating this crash, in the subsystem originally suspected, but it is **not** the cause
-of this one and a report must not claim it is.
+| Workload | Result |
+| --- | --- |
+| One reader, one query, no writer | `80000000`; peak 739,119,104 bytes; no OOM |
+| Four concurrent readers, one query each, no writer | Correct results; peak 2,412,253,184 bytes; no OOM |
+| Four looping readers plus an ADBC writer, up to 200 appends of 100 comparable documents | Database receives SIGKILL; cgroup reports `oom_kill 1` |
+| Four looping readers plus 20 appends of 100 documents, 60 seconds | 194 reader queries and all 20 appends complete |
 
-The observer connection in the workload that hit this connects as the `monetdb` administrator,
-so `admin` is true for it and `their_be->mvc->user_id` is never evaluated. That is not a
-guess: 200,000 `sys.sessions` reads as `monetdb` under heavy connection churn produced zero
-crashes, while the same workload as a non-admin crashed after 88.
+The writer uses the same physical connection for each `adbc_ingest(..., mode="append")`
+and autocommit. The table grows during the run, so each reader must process more data.
+These observations do not distinguish excessive server memory use from aggregate
+query demand exceeding the configured limit. They do not establish a concurrency
+race, an allocator defect, or a relationship to the separate
+[JSON cast](json-cast-memory-exhaustion.md) and
+[binary-export disconnect](binary-export-abort-on-client-disconnect.md) defects.
 
-So the original hypothesis — concurrent enumeration of `sys.sessions` during session teardown
-— is positively **excluded** here, even though it turned out to be a real bug for other users.
+## Remaining work
 
-## What was tried against the admin path, without reproducing anything
-
-All on `monetdb/monetdb:latest` (amd64, 11.55.7), `mclient` only, connecting as `monetdb`:
-
-| workload | duration | crashes |
-|---|---:|---:|
-| 4× temp-table create/insert/drop + 2× `sys.sessions`/`sys.tables` polling + 2× connection churn | 60 s | 0 |
-| 4× full scan of `json.text(json.filter(json.filter(json.filter(content,'$.parts'),0),'$.text'))` over a 400 MB `json` column + 1× batched writer + 2× catalogue polling + 2× connection churn | 180 s | 0 |
-
-The second covers the vheap-growth-under-concurrent-scan theory (a large `json` column being
-appended to while four sessions scan it), which was the most plausible remaining mechanism. It
-did not fire, though the emulated x86-64 container is roughly 5× slower than the original
-arm64 run, which widens every window and may equally well hide a narrow one.
-
-## What is still needed
-
-1. A core dump with usable registers. `--ulimit core=-1` does produce a core in the dbfarm on
-   the official image, but under Rosetta the kernel writes aarch64 registers into an x86-64
-   core and gdb cannot unwind it. Either reproduce on a real amd64 host, or reproduce on the
-   arm64 image where native gdb works.
-2. Confirmation that it reproduces at all outside the original application. Nothing found so
-   far contradicts the possibility that the trigger is something the client does rather than
-   something the server does on its own.
+Hold data volume constant, measure allocations across reader counts, and obtain
+a server backtrace if an exit occurs without an OOM kill. A negative stress run
+is not sufficient evidence to mark this investigation resolved.

@@ -1,6 +1,6 @@
 # Empty result when `ORDER BY` has a `CASE` over `grouping()`
 
-**Status:** reproduces on `master` at `ee305e491c` (56.0.0) and on 11.55.7 (Dec2025-SP3).
+**Status:** reproduces on Dec2025-SP4 (11.55.9), verified 2026-10-11 on native ARM64.
 
 ## Summary
 
@@ -19,8 +19,7 @@ This is not a synthetic pattern. It is exactly the shape of **TPC-DS queries 70 
 both of which carry it verbatim, and both of which return nothing on MonetDB while returning
 3 and 100 rows respectively on DuckDB.
 
-Seen through this driver at 0.12.0, which reports it as a zero-column result, and confirmed
-through `mclient`.
+The driver reports a zero-column result. The reproduction is verified through `mclient`.
 
 ## Reproduction
 

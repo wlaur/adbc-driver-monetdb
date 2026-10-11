@@ -1,26 +1,20 @@
 #!/usr/bin/env bash
 # Re-run the reproducible checks in ../ against a given MonetDB image.
-# usage: check-issues.sh IMAGE [GDK_DEBUG]
+# usage: check-issues.sh IMAGE
 #
 # Covers the checks that need nothing but one server and mclient. The remote-table,
-# JSON-cast, Parquet, binary-export and concurrency checks need their own setup and
+# JSON-cast, binary-export and concurrency checks need their own setup and
 # are described in their own files.
 set -uo pipefail
 
-image="${1:?usage: check-issues.sh IMAGE [GDK_DEBUG]}"
-gdk_debug="${2:-}"
+image="${1:?usage: check-issues.sh IMAGE}"
 name=mdb-issue-check
 platform="${PLATFORM:-linux/arm64}"
-
-env_args=()
-if [[ -n "$gdk_debug" ]]; then
-    env_args+=(-e "MSERVER5_EXTRA_ARGS=-d$gdk_debug")
-fi
 
 docker rm -f "$name" >/dev/null 2>&1
 docker run -d --name "$name" --platform "$platform" \
     -e MDB_DB_ADMIN_PASS=monetdb -e MDB_CREATE_DBS=chk \
-    "${env_args[@]}" "$image" >/dev/null
+    "$image" >/dev/null
 
 q() {
     local user="${2:-monetdb}" pass="${3:-monetdb}"
@@ -32,7 +26,7 @@ q() {
 n=0
 until q "SELECT 1;" >/dev/null 2>&1 || [ $n -ge 60 ]; do n=$((n + 1)); sleep 2; done
 
-echo "### image=$image gdk_debug=${gdk_debug:-unset}"
+echo "### image=$image"
 q "SELECT value FROM sys.env() WHERE name = 'monet_version';"
 
 echo
@@ -72,15 +66,6 @@ q "START TRANSACTION;
    SAVEPOINT sp;
    SELECT id FROM sp_probe;
    ROLLBACK;"
-
-echo
-echo "### prepared-statement-loses-temporary-table (must print 1)"
-q "START TRANSACTION;
-   PREPARE SELECT ? + 1;
-   CREATE LOCAL TEMPORARY TABLE tmp_after_prepare (x INTEGER) ON COMMIT PRESERVE ROWS;
-   INSERT INTO tmp_after_prepare VALUES (1);
-   SELECT count(*) AS rows_in_tmp FROM tmp_after_prepare;
-   COMMIT;"
 
 echo
 echo "### sessions-catalog-null-dereference (server must survive)"

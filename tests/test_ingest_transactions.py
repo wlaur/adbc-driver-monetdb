@@ -529,3 +529,27 @@ def test_ingest_preserves_drop_on_commit_temporary_table(monetdb_uri: str) -> No
     finally:
         with dbapi.connect(monetdb_uri, autocommit=True) as cleanup:
             cleanup.execute("DROP TABLE IF EXISTS ingest_drop_on_commit_target")
+
+
+@pytest.mark.integration
+def test_prepared_transaction_retains_temporary_table_and_catalogs(monetdb_uri: str) -> None:
+    with (
+        dbapi.connect(monetdb_uri) as connection,
+        connection.cursor(adbc_stmt_kwargs={StatementOptions.PREPARE_THRESHOLD: "1"}) as cursor,
+    ):
+        cursor.execute("SELECT ? + 1", (1,))
+        assert cursor.fetchone() == (2,)
+        cursor.execute("CREATE TABLE sys.sp4_catalog_probe (a INTEGER, b VARCHAR(10))")
+        cursor.execute("CREATE LOCAL TEMPORARY TABLE sp4_catalog_probe (x INTEGER) ON COMMIT PRESERVE ROWS")
+        cursor.execute("INSERT INTO tmp.sp4_catalog_probe VALUES (1)")
+        cursor.execute("SELECT count(*) FROM tmp.sp4_catalog_probe")
+        assert cursor.fetchone() == (1,)
+        cursor.execute("SELECT count(*) FROM tmp._tables WHERE name = 'sp4_catalog_probe'")
+        assert cursor.fetchone() == (1,)
+        cursor.execute(
+            "SELECT c.name FROM sys.columns c JOIN sys.tables t ON c.table_id = t.id "
+            "WHERE t.name = 'sp4_catalog_probe' AND t.schema_id = "
+            "(SELECT id FROM sys.schemas WHERE name = 'sys') ORDER BY c.number"
+        )
+        assert cursor.fetchall() == [("a",), ("b",)]
+        connection.rollback()

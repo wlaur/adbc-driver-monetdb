@@ -11,7 +11,7 @@
 //! `common/utils/copybinary.h`) and documented in
 //! `documentation/source/binary-resultset.rst` / `bincopy-backref.rst`.
 //!
-//! Only little-endian servers and MonetDB Dec2025 (11.55) or newer are
+//! Only little-endian servers and MonetDB Dec2025-SP4 (11.55.9) or newer are
 //! supported.
 
 mod decode;

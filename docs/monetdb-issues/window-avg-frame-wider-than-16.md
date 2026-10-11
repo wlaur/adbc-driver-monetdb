@@ -1,6 +1,6 @@
 # Wrong `avg()` over a `ROWS` window frame wider than 16
 
-**Status:** reproduces on `master` at `ee305e491c` (56.0.0) and on 11.55.7 (Dec2025-SP3).
+**Status:** reproduces on Dec2025-SP4 (11.55.9), verified 2026-10-11 on native ARM64.
 
 ## Summary
 
@@ -38,7 +38,7 @@ At `i = 17` the frame is rows 1..17, so the average must be `(1+17)/2 = 9.0`:
 | **17** | **12.75** | **9.00** |
 | 18 | 10.00 | 10.00 |
 
-Verbatim output on `master` at `ee305e491c`:
+Output on Dec2025-SP4:
 
 ```
 15,8

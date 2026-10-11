@@ -1,6 +1,6 @@
 # Prepared query over a remote table loses its parameter on the remote server
 
-**Status:** reproduces on `master` at `ee305e491c` (56.0.0) and on 11.55.7 (Dec2025-SP3).
+**Status:** reproduces on Dec2025-SP4 (11.55.9), verified 2026-10-11 on native ARM64.
 
 ## Summary
 
@@ -20,9 +20,9 @@ Two MonetDB instances that can reach each other. On a Docker network:
 ```sh
 docker network create mdbnet
 docker run -d --name mdb-src   --network mdbnet \
-  -e MDB_DB_ADMIN_PASS=monetdb -e MDB_CREATE_DBS=remote monetdb/monetdb:Dec2025-SP3
+  -e MDB_DB_ADMIN_PASS=monetdb -e MDB_CREATE_DBS=remote wlaur/monetdb-container:11.55.9-1
 docker run -d --name mdb-coord --network mdbnet \
-  -e MDB_DB_ADMIN_PASS=monetdb -e MDB_CREATE_DBS=test   monetdb/monetdb:Dec2025-SP3
+  -e MDB_DB_ADMIN_PASS=monetdb -e MDB_CREATE_DBS=test   wlaur/monetdb-container:11.55.9-1
 ```
 
 Run on the source database (`remote` on host `mdb-src`):

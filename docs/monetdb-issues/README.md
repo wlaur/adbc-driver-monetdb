@@ -1,63 +1,27 @@
 # MonetDB server issues
 
-Draft bug reports for the MonetDB server, collected while building and exercising this
-driver and the SQLAlchemy dialect that sits on top of it. Each file is written to be
-filed upstream as-is: a summary, a self-contained reproduction, expected versus observed
-behaviour, and — where it was possible to find one — the source location responsible.
+Current server defects and unresolved investigations for MonetDB Dec2025-SP4
+(11.55.9), verified 2026-10-11 on native ARM64 with
+`wlaur/monetdb-container:11.55.9-1` (digest
+`sha256:b7238498164cd26a0b7bd9391d51948dca5c69f490f888186d3204320abaecf7`).
+These are server reports, not driver defects.
 
-Nothing here is a driver defect. Every reproduction in this directory runs through
-`mclient` or a plain container, with no ADBC involved, unless the file says otherwise.
+| Issue | SP4 result |
+| --- | --- |
+| [Sessions catalog NULL dereference](sessions-catalog-null-dereference.md) | Non-admin catalog read with an open MAL session causes SIGSEGV |
+| [Window average](window-avg-frame-wider-than-16.md) | Row 17 returns 12.75 instead of 9.0 |
+| [Rollup ordering](rollup-grouping-order-by-empty-result.md) | No result instead of six rows |
+| [VARCHAR narrowing](alter-column-narrowing-keeps-overlong-values.md) | 900 characters retained in VARCHAR(255) |
+| [Savepoint visibility](savepoint-resurrects-deleted-row.md) | Deleted committed row becomes visible |
+| [Remote prepared parameter](remote-table-prepared-parameter.md) | EXECUTE fails; literal query succeeds |
+| [JSON cast memory exhaustion](json-cast-memory-exhaustion.md) | 289,086-byte document exhausts 4 GiB |
+| [Binary export disconnect](binary-export-abort-on-client-disconnect.md) | TCP reset during export causes invalid free and SIGABRT |
+| [Concurrent JSON workload](concurrent-json-workload-server-exit.md) | Memory exhaustion observed; independent crash mechanism remains unconfirmed |
 
-## Status
+Each confirmed report includes a reproduction using `mclient` or a plain MAPI
+connection. [`repro/`](repro/README.md) contains the shared SQL checks, synthetic
+fixtures, and source-build tooling for testing proposed server fixes. Run crash
+and memory-exhaustion probes only against their disposable databases.
 
-Verified on 2026-09-22 against MonetDB `master` at
-[`ee305e491c`](https://github.com/MonetDB/MonetDB/commit/ee305e491c), version `56.0.0`,
-built for `linux/arm64` with [`repro/`](repro/README.md). The baseline column is the
-release line the issue was first reported against.
-
-| Issue | Class | First seen on | Status at `ee305e491c` |
-| --- | --- | --- | --- |
-| [`sessions-catalog-null-dereference`](sessions-catalog-null-dereference.md) | crash, any authenticated user | 11.55.7 | **reproduces** |
-| [`window-avg-frame-wider-than-16`](window-avg-frame-wider-than-16.md) | silently wrong numbers | 11.55.7 | **reproduces** |
-| [`rollup-grouping-order-by-empty-result`](rollup-grouping-order-by-empty-result.md) | silently missing rows | 11.55.7 | **reproduces** |
-| [`alter-column-narrowing-keeps-overlong-values`](alter-column-narrowing-keeps-overlong-values.md) | silent type violation | 11.55.5 | **reproduces** |
-| [`savepoint-resurrects-deleted-row`](savepoint-resurrects-deleted-row.md) | silently wrong rows | 11.55.7 | **reproduces** |
-| [`remote-table-prepared-parameter`](remote-table-prepared-parameter.md) | error, feature unusable | 11.55.7 | **reproduces** |
-| [`json-cast-memory-exhaustion`](json-cast-memory-exhaustion.md) | out-of-memory kill | 11.55.7 | **reproduces** |
-| [`binary-export-abort-on-client-disconnect`](binary-export-abort-on-client-disconnect.md) | crash | 11.55.7 | not reproduced this pass; offending code unchanged |
-| [`concurrent-json-workload-server-exit`](concurrent-json-workload-server-exit.md) | crash | 11.55.7 | not re-tested — no standalone reproduction exists |
-| [`parquet-reader-defects`](parquet-reader-defects.md) | wrong data, failed reads | 56.0.0 | partly fixed, `DECIMAL` still unreadable |
-| [`pipeline-corrupt-binary-results`](pipeline-corrupt-binary-results.md) | corrupt results, silent-wrong-answer class | 56.0.0 | **reproduces** — deterministic on TPC-DS Q98 |
-| [`pipeline-disables-mitosis`](pipeline-disables-mitosis.md) | design, large slowdown | 56.0.0 | re-measured 2026-09-22 |
-| [`monetdbd-fresh-database-second-boot`](monetdbd-fresh-database-second-boot.md) | startup failure | 56.0.0 | **fixed** |
-| [`prepared-statement-loses-temporary-table`](prepared-statement-loses-temporary-table.md) | lost DDL | 11.55.0–11.55.6 | **fixed** in 11.55.7 |
-| [`tmp-schema-catalog-misbinding`](tmp-schema-catalog-misbinding.md) | wrong catalog rows | 11.55.1 | not reproduced |
-
-Two entries were not re-verified. Each says why in its own file, and what would be needed to
-settle it: a multi-gigabyte Parquet ingest for the full-ingest crash, and a concurrent
-multi-client workload for the wide-JSON server exit.
-
-A full seven-suite campaign on 2026-09-22 settled the two that had been deferred for needing a
-populated database. It also found that the pipeline engine corrupts binary results — an issue
-previously scoped only to one TPC-DS query, now seen on three queries across three suites.
-
-## Reproducing
-
-[`repro/`](repro/README.md) holds everything needed to rebuild a server from a MonetDB
-checkout and re-run the checks:
-
-```sh
-docs/monetdb-issues/repro/build-image.sh /path/to/MonetDB monetdb-tip:local
-docs/monetdb-issues/repro/check-issues.sh monetdb-tip:local
-```
-
-## Conventions
-
-- `monetdb/monetdb` is the official image and supplies `linux/amd64`. On Apple Silicon the
-  native `linux/arm64` builds come from
-  [`wlaur/monetdb-container`](https://github.com/wlaur/monetdb-container) for releases, and
-  from `repro/` for arbitrary commits.
-- Every reproduction creates a disposable database. None of them needs a host port, a
-  mounted volume, or an existing dataset unless stated.
-- A file whose status is not "reproduces" is kept rather than deleted: knowing a defect was
-  fixed, and in which version, is the thing a support policy is written against.
+Resolved reports and reports for features outside SP4 are removed. Unconfirmed
+investigations state the evidence and limits of their current reproduction.

@@ -26,7 +26,7 @@ covers the conventions that are easy to get wrong.
 
 ## Hard support policy — no compatibility code
 
-- **MonetDB Dec2025 (11.55)+ and little-endian servers only.** Fail fast at connect;
+- **MonetDB Dec2025-SP4 (11.55.9)+ and little-endian servers only.** Fail fast at connect;
   never add fallbacks for older servers and never decode text-protocol result sets.
 - **Current-stable consumers only:** Python ≥ 3.13, polars ≥ 1.42,
   adbc-driver-manager ≥ 1.11. Don't add version-compat shims — bump the pins instead.
@@ -84,7 +84,7 @@ covers the conventions that are easy to get wrong.
 ## Tests
 
 - `uv run pytest -m "not integration"` needs no server. Integration tests need
-  `MONETDB_TEST_URI` and the pinned native ARM64 Dec2025-SP3 image from
+  `MONETDB_TEST_URI` and the pinned native ARM64 Dec2025-SP4 image from
   `wlaur/monetdb-container` (command in `tests/conftest.py`); they skip when the
   variable is unset.
 - Not-yet-implemented behavior: write the test now and mark it
