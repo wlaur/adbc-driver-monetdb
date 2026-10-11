@@ -843,6 +843,7 @@ fn map_cursor_error(value: CursorError) -> Error {
             | CursorError::IO(_)
             | CursorError::Framing(_)
             | CursorError::BadReply(_)
+            | CursorError::Poisoned
     );
     let status = match value {
         CursorError::Closed | CursorError::NoResultSet => Status::InvalidState,
@@ -9776,6 +9777,13 @@ mod tests {
         let producer = map_cursor_error(CursorError::FileTransfer("reader failed".into()));
         assert_eq!(producer.status, Status::InvalidData);
         assert!(producer.details.is_none());
+
+        let poisoned = map_cursor_error(CursorError::Poisoned);
+        assert_eq!(poisoned.status, Status::Internal);
+        assert_eq!(
+            poisoned.details,
+            Some(vec![(TERMINAL_ERROR_DETAIL.to_owned(), b"true".to_vec())])
+        );
     }
 
     #[test]
