@@ -421,6 +421,20 @@ jobs:
           ref: 30ad454d6faa82e6e2ddca49cccf90029eeb4aee
       - name: Build native SP4 server from the checksum-verified release source
         run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          dockerfile = Path("Dockerfile")
+          source = dockerfile.read_text(encoding="utf-8")
+          command = "RUN curl --fail --location --proto '=https' --tlsv1.2"
+          if source.count(command) != 1:
+              raise ValueError("The pinned recipe must contain exactly one source download")
+          retries = (
+              " --retry 5 --retry-all-errors --connect-timeout 30"
+              " --max-time 300 --retry-max-time 1200"
+          )
+          dockerfile.write_text(source.replace(command, command + retries), encoding="utf-8")
+          PY
           docker build --build-arg BUILD_THREADS=4 --tag monetdb-sp4:ci .
           docker save --output "$RUNNER_TEMP/server.tar" monetdb-sp4:ci
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
