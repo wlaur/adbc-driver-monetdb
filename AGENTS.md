@@ -65,7 +65,7 @@ covers the conventions that are easy to get wrong.
 ## Python
 
 - `uv` only, never pip; committed lockfile (CI runs `uv sync --locked`).
-- **pyright (strict) is the only type checker** — zero errors. Blanket `# type: ignore`
+- **pyright (strict) and Pyrefly are required type checkers** — zero errors. Blanket `# type: ignore`
   is disabled; use rule-specific `# pyright: ignore[rule]`, and delete a suppression in
   the same change that makes it unnecessary (`reportUnnecessaryTypeIgnoreComment` is an
   error). `ruff check` + `ruff format` gate everything else.
@@ -112,3 +112,5 @@ covers the conventions that are easy to get wrong.
 Keep the repo self-contained: no references to private projects, internal benchmarks, or
 company infrastructure. Cite public sources only (the MonetDB repo's protocol docs,
 pymonetdb, apache/arrow-adbc, polars).
+
+- Pre-commit runs Ruff and Pyrefly. Commit with hooks enabled; never bypass them.

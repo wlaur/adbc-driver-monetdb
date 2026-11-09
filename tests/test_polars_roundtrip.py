@@ -1342,13 +1342,13 @@ def test_pandas_roundtrip(monetdb_uri: str) -> None:
             assert (
                 frame.to_sql(
                     "pandas_smoke",
-                    conn,  # pyright: ignore[reportArgumentType]
+                    conn,  # pyright: ignore[reportArgumentType]  # pyrefly: ignore[bad-argument-type]
                     if_exists="replace",
                     index=False,
                 )
                 == 3
             )
-            result = pd.read_sql(
+            result = pd.read_sql(  # pyrefly: ignore[no-matching-overload]
                 "SELECT id, name FROM pandas_smoke ORDER BY id",
                 conn,  # pyright: ignore[reportArgumentType]
                 dtype_backend="pyarrow",

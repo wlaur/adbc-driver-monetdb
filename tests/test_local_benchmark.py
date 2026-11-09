@@ -1,4 +1,4 @@
-import datetime
+import datetime as dt
 import gc
 import multiprocessing
 import os
@@ -289,7 +289,7 @@ def test_local_temporal_materialization_against_pymonetdb(monetdb_uri: str) -> N
                 "SELECT TIMESTAMP '2024-01-01 00:00:00' + value * INTERVAL '0.001' SECOND "
                 f"FROM sys.generate_series(0, {rows})"
             ),
-            datetime.datetime,
+            dt.datetime,
         ),
         "timestamptz": (
             (
@@ -297,11 +297,11 @@ def test_local_temporal_materialization_against_pymonetdb(monetdb_uri: str) -> N
                 "+ value * INTERVAL '0.001' SECOND "
                 f"FROM sys.generate_series(0, {rows})"
             ),
-            datetime.datetime,
+            dt.datetime,
         ),
         "time": (
             f"SELECT TIME '00:00:00' + MOD(value, 86400) * INTERVAL '1' SECOND FROM sys.generate_series(0, {rows})",
-            datetime.time,
+            dt.time,
         ),
     }
 

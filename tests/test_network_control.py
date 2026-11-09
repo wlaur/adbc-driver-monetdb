@@ -3,7 +3,7 @@ import sys
 from queue import Queue
 from threading import Event, Thread
 from time import monotonic
-from typing import Literal, cast
+from typing import Literal, TypedDict, cast
 
 import adbc_driver_manager
 import pyarrow as pa
@@ -310,6 +310,12 @@ def test_statement_write_timeout_bounds_stalled_copy_upload() -> None:
         assert server.query_received.is_set()
 
 
+class _ServerOptions(TypedDict, total=False):
+    endian: Literal["BIG", "LIT"]
+    advertise_binary: bool
+    version: str
+
+
 @pytest.mark.parametrize(
     ("server_options", "message"),
     [
@@ -322,10 +328,10 @@ def test_statement_write_timeout_bounds_stalled_copy_upload() -> None:
     ],
 )
 def test_connect_rejects_unsupported_server_capabilities(
-    server_options: dict[str, object],
+    server_options: _ServerOptions,
     message: str,
 ) -> None:
-    with _BlackHoleServer(initialize=True, behavior="connect_only", **server_options) as server:  # pyright: ignore[reportArgumentType]
+    with _BlackHoleServer(initialize=True, behavior="connect_only", **server_options) as server:
         with pytest.raises(adbc_driver_manager.NotSupportedError, match=message) as caught:
             dbapi.connect(server.uri, autocommit=True)
         assert caught.value.status_code == adbc_driver_manager.AdbcStatusCode.NOT_IMPLEMENTED

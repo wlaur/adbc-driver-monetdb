@@ -19,6 +19,7 @@ def main() -> None:
     mapi = connection.mapi
     mapi.cmd("Xreply_size 1")
     reply = mapi.cmd("sSELECT value, value * 2, value * 3 FROM sys.generate_series(1, 20000001) AS g(value);\n")
+    assert reply is not None
     result_id = reply.split()[1]
     mapi._putblock(f"Xexportbin {result_id} 0 20000000")
     stream = mapi.sock

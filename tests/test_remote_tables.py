@@ -1,4 +1,4 @@
-import datetime
+import datetime as dt
 import json
 from collections.abc import Iterator
 from typing import cast
@@ -127,11 +127,11 @@ def test_remote_table_fetches_through_xexportbin(
     assert remote.num_rows == SOURCE_ROWS
     assert remote.equals(direct, check_metadata=True)
     assert len(rows) == SOURCE_ROWS
-    assert rows[0] == (0, "remote-0", datetime.datetime(2024, 1, 1))
+    assert rows[0] == (0, "remote-0", dt.datetime(2024, 1, 1))
     assert rows[-1] == (
         SOURCE_ROWS - 1,
         f"remote-{SOURCE_ROWS - 1}",
-        datetime.datetime(2024, 1, 1, 0, 16, 39),
+        dt.datetime(2024, 1, 1, 0, 16, 39),
     )
 
 
@@ -147,8 +147,8 @@ def test_prepared_remote_query_falls_back_without_aborting_transaction(
     )
     parameters = (
         100,
-        datetime.datetime(2024, 1, 1),
-        datetime.datetime(2024, 1, 2),
+        dt.datetime(2024, 1, 1),
+        dt.datetime(2024, 1, 2),
         1_000.0,
     )
     statuses: list[dict[str, object]] = []
@@ -344,17 +344,17 @@ def test_merge_table_fetches_remote_and_local_members(
         {
             "id": SOURCE_ROWS - 1,
             "payload": f"remote-{SOURCE_ROWS - 1}",
-            "observed_at": datetime.datetime(2024, 1, 1, 0, 16, 39),
+            "observed_at": dt.datetime(2024, 1, 1, 0, 16, 39),
         },
         {
             "id": SOURCE_ROWS,
             "payload": f"local-{SOURCE_ROWS}",
-            "observed_at": datetime.datetime(2024, 1, 2),
+            "observed_at": dt.datetime(2024, 1, 2),
         },
         {
             "id": SOURCE_ROWS + 1,
             "payload": f"local-{SOURCE_ROWS + 1}",
-            "observed_at": datetime.datetime(2024, 1, 2, 0, 0, 1),
+            "observed_at": dt.datetime(2024, 1, 2, 0, 0, 1),
         },
     ]
     assert aggregate == (SOURCE_ROWS + 2, 0, SOURCE_ROWS + 1)

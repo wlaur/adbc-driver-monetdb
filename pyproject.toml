@@ -46,6 +46,8 @@ dev = [
     "sqlalchemy>=2.0",
     "cryptography>=45",
     "pyarrow-stubs>=20.0.0.20260625",
+    "pyrefly==1.4.0",
+    "pre-commit>=4.7.0",
 ]
 
 [project.urls]
@@ -182,3 +184,12 @@ override-dependencies = ["pyarrow>=25"]
 
 [tool.uv.sources]
 adbc-drivers-validation = { git = "https://github.com/adbc-drivers/validation", rev = "a4019a3f44ccffcbec4b5203531a88259d588257" }
+
+[tool.pyrefly]
+project-includes = ["**/*.py", "**/*.pyi"]
+search-path = [".", "tests", "tests/validation"]
+infer-with-first-use = false
+enabled-ignores = ["pyrefly"]
+
+[tool.pyrefly.errors]
+unused-ignore = "error"
